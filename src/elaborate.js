@@ -1,0 +1,294 @@
+// AST → ネットリスト IR
+//
+// すべての信号を 1 ビット単位のネットに展開する (bit-blast)。
+// 以降の工程 (スケジューリング / コード生成) はビット幅を一切意識しない。
+//
+// ネットリスト IR:
+//   nets   : [{ name }]                      … 1 ネット = 1 ビット
+//   gates  : [{ op, out, in:[netId], value }] … op: const|buf|not|and|or|xor|mux
+//   regs   : [{ q, d, line }]                 … posedge clk の D フリップフロップ
+//   signals: Map<name, { dir, kind, msb, lsb, width, bits:[netId] }>
+//
+// 幅の解決規則 (Verilog の文脈依存幅は実装せず、単純化した規則を採用):
+//   - 二項演算は両辺を max(幅) までゼロ拡張してからビットごとに適用
+//   - 代入は右辺を左辺の幅に切り詰め / ゼロ拡張
+//   - ?: の選択信号が複数ビットなら OR リダクションで 1 ビットにする
+
+import { CompileError } from './errors.js';
+import { GATE_PRIMITIVES } from './parser.js';
+
+export function elaborate(mod) {
+  const nets = [];
+  const gates = [];
+  const regs = [];
+  const signals = new Map();
+  const drivers = new Map(); // netId -> 駆動元の説明 (多重ドライブ検出用)
+
+  const newNet = (name) => {
+    nets.push({ name });
+    return nets.length - 1;
+  };
+
+  const CONST0 = newNet('$const0');
+  const CONST1 = newNet('$const1');
+  gates.push({ op: 'const', value: 0, out: CONST0, in: [] });
+  gates.push({ op: 'const', value: 1, out: CONST1, in: [] });
+  drivers.set(CONST0, '定数');
+  drivers.set(CONST1, '定数');
+
+  const setDriver = (netId, what, line) => {
+    const prev = drivers.get(netId);
+    if (prev) {
+      throw new CompileError(`${nets[netId].name} が多重にドライブされている (${prev} と ${what})`, line);
+    }
+    drivers.set(netId, what);
+  };
+
+  const newGate = (op, ins, tag) => {
+    const out = newNet(`$${op}${gates.length}${tag ? `_${tag}` : ''}`);
+    gates.push({ op, out, in: ins });
+    drivers.set(out, 'ゲート');
+    return out;
+  };
+
+  // ---- 宣言 --------------------------------------------------------------
+  function declare(name, { dir, kind, range }, line) {
+    let s = signals.get(name);
+    if (!s) {
+      const msb = range ? range.msb : 0;
+      const lsb = range ? range.lsb : 0;
+      if (msb < lsb) throw new CompileError(`降順ビット範囲 [${msb}:${lsb}] は未対応`, line);
+      const width = msb - lsb + 1;
+      const bits = [];
+      for (let b = 0; b < width; b++) {
+        bits.push(newNet(width > 1 ? `${name}[${b + lsb}]` : name));
+      }
+      s = { name, dir: dir ?? null, kind: kind ?? 'wire', msb, lsb, width, bits };
+      signals.set(name, s);
+    } else {
+      if (range && (range.msb !== s.msb || range.lsb !== s.lsb)) {
+        throw new CompileError(`${name} のビット範囲が宣言間で矛盾している`, line);
+      }
+      if (dir) s.dir = dir;
+      if (kind) s.kind = kind;
+    }
+    return s;
+  }
+
+  const lookup = (name, line) => {
+    const s = signals.get(name);
+    if (!s) throw new CompileError(`未宣言の信号 '${name}'`, line);
+    return s;
+  };
+
+  // 先に全宣言を処理して、前方参照 (assign が後続の wire 宣言を参照する等) を許す
+  for (const item of mod.items) {
+    if (item.type === 'decl') {
+      for (const n of item.names) declare(n, item, item.line);
+    }
+  }
+  for (const pname of mod.portOrder) {
+    if (!signals.has(pname)) {
+      throw new CompileError(`ポート '${pname}' の方向が宣言されていない`, mod.line);
+    }
+  }
+  // input のネットは外部から与えられるので「駆動済み」とみなす
+  for (const s of signals.values()) {
+    if (s.dir === 'input') s.bits.forEach((n) => drivers.set(n, '入力ポート'));
+  }
+
+  // ---- 式の評価 (→ LSB 先頭のネット配列) ------------------------------------
+  function resize(bits, width) {
+    if (bits.length === width) return bits;
+    if (bits.length > width) return bits.slice(0, width);
+    return [...bits, ...Array(width - bits.length).fill(CONST0)];
+  }
+
+  function refBits(node) {
+    const s = lookup(node.name, node.line);
+    if (!node.range) return s.bits;
+    const { msb, lsb } = node.range;
+    if (msb < lsb) throw new CompileError(`降順の部分選択 [${msb}:${lsb}] は未対応`, node.line);
+    const out = [];
+    for (let i = lsb; i <= msb; i++) {
+      const pos = i - s.lsb;
+      if (pos < 0 || pos >= s.width) {
+        throw new CompileError(`${s.name}[${i}] は宣言範囲 [${s.msb}:${s.lsb}] の外`, node.line);
+      }
+      out.push(s.bits[pos]);
+    }
+    return out;
+  }
+
+  function reduceOr(bits, line) {
+    if (bits.length === 0) return CONST0;
+    let acc = bits[0];
+    for (let i = 1; i < bits.length; i++) acc = newGate('or', [acc, bits[i]]);
+    return acc;
+  }
+
+  function evalExpr(e) {
+    switch (e.type) {
+      case 'num': {
+        const out = [];
+        for (let b = 0; b < e.width; b++) {
+          out.push((e.bits >> BigInt(b)) & 1n ? CONST1 : CONST0);
+        }
+        return out;
+      }
+      case 'ref':
+        return refBits(e);
+      case 'un':
+        return evalExpr(e.a).map((n) => newGate('not', [n]));
+      case 'bin': {
+        const a = evalExpr(e.a);
+        const b = evalExpr(e.b);
+        const w = Math.max(a.length, b.length);
+        const aa = resize(a, w);
+        const bb = resize(b, w);
+        const op = { '&': 'and', '|': 'or', '^': 'xor' }[e.op];
+        if (!op) throw new CompileError(`未対応の二項演算子 '${e.op}'`, e.line);
+        return aa.map((n, i) => newGate(op, [n, bb[i]]));
+      }
+      case 'tern': {
+        const sel = reduceOr(evalExpr(e.sel), e.line);
+        const a = evalExpr(e.a);
+        const b = evalExpr(e.b);
+        const w = Math.max(a.length, b.length);
+        const aa = resize(a, w);
+        const bb = resize(b, w);
+        return aa.map((n, i) => newGate('mux', [sel, n, bb[i]]));
+      }
+      case 'concat': {
+        // {msb側, ..., lsb側} なので、LSB 先頭配列では逆順に連結する
+        const out = [];
+        for (let i = e.parts.length - 1; i >= 0; i--) out.push(...evalExpr(e.parts[i]));
+        return out;
+      }
+      default:
+        throw new CompileError(`未知の式ノード '${e.type}'`, e.line);
+    }
+  }
+
+  /** 左辺のネット列に右辺を接続する (buf ゲートで橋渡し) */
+  function connect(lhsNode, rhsBits, what, line) {
+    const lhs = refBits(lhsNode);
+    const src = resize(rhsBits, lhs.length);
+    lhs.forEach((q, i) => {
+      setDriver(q, what, line);
+      gates.push({ op: 'buf', out: q, in: [src[i]] });
+    });
+  }
+
+  // ---- 項目の処理 ----------------------------------------------------------
+  let clock = null;
+
+  for (const item of mod.items) {
+    if (item.type === 'decl') continue;
+
+    if (item.type === 'assign') {
+      const s = lookup(item.lhs.name, item.line);
+      if (s.kind === 'reg') {
+        throw new CompileError(`assign で reg '${s.name}' は駆動できない (always を使う)`, item.line);
+      }
+      if (s.dir === 'input') {
+        throw new CompileError(`入力ポート '${s.name}' は駆動できない`, item.line);
+      }
+      connect(item.lhs, evalExpr(item.rhs), 'assign 文', item.line);
+      continue;
+    }
+
+    if (item.type === 'gate') {
+      if (!GATE_PRIMITIVES.has(item.gate)) {
+        throw new CompileError(`未知のゲート '${item.gate}'`, item.line);
+      }
+      if (item.args.length < 1) throw new CompileError('ゲートの引数が足りない', item.line);
+      const [outNode, ...inNodes] = item.args;
+      if (outNode.type !== 'ref') throw new CompileError('ゲートの第1引数は出力信号名', item.line);
+
+      const unary = item.gate === 'not' || item.gate === 'buf';
+      if (unary && inNodes.length !== 1) {
+        throw new CompileError(`${item.gate} は入力 1 本 (${inNodes.length} 本指定された)`, item.line);
+      }
+      if (!unary && inNodes.length < 2) {
+        throw new CompileError(`${item.gate} は入力 2 本以上 (${inNodes.length} 本指定された)`, item.line);
+      }
+
+      const inBits = inNodes.map((n) => evalExpr(n));
+      const width = Math.max(...inBits.map((b) => b.length));
+      const padded = inBits.map((b) => resize(b, width));
+
+      const base = { and: 'and', nand: 'and', or: 'or', nor: 'or', xor: 'xor', xnor: 'xor', not: null, buf: null }[item.gate];
+      const invert = item.gate === 'nand' || item.gate === 'nor' || item.gate === 'xnor' || item.gate === 'not';
+
+      const result = [];
+      for (let b = 0; b < width; b++) {
+        let acc = padded[0][b];
+        if (base) for (let k = 1; k < padded.length; k++) acc = newGate(base, [acc, padded[k][b]]);
+        if (invert) acc = newGate('not', [acc]);
+        result.push(acc);
+      }
+      connect(outNode, result, `${item.gate} ゲート`, item.line);
+      continue;
+    }
+
+    if (item.type === 'always') {
+      const clk = lookup(item.clock, item.line);
+      if (clk.width !== 1) throw new CompileError(`クロック '${item.clock}' は 1 ビットでなければならない`, item.line);
+      if (clock && clock !== item.clock) {
+        throw new CompileError(`複数クロックは未対応 ('${clock}' と '${item.clock}')`, item.line);
+      }
+      clock = item.clock;
+      clk.isClock = true;
+
+      for (const st of item.stmts) {
+        const s = lookup(st.lhs.name, st.line);
+        if (s.kind !== 'reg') {
+          throw new CompileError(`always ブロックで代入する '${s.name}' は reg 宣言が必要`, st.line);
+        }
+        const q = refBits(st.lhs);
+        const d = resize(evalExpr(st.rhs), q.length);
+        q.forEach((qn, i) => {
+          setDriver(qn, `always @(posedge ${clock})`, st.line);
+          regs.push({ q: qn, d: d[i], line: st.line });
+        });
+      }
+      continue;
+    }
+
+    throw new CompileError(`未対応の項目 '${item.type}'`, item.line);
+  }
+
+  // ---- 未駆動ネットの検査 ---------------------------------------------------
+  const undriven = [];
+  for (const s of signals.values()) {
+    if (s.dir === 'input') continue;
+    s.bits.forEach((n) => {
+      if (!drivers.has(n)) undriven.push(nets[n].name);
+    });
+  }
+  if (undriven.length > 0) {
+    // 未駆動は 0 に固定して継続する (途中まで書いた RTL でも動かせるようにする)
+    for (const s of signals.values()) {
+      s.bits.forEach((n) => {
+        if (!drivers.has(n)) {
+          drivers.set(n, '未駆動 (0 固定)');
+          gates.push({ op: 'buf', out: n, in: [CONST0] });
+        }
+      });
+    }
+  }
+
+  return {
+    name: mod.name,
+    nets,
+    gates,
+    regs,
+    signals,
+    clock,
+    portOrder: mod.portOrder,
+    warnings: undriven.length ? [`未駆動の信号を 0 に固定しました: ${undriven.join(', ')}`] : [],
+    CONST0,
+    CONST1,
+  };
+}

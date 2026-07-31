@@ -1,0 +1,12 @@
+{
+  "name": "verilog-wasm",
+  "version": "0.1.0",
+  "description": "Verilog サブセット (ゲート + レジスタ) を WebAssembly にコンパイルする",
+  "type": "module",
+  "scripts": {
+    "test": "node test/run.js",
+    "bench": "node tools/bench.js",
+    "serve": "node tools/serve.js"
+  },
+  "license": "MIT"
+}

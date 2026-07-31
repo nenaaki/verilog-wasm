@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>verilog-wasm — Verilog を WASM にコンパイルして動かす</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel2: #1e222b;
+    --line: #2b303b;
+    --fg: #dfe3ea;
+    --dim: #8b93a3;
+    --blue: #5aa2ff;
+    --green: #4ec98a;
+    --amber: #e3b341;
+    --red: #f0776c;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.5 system-ui, "Segoe UI", "Yu Gothic UI", sans-serif;
+    display: grid; grid-template-rows: auto 1fr; overflow: hidden;
+  }
+
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  header .stats { margin-left: auto; color: var(--dim); font-family: var(--mono); font-size: 11px; }
+
+  main { display: grid; grid-template-columns: minmax(320px, 40%) 1fr; min-height: 0; }
+  .col { display: grid; min-height: 0; min-width: 0; }
+  .left { grid-template-rows: auto 1fr auto; border-right: 1px solid var(--line); }
+  .right { grid-template-rows: auto auto minmax(0, 1fr) auto; }
+
+  .bar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 7px 12px; border-bottom: 1px solid var(--line); background: var(--panel2);
+  }
+  .bar .label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+
+  select, button, input {
+    background: #232833; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 5px; padding: 4px 8px; font: inherit;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--blue); }
+  button.primary { background: #1d3a63; border-color: #2f5d9e; }
+  input[type=text] { font-family: var(--mono); width: 76px; }
+  input[type=number] { width: 62px; font-family: var(--mono); }
+
+  textarea {
+    width: 100%; height: 100%; resize: none; border: 0; outline: 0;
+    background: #0c0e12; color: var(--fg);
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.6;
+    padding: 10px 12px; tab-size: 2;
+  }
+
+  #msg { padding: 8px 12px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; min-height: 34px; }
+  #msg.err { color: var(--red); }
+  #msg.warn { color: var(--amber); }
+  #msg.ok { color: var(--green); }
+
+  .scroll { overflow: auto; min-height: 0; }
+
+  #ports {
+    display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 8px 12px; align-items: center;
+    border-bottom: 1px solid var(--line); max-height: 30vh; overflow: auto;
+  }
+  #ports .p { display: flex; align-items: center; gap: 5px; }
+  #ports .p span { font-family: var(--mono); font-size: 11.5px; color: var(--dim); }
+
+  table.wave { border-collapse: collapse; font-family: var(--mono); font-size: 11.5px; }
+  table.wave th, table.wave td { border: 1px solid var(--line); padding: 1px 6px; text-align: right; white-space: nowrap; }
+  table.wave th { background: var(--panel2); position: sticky; top: 0; z-index: 1; color: var(--dim); font-weight: 500; }
+  table.wave th.sig { left: 0; z-index: 2; text-align: left; }
+  table.wave td.sig { position: sticky; left: 0; background: var(--panel); text-align: left; color: var(--fg); }
+  table.wave td.one { color: var(--green); }
+  table.wave td.zero { color: #4b5262; }
+  table.wave tr.reg td.sig { color: var(--blue); }
+  table.wave tr.out td.sig { color: var(--amber); }
+
+  pre#wat {
+    margin: 0; padding: 10px 12px; font-family: var(--mono); font-size: 11px;
+    color: #a9b3c4; white-space: pre; background: #0c0e12;
+  }
+  .foot { padding: 6px 12px; border-top: 1px solid var(--line); color: var(--dim); font-size: 11px; display: flex; gap: 12px; align-items: center; }
+  details summary { cursor: pointer; padding: 6px 12px; border-top: 1px solid var(--line); background: var(--panel2); color: var(--dim); font-size: 11px; }
+  details[open] { display: grid; grid-template-rows: auto 1fr; min-height: 0; overflow: hidden; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>verilog-wasm</h1>
+  <span class="label" style="color:var(--dim);font-size:11px">Verilog サブセット → WebAssembly</span>
+  <span class="stats" id="stats"></span>
+</header>
+
+<main>
+  <section class="col left">
+    <div class="bar">
+      <span class="label">example</span>
+      <select id="examples"></select>
+      <button id="compile" class="primary">コンパイル (Ctrl+Enter)</button>
+    </div>
+    <textarea id="src" spellcheck="false"></textarea>
+    <div id="msg"></div>
+  </section>
+
+  <section class="col right">
+    <div class="bar">
+      <button id="reset">リセット</button>
+      <button id="step">step</button>
+      <button id="runN">run</button>
+      <input type="number" id="cycles" value="16" min="1" max="4096">
+      <span class="label" style="margin-left:auto">bench</span>
+      <button id="bench">1M クロック計測</button>
+    </div>
+    <div id="ports"></div>
+    <div class="scroll" id="waveWrap"><table class="wave" id="wave"></table></div>
+    <details id="watBox">
+      <summary>生成された WAT を見る</summary>
+      <div class="scroll"><pre id="wat"></pre></div>
+    </details>
+  </section>
+</main>
+
+<script type="module">
+import { compile, CompileError } from '../src/compile.js';
+import { WasmSimulator } from '../src/sim.js';
+import { bits } from '../src/signals.js';
+
+const EXAMPLES = {
+  'lfsr8 — 8bit LFSR (周期255)': `module lfsr8(
+  input clk,
+  output reg [7:0] q
+);
+  wire fb;
+
+  assign fb = q[7] ^ q[5] ^ q[4] ^ q[3];
+
+  always @(posedge clk)
+    q <= {q[6:0], fb};
+endmodule`,
+
+  'full_adder — 全加算器': `module full_adder(
+  input  a,
+  input  b,
+  input  cin,
+  output sum,
+  output cout
+);
+  wire axb;
+
+  assign axb  = a ^ b;
+  assign sum  = axb ^ cin;
+  assign cout = (a & b) | (cin & axb);
+endmodule`,
+
+  'shift8 — シフトレジスタ': `module shift8(
+  input clk,
+  input din,
+  output reg [7:0] q
+);
+  always @(posedge clk)
+    q <= {din, q[7:1]};
+endmodule`,
+
+  'reg_en — イネーブル付きレジスタ': `module reg_en(
+  input clk,
+  input en,
+  input [3:0] d,
+  output reg [3:0] q
+);
+  always @(posedge clk)
+    q <= en ? d : q;
+endmodule`,
+
+  'gates — ゲートプリミティブ': `module gates(input a, b, output y_and, y_or, y_xor, y_nand, y_nor, y_xnor, y_not);
+  and  g0(y_and,  a, b);
+  or   g1(y_or,   a, b);
+  xor  g2(y_xor,  a, b);
+  nand g3(y_nand, a, b);
+  nor  g4(y_nor,  a, b);
+  xnor g5(y_xnor, a, b);
+  not  g6(y_not,  a);
+endmodule`,
+
+  'ring — 組合せループ (エラーになる例)': `module ring(input a, output y);
+  wire t;
+  assign t = a & y;
+  assign y = ~t;
+endmodule`,
+};
+
+const $ = (id) => document.getElementById(id);
+const el = { src: $('src'), msg: $('msg'), stats: $('stats'), ports: $('ports'), wave: $('wave'), wat: $('wat') };
+
+let compiled = null;
+let sim = null;
+let observable = [];  // clk は step() が posedge そのものなので波形から除く
+let history = [];     // [{cycle, values:{name:bigint}}]
+const MAX_HISTORY = 64;
+
+// ---- example セレクタ ------------------------------------------------------
+for (const name of Object.keys(EXAMPLES)) {
+  const o = document.createElement('option');
+  o.textContent = name;
+  $('examples').appendChild(o);
+}
+$('examples').onchange = () => {
+  el.src.value = EXAMPLES[$('examples').value];
+  doCompile();
+};
+el.src.value = EXAMPLES[Object.keys(EXAMPLES)[0]];
+
+// ---- コンパイル -----------------------------------------------------------
+function setMsg(text, cls = '') {
+  el.msg.textContent = text;
+  el.msg.className = cls;
+}
+
+async function doCompile() {
+  try {
+    compiled = compile(el.src.value);
+    sim = await WasmSimulator.create(compiled);
+    observable = compiled.layout.signalTable.filter((t) => !t.isClock);
+    const s = compiled.stats;
+    el.stats.textContent = `top=${compiled.top}  nets=${s.nets}  gates=${s.gates}  regs=${s.regs}  state=${s.stateBytes}B  wasm=${s.wasmBytes}B`;
+    el.wat.textContent = compiled.wat;
+    setMsg(compiled.warnings.length
+      ? `コンパイル成功 / ${compiled.warnings.join(' / ')}`
+      : `コンパイル成功 — ${s.gates} ゲート / ${s.regs} レジスタ を ${s.wasmBytes} バイトの WASM に変換`,
+      compiled.warnings.length ? 'warn' : 'ok');
+    buildPorts();
+    resetSim();
+  } catch (e) {
+    compiled = null; sim = null;
+    el.stats.textContent = '';
+    el.ports.innerHTML = '';
+    el.wave.innerHTML = '';
+    setMsg(e instanceof CompileError ? e.message : `${e.name}: ${e.message}`, 'err');
+  }
+}
+
+// ---- 入力コントロール ------------------------------------------------------
+function buildPorts() {
+  el.ports.innerHTML = '';
+  for (const t of compiled.layout.signalTable) {
+    const writable = t.dir === 'input' || t.kind === 'reg';
+    if (!writable || t.isClock) continue;
+    const wrap = document.createElement('label');
+    wrap.className = 'p';
+    const label = document.createElement('span');
+    label.textContent = t.width > 1 ? `${t.name}[${t.msb}:${t.lsb}]` : t.name;
+    wrap.appendChild(label);
+
+    if (t.width === 1) {
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.onchange = () => { sim.setInput(t.name, cb.checked ? 1 : 0).eval(); sample(true); };
+      wrap.appendChild(cb);
+    } else {
+      const num = document.createElement('input');
+      num.type = 'text';
+      num.value = '0';
+      num.placeholder = '0 / 0xff';
+      num.onchange = () => {
+        try {
+          sim.setInput(t.name, BigInt(num.value.trim() || '0')).eval();
+          sample(true);
+        } catch { num.value = '0'; }
+      };
+      wrap.appendChild(num);
+    }
+    if (t.kind === 'reg') label.style.color = 'var(--blue)';
+    el.ports.appendChild(wrap);
+  }
+}
+
+// ---- 波形 ----------------------------------------------------------------
+function sample(replaceLast = false) {
+  const values = {};
+  for (const t of observable) values[t.name] = sim.get(t.name);
+  const cycle = history.length === 0 ? 0 : history[history.length - 1].cycle + (replaceLast ? 0 : 1);
+  if (replaceLast && history.length > 0) history[history.length - 1] = { cycle, values };
+  else history.push({ cycle, values });
+  if (history.length > MAX_HISTORY) history.shift();
+  renderWave();
+}
+
+function renderWave() {
+  const rows = observable;
+  const head = ['<tr><th class="sig">signal</th>'
+    + history.map((h) => `<th>${h.cycle}</th>`).join('') + '</tr>'];
+  const body = rows.map((t) => {
+    const cls = t.dir === 'output' ? 'out' : (t.kind === 'reg' ? 'reg' : '');
+    const label = t.width > 1 ? `${t.name}[${t.msb}:${t.lsb}]` : t.name;
+    const cells = history.map((h) => {
+      const v = h.values[t.name];
+      if (t.width === 1) return `<td class="${v ? 'one' : 'zero'}">${v}</td>`;
+      return `<td>${bits(v, t.width)}</td>`;
+    }).join('');
+    return `<tr class="${cls}"><td class="sig">${label}</td>${cells}</tr>`;
+  });
+  el.wave.innerHTML = head.concat(body).join('');
+  $('waveWrap').scrollLeft = $('waveWrap').scrollWidth;
+}
+
+function resetSim() {
+  sim.reset();
+  history = [];
+  // コントロールの現在値を反映
+  for (const wrap of el.ports.querySelectorAll('.p')) {
+    const input = wrap.querySelector('input');
+    const name = wrap.querySelector('span').textContent.replace(/\[.*/, '');
+    if (input.type === 'checkbox') sim.setInput(name, input.checked ? 1 : 0);
+    else { try { sim.setInput(name, BigInt(input.value.trim() || '0')); } catch {} }
+  }
+  sim.eval();
+  sample();
+}
+
+// ---- ボタン --------------------------------------------------------------
+$('compile').onclick = doCompile;
+$('reset').onclick = () => sim && resetSim();
+$('step').onclick = () => { if (sim) { sim.step(); sample(); } };
+$('runN').onclick = () => {
+  if (!sim) return;
+  const n = Math.max(1, Math.min(4096, Number($('cycles').value) || 1));
+  for (let i = 0; i < n; i++) { sim.step(); sample(); }
+};
+$('bench').onclick = () => {
+  if (!sim) return;
+  const N = 1_000_000;
+  const t0 = performance.now();
+  sim.run(N);
+  const ms = performance.now() - t0;
+  const gates = compiled.stats.gates;
+  setMsg(`${N.toLocaleString()} クロック = ${ms.toFixed(1)} ms `
+    + `(${(N / ms / 1000).toFixed(1)} Mclk/s, ${(N * gates * 64 / ms / 1e6).toFixed(1)} G gate-eval/s `
+    + `※64 レーン同時換算)`, 'ok');
+  history = [];
+  sample();
+};
+
+el.src.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doCompile(); }
+});
+
+// ---- URL からの再現用 ------------------------------------------------------
+//   ?example=lfsr8&set=q:1&run=16   のように書くと、その状態で開ける
+function setControl(name, value) {
+  for (const wrap of el.ports.querySelectorAll('.p')) {
+    if (wrap.querySelector('span').textContent.replace(/\[.*/, '') !== name) continue;
+    const input = wrap.querySelector('input');
+    if (input.type === 'checkbox') input.checked = BigInt(value) !== 0n;
+    else input.value = String(value);
+  }
+}
+
+const params = new URLSearchParams(location.search);
+const wanted = params.get('example');
+if (wanted) {
+  const hit = Object.keys(EXAMPLES).find((k) => k.startsWith(wanted));
+  if (hit) { $('examples').value = hit; el.src.value = EXAMPLES[hit]; }
+}
+
+await doCompile();
+
+if (sim && (params.has('set') || params.has('run'))) {
+  for (const pair of (params.get('set') ?? '').split(',').filter(Boolean)) {
+    const [name, value] = pair.split(':');
+    try { sim.setInput(name, BigInt(value)); setControl(name, value); } catch { /* 無効な指定は無視 */ }
+  }
+  sim.eval();
+  history = [];
+  sample();
+  const n = Math.min(Number(params.get('run') ?? 0) || 0, 512);
+  for (let i = 0; i < n; i++) { sim.step(); sample(); }
+}
+</script>
+</body>
+</html>
