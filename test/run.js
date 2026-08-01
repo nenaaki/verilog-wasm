@@ -163,7 +163,7 @@ async function testArith() {
   assign pre1  = a + b & 4'hC; // + は & より強い → (a+b) & C
   assign pre2  = a & b + 4'h1; // → a & (b+1)
   assign slice = a[2:0] + 1;
-  assign wide  = a - b;        // 左辺が広くても計算幅は max(右辺)+1 のまま
+  assign wide  = a - b;        // 8 ビット文脈で計算される (文脈依存幅)
 endmodule`;
   const { compiled, wasm, ref } = await bothSims(src);
 
@@ -180,7 +180,7 @@ endmodule`;
         pre1: ((a + b) & 0xc) & 31,
         pre2: (a & ((b + 1) & 31)) & 31,
         slice: ((a & 7) + 1) & 31,
-        wide: (a - b) & 31,     // 8 ビットに広げるのは計算の後。下の固定テスト参照
+        wide: ((a - b) % 256 + 256) % 256,   // 代入先が 8 ビットなので 8 ビットで計算される
       };
       for (const [port, want] of Object.entries(expect)) {
         for (const sim of [wasm, ref]) {
@@ -202,14 +202,12 @@ endmodule`;
   eq(wasm.get('sum'), 16, '加算: 15 + 1 は 5 ビットで 16');
   eq(wasm.get('wrap'), 0, '加算: 4 ビットに代入すると 0 に回る');
 
-  // 幅の割り切りが見える所を固定しておく。
-  // 計算幅は「代入先の幅」ではなく「右辺の max(幅)+1」で決まるので、左辺が
-  // それより広いと本物の Verilog と結果が変わる (文脈依存幅は実装していない)。
-  // 3 - 5 は 8 ビット文脈なら 251 になるが、ここでは 5 ビットで計算した 30 を
-  // ゼロ拡張して 30 になる。意図した挙動なのでテストで固定する。
+  // 計算幅は代入先の幅まで広がる (文脈依存幅)。同じ `a - b` が代入先ごとに
+  // 違う値になり、どれも Verilog と一致する。
   for (const sim of [wasm, ref]) sim.setInput('a', 3).setInput('b', 5).eval();
-  eq(wasm.get('wide'), 30, '減算: 左辺が広くても計算幅は max(右辺)+1');
-  eq(ref.get('wide'), 30, '減算: 参照実装も同じ幅規則');
+  eq(wasm.get('diff'), 30, '減算: 5 ビットに代入すると 3 - 5 は 30');
+  eq(wasm.get('wide'), 254, '減算: 8 ビットに代入すると 3 - 5 は 254');
+  eq(ref.get('wide'), 254, '減算: 参照実装も同じ');
 
   // 64 レーン同時に別々の足し算をさせる (加算器もビット単位なので効く)
   wasm.reset();
@@ -288,7 +286,8 @@ endmodule`;
         widened: a < b ? 1 : 0,
         prec1: (a < b ? 1 : 0) === 1 ? 1 : 0,
         prec2: a & 1,
-        prec3: ((a + 1) & 31) <= b ? 1 : 0,
+        // 比較のオペランドは自己決定なので a + 1 は 4 ビットで計算される
+        prec3: ((a + 1) & 15) <= b ? 1 : 0,
       };
       for (const [port, want] of Object.entries(expect)) {
         for (const sim of [w2, r2]) {
@@ -330,6 +329,139 @@ endmodule`);
     w3.setInput('a', a).setInput('b', b).step();
     eq(w3.get('q'), a <= b ? 1 : 0, `<= の曖昧性: q <= a <= b (a=${a} b=${b})`);
   }
+}
+
+// ------------------------------------------------------------ 文脈依存幅
+//
+// 「どの演算子が代入先の幅を受け取り、どれが受け取らないか」が本体なので、
+// 受け取る側と受け取らない側を並べて、同じ部分式が幅で変わることを確かめる。
+async function testContextWidth() {
+  const src = `module ctxw(
+  input [3:0] a,
+  input [3:0] b,
+  input [3:0] hi,
+  input c,
+  output [7:0] sub8,
+  output [3:0] sub4,
+  output [7:0] thruAnd,
+  output [7:0] thruTern,
+  output [7:0] thruNot,
+  output [7:0] thruShift,
+  output [7:0] inConcat,
+  output [7:0] inCmp,
+  output [7:0] cmpMutual,
+  output [7:0] inAmt,
+  output [7:0] inLogic
+);
+  // --- 文脈が配られる側 ---
+  assign sub8      = a - b;                // 8 ビットで計算
+  assign sub4      = a - b;                // 同じ式が 4 ビットで計算
+  assign thruAnd   = (a - b) & 8'hFF;      // & が 8 を下に配る
+  assign thruTern  = c ? a - b : 8'h00;    // ?: の値側に配られる
+  assign thruNot   = ~(a - b);             // ~ が配る
+  assign thruShift = hi << 4;              // << の左オペランドに配られる
+
+  // --- 文脈が配られない側 (自己決定) ---
+  assign inConcat  = {4'h0, a - b};        // 連接のパートは自己決定 (4 ビット)
+  assign inCmp     = (a - b) == 4'hE;      // 比較は外の文脈を受け取らない
+  assign cmpMutual = (a - b) == 8'hFE;     // ただし両辺は互いの max(幅) に揃う
+  assign inAmt     = hi << (a - b);        // シフト量は自己決定 (4 ビット)
+  assign inLogic   = (hi << 4) && 1'b1;    // 論理演算のオペランドは自己決定
+endmodule`;
+  const { wasm, ref } = await bothSims(src);
+
+  const mod = (v, m) => ((v % m) + m) % m;
+  let bad = null;
+  for (let a = 0; a < 16 && !bad; a++) {
+    for (let b = 0; b < 16 && !bad; b++) {
+      for (const hi of [0, 1, 10, 15]) {
+        for (const c of [0, 1]) {
+          for (const sim of [wasm, ref]) {
+            sim.setInput('a', a).setInput('b', b).setInput('hi', hi).setInput('c', c).eval();
+          }
+          const d8 = mod(a - b, 256);
+          const d4 = mod(a - b, 16);
+          const expect = {
+            sub8: d8,
+            sub4: d4,
+            thruAnd: d8,
+            thruTern: c ? d8 : 0,
+            thruNot: (~d8) & 255,
+            thruShift: (hi << 4) & 255,
+            inConcat: d4,                        // 上位ニブルは 4'h0
+            inCmp: d4 === 14 ? 1 : 0,
+            cmpMutual: d8 === 254 ? 1 : 0,
+            inAmt: d4 >= 8 ? 0 : (hi << d4) & 255,
+            inLogic: 0,                          // 4 ビットの hi << 4 は必ず 0
+          };
+          for (const [port, want] of Object.entries(expect)) {
+            for (const sim of [wasm, ref]) {
+              if (Number(sim.get(port)) !== want && !bad) {
+                bad = `${sim.constructor.name} ${port}: a=${a} b=${b} hi=${hi} c=${c}`
+                  + ` 期待 ${want} / 実際 ${sim.get(port)}`;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, '文脈依存幅: 配られる側と配られない側が全通りで一致', bad ?? '');
+
+  // 代表値を名前つきで固定する (3 - 5 は代入先の幅で 14 / 30 / 254 に変わる)
+  const widths = `module w(input [3:0] a, input [3:0] b,
+    output [3:0] w4, output [4:0] w5, output [7:0] w8, output [15:0] w16);
+    assign w4 = a - b;
+    assign w5 = a - b;
+    assign w8 = a - b;
+    assign w16 = a - b;
+  endmodule`;
+  const { wasm: ww } = await bothSims(widths);
+  ww.setInput('a', 3).setInput('b', 5).eval();
+  eq(ww.get('w4'), 14, '文脈依存幅: 3 - 5 を 4 ビットに代入すると 14');
+  eq(ww.get('w5'), 30, '文脈依存幅: 5 ビットなら 30');
+  eq(ww.get('w8'), 254, '文脈依存幅: 8 ビットなら 254');
+  eq(ww.get('w16'), 65534, '文脈依存幅: 16 ビットなら 65534');
+
+  // ノンブロッキング代入でも代入先の幅が文脈になる
+  const nb = `module n(input clk, input [3:0] a, input [3:0] b,
+    output reg [3:0] q4, output reg [7:0] q8);
+    always @(posedge clk) begin
+      q4 <= a - b;
+      q8 <= a - b;
+    end
+  endmodule`;
+  const { all: nbs } = await bothSims(nb);
+  for (const sim of nbs) {
+    sim.reset().setInput('a', 3).setInput('b', 5).step();
+    eq(sim.get('q4'), 14, `${sim.constructor.name} 文脈依存幅: always の 4 ビット代入`);
+    eq(sim.get('q8'), 254, `${sim.constructor.name} 文脈依存幅: always の 8 ビット代入`);
+  }
+
+  // 幅より大きい値を書いたサイズ付きリテラルは、文脈で広がる前に自分の幅で切られる
+  const lit = `module l(output [7:0] over, output [3:0] narrow, output [7:0] sum);
+    assign over   = 4'hFF;         // 15。8 ビット文脈でも 15 のまま
+    assign narrow = 4'hFF;         // 15
+    assign sum    = 4'hFF + 4'h1;  // 8 ビット文脈で 15 + 1 → 16
+  endmodule`;
+  const { all: lits } = await bothSims(lit);
+  for (const sim of lits) {
+    sim.eval();
+    const kind = sim.constructor.name;
+    eq(sim.get('over'), 15, `${kind} 文脈依存幅: 4'hFF は自分の幅で切られてから広がる`);
+    eq(sim.get('narrow'), 15, `${kind} 文脈依存幅: 狭い文脈でも 15`);
+    eq(sim.get('sum'), 16, `${kind} 文脈依存幅: 4'hFF + 4'h1 は 8 ビット文脈で 16`);
+  }
+
+  // 加算の桁上げも「代入先を 1 ビット広くする」で受けられる
+  const carry = `module c(input [3:0] a, input [3:0] b, output [3:0] s4, output [4:0] s5);
+    assign s4 = a + b;
+    assign s5 = a + b;
+  endmodule`;
+  const { wasm: cw } = await bothSims(carry);
+  cw.setInput('a', 15).setInput('b', 1).eval();
+  eq(cw.get('s4'), 0, '文脈依存幅: 15 + 1 を 4 ビットに代入すると 0');
+  eq(cw.get('s5'), 16, '文脈依存幅: 5 ビットなら桁上げが残って 16');
 }
 
 // -------------------------------------------------------------- 論理演算子
@@ -472,27 +604,30 @@ async function testShift() {
   input [2:0] amt,
   input [3:0] wideAmt,
   output [3:0] l1, output [3:0] l2, output [3:0] r1, output [3:0] r2,
-  output [7:0] noGrow, output [3:0] l9, output [3:0] r9,
+  output [7:0] grow, output [3:0] narrowShift, output [3:0] l9, output [3:0] r9,
   output [7:0] concatPack,
   output [3:0] vl, output [3:0] vr,
   output [3:0] vlWide, output [3:0] vrWide,
-  output [7:0] prec1, output prec2, output [7:0] prec3
+  output [7:0] prec1, output prec2,
+  output [7:0] litAmt, output [7:0] sizedAmt
 );
   assign l1 = a << 1;
   assign l2 = a << 2;
   assign r1 = a >> 1;
   assign r2 = a >> 2;
-  assign noGrow = a << 3;              // 4 ビットのまま計算 → 押し出されたビットは戻らない
+  assign grow = a << 3;                // 8 ビット文脈なので押し出されない (文脈依存幅)
+  assign narrowShift = a << 3;         // 4 ビット文脈だと押し出される
   assign l9 = a << 9;                  // 全部押し出される
   assign r9 = a >> 9;
-  assign concatPack = {a, 4'h0} | a;   // ニブル詰めは連接で書く
+  assign concatPack = {a, 4'h0} | a;   // 連接は文脈を受け取らないので常に 8 ビット
   assign vl = a << amt;                // バレルシフタ
   assign vr = a >> amt;
   assign vlWide = a << wideAmt;        // シフト量が幅より大きくなり得る
   assign vrWide = a >> wideAmt;
-  assign prec1 = a + 1 << 2;           // 算術が先 → (a+1) << 2
-  assign prec2 = a << 1 < amt;         // シフトが先 → (a<<1) < amt
-  assign prec3 = a << 1 + 1;           // 算術が先 → a << (1+1)
+  assign prec1 = a + 1 << 2;           // 算術が先 → (a+1) << 2。8 ビット文脈で計算
+  assign prec2 = a << 1 < amt;         // シフトが先 → (a<<1) < amt。比較の辺は自己決定
+  assign litAmt = a << (1 + 1);        // シフト量は自己決定。1 は 1 ビット幅なので 1+1 は 0
+  assign sizedAmt = a << (2'd1 + 2'd1);   // サイズ付きなら 2 ビットで 2
 endmodule`;
   const { wasm, ref } = await bothSims(src);
 
@@ -508,7 +643,8 @@ endmodule`;
           l2: (a << 2) & 15,
           r1: a >> 1,
           r2: a >> 2,
-          noGrow: (a << 3) & 15,     // 4 ビットで計算されるので押し出されたぶんは消える
+          grow: (a << 3) & 255,          // 8 ビット文脈で計算されるので押し出されない
+          narrowShift: (a << 3) & 15,    // 4 ビット文脈だと消える
           l9: 0,
           r9: 0,
           concatPack: ((a << 4) | a) & 255,
@@ -516,9 +652,10 @@ endmodule`;
           vr: (a >> amt) & 15,
           vlWide: (a << wideAmt) & 15,
           vrWide: wideAmt >= 4 ? 0 : (a >> wideAmt) & 15,
-          prec1: ((a + 1) << 2) & 31,   // a+1 が 5 ビットなので 5 ビットでシフトされる
+          prec1: ((a + 1) << 2) & 255,   // 8 ビット文脈が a+1 にも配られる
           prec2: ((a << 1) & 15) < amt ? 1 : 0,
-          prec3: (a << 2) & 15,
+          litAmt: a & 255,               // 1 + 1 が 1 ビットで 0 になるのでシフトされない
+          sizedAmt: (a << 2) & 255,
         };
         for (const [port, want] of Object.entries(expect)) {
           for (const sim of [wasm, ref]) {
@@ -533,15 +670,21 @@ endmodule`;
   }
   ok(!bad, 'シフト: 16 × 8 × 16 通りが JS のシフトと一致', bad ?? '');
 
-  // 幅は左オペランドのまま。リテラルでも定数式でも信号でも同じ規則になる
+  // 同じ `a << 3` が代入先の幅で変わる (文脈依存幅)。どちらも Verilog と一致する
   for (const sim of [wasm, ref]) {
     sim.setInput('a', 5).setInput('amt', 2).setInput('wideAmt', 2).eval();
   }
-  eq(wasm.get('l2'), 4, 'シフト: 5 << 2 は 4 ビットで 4 (リテラル量)');
-  eq(wasm.get('prec3'), 4, 'シフト: 5 << (1+1) も同じ 4 (定数式の量)');
-  eq(wasm.get('vlWide'), 4, 'シフト: 5 << amt も同じ 4 (信号の量)');
-  eq(wasm.get('noGrow'), 8, 'シフト: 広い左辺でも押し出されたビットは戻らない (5<<3 が 4 ビットで 8)');
-  eq(wasm.get('concatPack'), 0x55, 'シフト: ニブル詰めは連接 {a, 4\'h0} で書ける');
+  eq(wasm.get('grow'), 40, 'シフト: 8 ビットに代入すると 5 << 3 は 40');
+  eq(wasm.get('narrowShift'), 8, 'シフト: 4 ビットに代入すると 5 << 3 は 8');
+  eq(wasm.get('l2'), 4, 'シフト: 4 ビット文脈の 5 << 2 は 4');
+  eq(wasm.get('vlWide'), 4, 'シフト: 信号の量でも同じ (4 ビット文脈)');
+  eq(wasm.get('concatPack'), 0x55, 'シフト: 連接は文脈に関係なく 8 ビット');
+
+  // サイズ無し整数リテラルの幅は Verilog の 32 ビットではなく最小幅にしてある。
+  // 文脈が配られない位置 (シフト量) で足し算すると差が出る。意図した割り切りなので
+  // 固定しておく (README「サイズ無しリテラルの幅」参照)。
+  eq(wasm.get('litAmt'), 5, 'リテラル幅: a << (1 + 1) は 1+1 が 1 ビットなのでシフトされない');
+  eq(wasm.get('sizedAmt'), 20, 'リテラル幅: サイズ付きの 2\'d1 + 2\'d1 なら 2 になる');
 
   // バレルシフタの段数。8 ビットを 3 ビット量でずらすと 8×3 = 24 個の mux
   const barrel = compile('module m(input [7:0] a, input [2:0] s, output [7:0] y); assign y = a << s; endmodule');
@@ -1627,6 +1770,7 @@ const suites = [
   ['全加算器', testFullAdder],
   ['ゲートプリミティブ', testGates],
   ['加算・減算', testArith],
+  ['文脈依存幅', testContextWidth],
   ['比較器', testCompare],
   ['論理演算子', testLogical],
   ['範囲判定', testWindow],

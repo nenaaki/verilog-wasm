@@ -9,14 +9,14 @@
 //   regs   : [{ q, d, line }]                 … posedge clk の D フリップフロップ
 //   signals: Map<name, { dir, kind, msb, lsb, width, bits:[netId] }>
 //
-// 幅の解決規則 (Verilog の文脈依存幅は実装せず、単純化した規則を採用):
-//   - 二項演算は両辺を max(幅) までゼロ拡張してからビットごとに適用
-//   - + / - は桁上げが入るので max(幅)+1 で計算し、その幅を結果とする
-//   - 比較は両辺を max(幅) に揃え、結果は 1 ビット (ここは Verilog と完全に同じ)
-//   - << / >> の結果は左オペランドの幅 (Verilog のシフトの自己決定幅と同じ)
-//   - && / || / ! は両辺を OR リダクションで潰し、結果は 1 ビット (Verilog と同じ)
-//   - 代入は右辺を左辺の幅に切り詰め / ゼロ拡張
-//   - ?: と if の条件が複数ビットなら OR リダクションで 1 ビットにする
+// 幅の解決は Verilog の文脈依存幅に従う。2 段階に分かれていて、
+// selfWidth() が 1 段目 (下から自己決定幅を求める)、evalExpr(e, ctx) が 2 段目
+// (上から文脈幅を配り、文脈依存の演算子は max(自己決定幅, 文脈幅) で計算する)。
+// 詳しくは selfWidth() の上のコメントと README「幅の規則」を参照。
+//
+// Verilog と違うのはサイズ無し整数リテラルの幅だけ。LRM は 32 ビットだが、
+// ここでは値が収まる最小幅にしている (32 ビットにすると q + 1 が 32 ビット
+// 加算器になり、定数畳み込みも刈り取りも無いので死んだ論理がそのまま残る)。
 
 import { CompileError } from './errors.js';
 import { GATE_PRIMITIVES } from './parser.js';
@@ -144,23 +144,14 @@ export function elaborate(mod) {
   }
 
   /**
-   * a + b / a - b。
-   *
-   * 両辺を max(幅)+1 まで広げてから計算する。この「先に広げる」のが要点で、
-   * 元の幅で計算して桁上げを上に足す形にすると減算が合わない
-   * (4 ビットの 3 - 5 は、5 ビットの文脈では 14 ではなく 30)。
+   * a + b / a - b。両辺は呼び出し側で実効幅に揃えてある (文脈依存幅を配った結果)。
+   * その幅で計算して桁上げ出力は捨てる — これが Verilog の意味論そのもので、
+   * 桁上げを残したければ代入先を 1 ビット広くする、という形になる。
    * 減算は b を反転して桁上げ入力 1、つまり 2 の補数で足す。
-   *
-   * ここで決まるのは「右辺だけを見た幅」で、代入先の幅は見ない。Verilog 本来の
-   * 文脈依存幅では代入先も計算幅に入るので、左辺が max(幅)+1 より広いと結果が
-   * 変わる (8 ビットに代入する 3 - 5 は本来 251、ここでは 30)。文脈依存幅は
-   * 実装しない方針なので、この差は割り切りとして受け入れている。
    */
   function addSub(a, b, op) {
-    const w = Math.max(a.length, b.length) + 1;
-    const aa = resize(a, w);
-    const bb = op === '+' ? resize(b, w) : resize(b, w).map((n) => newGate('not', [n]));
-    return addBits(aa, bb, op === '+' ? CONST0 : CONST1);
+    const bb = op === '+' ? b : b.map((n) => newGate('not', [n]));
+    return addBits(a, bb, op === '+' ? CONST0 : CONST1);
   }
 
   /**
@@ -260,73 +251,139 @@ export function elaborate(mod) {
     return acc;
   }
 
-  function evalExpr(e) {
+  // ---- 自己決定幅 (文脈依存幅の 1 段目) --------------------------------------
+  //
+  // Verilog は式の幅を 2 段階で決める:
+  //   1. 下から「自己決定幅」を求める            … ここ
+  //   2. 上から文脈幅を配り、文脈依存の演算子は max(自己決定幅, 文脈幅) で計算する
+  //
+  // 演算子は「文脈を受け取るもの」と「受け取らないもの」に分かれる:
+  //   受け取る … ~ & | ^ + - (単項も)、?: の値側、シフトの左オペランド
+  //   受け取らない … 比較・論理演算 (結果 1 ビット)、連接、ビット選択、
+  //                  シフト量、?: の条件
+  //
+  // ゲートは作らないので、同じノードを何度尋ねても副作用は無い。ノードごとに
+  // 結果をキャッシュして、深い式で何度も辿らないようにしてある。
+  const selfWidthCache = new Map();
+
+  function selfWidth(e) {
+    const hit = selfWidthCache.get(e);
+    if (hit !== undefined) return hit;
+    const w = computeSelfWidth(e);
+    selfWidthCache.set(e, w);
+    return w;
+  }
+
+  function computeSelfWidth(e) {
+    switch (e.type) {
+      case 'num':
+        return e.width;
+      case 'ref':
+        return refBits(e).length;        // refBits は純粋 (既存のネット ID を返すだけ)
+      case 'un':
+        return e.op === '!' ? 1 : selfWidth(e.a);
+      case 'bin':
+        if (e.op === '&&' || e.op === '||') return 1;
+        if (e.op === '==' || e.op === '!=' || CMP[e.op]) return 1;
+        if (e.op === '<<' || e.op === '>>') return selfWidth(e.a);
+        return Math.max(selfWidth(e.a), selfWidth(e.b));
+      case 'tern':
+        return Math.max(selfWidth(e.a), selfWidth(e.b));
+      case 'concat':
+        return e.parts.reduce((sum, p) => sum + selfWidth(p), 0);
+      default:
+        throw new CompileError(`未知の式ノード '${e.type}'`, e.line);
+    }
+  }
+
+  /**
+   * 式を LSB 先頭のネット配列に展開する (文脈依存幅の 2 段目)。
+   *
+   * ctx は上から配られてくる文脈幅。0 は「文脈なし」= 自己決定幅で計算する、の意味。
+   * 実効幅は max(自己決定幅, ctx) で、文脈依存の演算子はこれを子に配る。
+   * 返す配列の長さは必ず実効幅になるので、呼び出し側は代入先の幅に resize するだけ。
+   */
+  function evalExpr(e, ctx = 0) {
+    const w = Math.max(selfWidth(e), ctx);
+
     switch (e.type) {
       case 'num': {
         const out = [];
-        for (let b = 0; b < e.width; b++) {
-          out.push((e.bits >> BigInt(b)) & 1n ? CONST1 : CONST0);
+        for (let b = 0; b < w; b++) {
+          // 自分の幅より上は 0。ここでマスクしないと 4'hFF が 255 のまま広がる
+          const bit = b < e.width ? (e.bits >> BigInt(b)) & 1n : 0n;
+          out.push(bit === 1n ? CONST1 : CONST0);
         }
         return out;
       }
       case 'ref':
-        return refBits(e);
+        return resize(refBits(e), w);
       case 'un': {
-        const a = evalExpr(e.a);
-        if (e.op === '~') return a.map((n) => newGate('not', [n]));
-        if (e.op === '-') {
-          // 2 の補数で符号反転。幅は変えない (Verilog の単項 - も同じ)
-          const inv = a.map((n) => newGate('not', [n]));
-          return addBits(inv, Array(a.length).fill(CONST0), CONST1);
-        }
         if (e.op === '!') {
           // 論理否定は「全ビット 0 か」なので OR リダクションの反転。結果は 1 ビット。
-          // ビットごとに反転する ~ と違うのはここ (~4'b0010 は 4'b1101、!4'b0010 は 0)
-          return [newGate('not', [reduceOr(a, e.line)])];
+          // ビットごとに反転する ~ と違うのはここ (~4'b0010 は 4'b1101、!4'b0010 は 0)。
+          // 中身は自己決定なので文脈を渡さない。
+          return resize([newGate('not', [reduceOr(evalExpr(e.a), e.line)])], w);
+        }
+        const a = evalExpr(e.a, w);        // ~ と単項 - は文脈依存
+        if (e.op === '~') return a.map((n) => newGate('not', [n]));
+        if (e.op === '-') {
+          // 2 の補数で符号反転
+          const inv = a.map((n) => newGate('not', [n]));
+          return addBits(inv, Array(w).fill(CONST0), CONST1);
         }
         throw new CompileError(`未対応の単項演算子 '${e.op}'`, e.line);
       }
       case 'bin': {
-        const a = evalExpr(e.a);
-        const b = evalExpr(e.b);
-        if (e.op === '+' || e.op === '-') return addSub(a, b, e.op);
-        if (e.op === '==' || e.op === '!=') return equalBits(a, b, e.op);
-        if (CMP[e.op]) return compareBits(a, b, e.op);
-        if (e.op === '<<' || e.op === '>>') {
-          // リテラルなら並べ替えだけ、信号ならバレルシフタ。どちらも幅は変わらない
-          return e.b.type === 'num'
-            ? shiftFixed(a, Number(e.b.bits), e.op)
-            : barrelShift(a, b, e.op);
-        }
+        // --- 文脈を受け取らないもの (結果 1 ビット) ---
         if (e.op === '&&' || e.op === '||') {
-          // 両辺を「0 でないか」に潰してからゲート 1 個。結果は 1 ビット。
+          // 両辺を「0 でないか」に潰してからゲート 1 個。
           // 短絡評価は無い (ハードウェアなので両辺とも常に評価される)。式に副作用が
           // 無いので観測できる違いにはならない。
-          const l = reduceOr(a, e.line);
-          const r = reduceOr(b, e.line);
-          return [newGate(e.op === '&&' ? 'and' : 'or', [l, r])];
+          const l = reduceOr(evalExpr(e.a), e.line);
+          const r = reduceOr(evalExpr(e.b), e.line);
+          return resize([newGate(e.op === '&&' ? 'and' : 'or', [l, r])], w);
         }
-        const w = Math.max(a.length, b.length);
-        const aa = resize(a, w);
-        const bb = resize(b, w);
+        if (e.op === '==' || e.op === '!=' || CMP[e.op]) {
+          // 比較は外の文脈を受け取らないが、2 つのオペランドが互いの max(幅) に
+          // 揃えられる。つまりオペランド 2 つだけで文脈を作る。
+          // (8 ビットのリテラルと比べると、左辺の a - b も 8 ビットで計算される)
+          const cw = Math.max(selfWidth(e.a), selfWidth(e.b));
+          const l = evalExpr(e.a, cw);
+          const r = evalExpr(e.b, cw);
+          const bits = CMP[e.op] ? compareBits(l, r, e.op) : equalBits(l, r, e.op);
+          return resize(bits, w);
+        }
+
+        // --- シフト: 左は文脈依存、シフト量は自己決定 ---
+        if (e.op === '<<' || e.op === '>>') {
+          const a = evalExpr(e.a, w);
+          // リテラルなら並べ替えだけ、信号ならバレルシフタ
+          return e.b.type === 'num'
+            ? shiftFixed(a, Number(e.b.bits), e.op)
+            : barrelShift(a, evalExpr(e.b), e.op);
+        }
+
+        // --- 残り (ビット演算・算術) は両辺とも文脈依存 ---
+        const a = evalExpr(e.a, w);
+        const b = evalExpr(e.b, w);
+        if (e.op === '+' || e.op === '-') return addSub(a, b, e.op);
         const op = { '&': 'and', '|': 'or', '^': 'xor' }[e.op];
         if (!op) throw new CompileError(`未対応の二項演算子 '${e.op}'`, e.line);
-        return aa.map((n, i) => newGate(op, [n, bb[i]]));
+        return a.map((n, i) => newGate(op, [n, b[i]]));
       }
       case 'tern': {
-        const sel = reduceOr(evalExpr(e.sel), e.line);
-        const a = evalExpr(e.a);
-        const b = evalExpr(e.b);
-        const w = Math.max(a.length, b.length);
-        const aa = resize(a, w);
-        const bb = resize(b, w);
-        return aa.map((n, i) => newGate('mux', [sel, n, bb[i]]));
+        const sel = reduceOr(evalExpr(e.sel), e.line);   // 条件は自己決定
+        const a = evalExpr(e.a, w);
+        const b = evalExpr(e.b, w);
+        return a.map((n, i) => newGate('mux', [sel, n, b[i]]));
       }
       case 'concat': {
-        // {msb側, ..., lsb側} なので、LSB 先頭配列では逆順に連結する
+        // {msb側, ..., lsb側} なので、LSB 先頭配列では逆順に連結する。
+        // 各パートは自己決定 — 文脈は中に伝わらない (だから幅が曖昧にならない)
         const out = [];
         for (let i = e.parts.length - 1; i >= 0; i--) out.push(...evalExpr(e.parts[i]));
-        return out;
+        return resize(out, w);
       }
       default:
         throw new CompileError(`未知の式ノード '${e.type}'`, e.line);
@@ -370,7 +427,8 @@ export function elaborate(mod) {
     for (const st of stmts) {
       if (st.type === 'nb') {
         const q = lhsRegBits(st.lhs, st.line);
-        const d = resize(evalExpr(st.rhs), q.length);
+        // 代入先の幅が右辺の文脈幅になる (文脈依存幅)
+        const d = resize(evalExpr(st.rhs, q.length), q.length);
         q.forEach((qn, i) => {
           cur.set(qn, d[i]);
           regLine.set(qn, st.line);
@@ -387,7 +445,13 @@ export function elaborate(mod) {
       }
 
       if (st.type === 'case') {
-        const sel = evalExpr(st.sel);
+        // case 式と全ラベルは、そのすべての max(幅) に揃えられる (Verilog の規則)。
+        // 符号なししか無いので結果は max(2 つ) と同じになるが、規則どおりにしておく。
+        let cw = selfWidth(st.sel);
+        for (const it of st.items) {
+          for (const label of it.labels) cw = Math.max(cw, selfWidth(label));
+        }
+        const sel = evalExpr(st.sel, cw);
         // default (無ければ「保持」) を土台にして後ろの項目から積む。こうすると
         // 先に書いた項目の mux が外側に来て、Verilog の「上から順に最初に一致
         // したものが勝つ」がそのまま出る。
@@ -396,7 +460,7 @@ export function elaborate(mod) {
           const it = st.items[k];
           let cond = null;
           for (const label of it.labels) {
-            const hit = equalBits(sel, evalExpr(label), '==')[0];
+            const hit = equalBits(sel, evalExpr(label, cw), '==')[0];
             cond = cond === null ? hit : newGate('or', [cond, hit]);
           }
           acc = mergeStates(cond, runStmts(it.stmts, new Map(cur)), acc, cur);
@@ -434,7 +498,9 @@ export function elaborate(mod) {
       if (s.dir === 'input') {
         throw new CompileError(`入力ポート '${s.name}' は駆動できない`, item.line);
       }
-      connect(item.lhs, evalExpr(item.rhs), 'assign 文', item.line);
+      // 代入先の幅が右辺の文脈幅になる (文脈依存幅)
+      const lhsWidth = refBits(item.lhs).length;
+      connect(item.lhs, evalExpr(item.rhs, lhsWidth), 'assign 文', item.line);
       continue;
     }
 
