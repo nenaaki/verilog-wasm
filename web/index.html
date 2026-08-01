@@ -201,6 +201,20 @@ endmodule`,
     q <= tc ? 8'h00 : q + 1;
 endmodule`,
 
+  'window — 範囲判定 (&& と ! / 比較器)': `module window(
+  input  [3:0] x,
+  input  [3:0] lo,
+  input  [3:0] hi,
+  input  valid,
+  output inside,
+  output outside,
+  output empty
+);
+  assign inside  = valid && (x >= lo) && (x <= hi);
+  assign outside = !inside;
+  assign empty   = lo > hi;
+endmodule`,
+
   'shifter — 定数シフトとバレルシフタ': `module shifter(
   input  [3:0] hi,
   input  [3:0] lo,

@@ -14,6 +14,7 @@
 //   - + / - は桁上げが入るので max(幅)+1 で計算し、その幅を結果とする
 //   - 比較は両辺を max(幅) に揃え、結果は 1 ビット (ここは Verilog と完全に同じ)
 //   - << / >> の結果は左オペランドの幅 (Verilog のシフトの自己決定幅と同じ)
+//   - && / || / ! は両辺を OR リダクションで潰し、結果は 1 ビット (Verilog と同じ)
 //   - 代入は右辺を左辺の幅に切り詰め / ゼロ拡張
 //   - ?: と if の条件が複数ビットなら OR リダクションで 1 ビットにする
 
@@ -278,6 +279,11 @@ export function elaborate(mod) {
           const inv = a.map((n) => newGate('not', [n]));
           return addBits(inv, Array(a.length).fill(CONST0), CONST1);
         }
+        if (e.op === '!') {
+          // 論理否定は「全ビット 0 か」なので OR リダクションの反転。結果は 1 ビット。
+          // ビットごとに反転する ~ と違うのはここ (~4'b0010 は 4'b1101、!4'b0010 は 0)
+          return [newGate('not', [reduceOr(a, e.line)])];
+        }
         throw new CompileError(`未対応の単項演算子 '${e.op}'`, e.line);
       }
       case 'bin': {
@@ -291,6 +297,14 @@ export function elaborate(mod) {
           return e.b.type === 'num'
             ? shiftFixed(a, Number(e.b.bits), e.op)
             : barrelShift(a, b, e.op);
+        }
+        if (e.op === '&&' || e.op === '||') {
+          // 両辺を「0 でないか」に潰してからゲート 1 個。結果は 1 ビット。
+          // 短絡評価は無い (ハードウェアなので両辺とも常に評価される)。式に副作用が
+          // 無いので観測できる違いにはならない。
+          const l = reduceOr(a, e.line);
+          const r = reduceOr(b, e.line);
+          return [newGate(e.op === '&&' ? 'and' : 'or', [l, r])];
         }
         const w = Math.max(a.length, b.length);
         const aa = resize(a, w);

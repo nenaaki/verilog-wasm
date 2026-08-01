@@ -1,9 +1,10 @@
 // Verilog サブセット → AST
 //
 // 式の優先順位 (低い順):
-//   ?:  |  ^  &  == !=  < <= > >=  << >>  + -  単項 (~ - +)  primary
-// これは Verilog 本来の優先順位と一致する。等価 (== !=) は関係 (< など) より弱く、
-// 関係はシフトより弱く、シフトは算術より弱い。どれもビット演算より強い。
+//   ?:  ||  &&  |  ^  &  == !=  < <= > >=  << >>  + -  単項 (~ - + !)  primary
+// これは Verilog 本来の優先順位と一致する。論理演算子 (|| &&) はビット演算より
+// 弱く、等価 (== !=) は関係 (< など) より弱く、関係はシフトより弱く、シフトは
+// 算術より弱い。
 //
 // '<=' はノンブロッキング代入と「以下」の両方に使われる。always 文の代入は
 // parseLValue で左辺を読んでから expect('<=') で食べるので、式の中に出てきた
@@ -58,7 +59,7 @@ export function parse(src) {
 
   // ---- 式 ----------------------------------------------------------------
   function parseExpr() {
-    const cond = parseOr();
+    const cond = parseLogOr();
     if (eat('?')) {
       const a = parseExpr();
       expect(':');
@@ -89,9 +90,11 @@ export function parse(src) {
   const parseAnd = binaryLevel('&', parseEq);
   const parseXor = binaryLevel('^', parseAnd);
   const parseOr = binaryLevel('|', parseXor);
+  const parseLogAnd = binaryLevel('&&', parseOr);
+  const parseLogOr = binaryLevel('||', parseLogAnd);
 
   function parseUnary() {
-    if (at('~') || at('-')) {
+    if (at('~') || at('-') || at('!')) {
       const t = next();
       return { type: 'un', op: t.value, a: parseUnary(), line: t.line };
     }

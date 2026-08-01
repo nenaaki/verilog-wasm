@@ -332,6 +332,130 @@ endmodule`);
   }
 }
 
+// -------------------------------------------------------------- 論理演算子
+//
+// ビットごとに働く ~ / & / | と混同しやすいので、両方を並べて JS と比べる。
+async function testLogical() {
+  const src = `module lg(
+  input [3:0] a,
+  input [3:0] b,
+  output land, output lor, output lnot, output dblNot,
+  output [3:0] bitNot, output [3:0] bitAnd,
+  output chain, output precBitOr, output precEq, output precUnary,
+  output [7:0] widened, output tern, output selfAnd
+);
+  assign land   = a && b;
+  assign lor    = a || b;
+  assign lnot   = !a;
+  assign dblNot = !!a;            // 0 でないか
+  assign bitNot = ~a;             // ビットごと。!a と区別できるか
+  assign bitAnd = a & b;
+  assign chain  = a && b || !a;   // && は || より強い
+  assign precBitOr = a | b && 4'h0;  // | は && より強い → (a|b) && 0
+  assign precEq = a && b == b;    // == は && より強い → a && (b==b)
+  assign precUnary = !a == 1'b1;  // 単項は == より強い → (!a) == 1
+  assign widened = a && b;        // 結果は 1 ビットなのでゼロ拡張される
+  assign tern = a || b ? 1'b1 : 1'b0;
+  assign selfAnd = a && a;
+endmodule`;
+  const { wasm, ref } = await bothSims(src);
+
+  let bad = null;
+  for (let a = 0; a < 16 && !bad; a++) {
+    for (let b = 0; b < 16 && !bad; b++) {
+      for (const sim of [wasm, ref]) sim.setInput('a', a).setInput('b', b).eval();
+      const A = a !== 0;
+      const B = b !== 0;
+      const expect = {
+        land: A && B ? 1 : 0,
+        lor: A || B ? 1 : 0,
+        lnot: A ? 0 : 1,
+        dblNot: A ? 1 : 0,
+        bitNot: (~a) & 15,
+        bitAnd: a & b,
+        chain: (A && B) || !A ? 1 : 0,
+        precBitOr: 0,                    // (a|b) && 0 は常に 0
+        precEq: A ? 1 : 0,               // b == b は常に真
+        precUnary: A ? 0 : 1,            // (!a) == 1
+        widened: A && B ? 1 : 0,
+        tern: A || B ? 1 : 0,
+        selfAnd: A ? 1 : 0,
+      };
+      for (const [port, want] of Object.entries(expect)) {
+        for (const sim of [wasm, ref]) {
+          if (Number(sim.get(port)) !== want && !bad) {
+            bad = `${sim.constructor.name} ${port}: a=${a} b=${b}`
+              + ` 期待 ${want} / 実際 ${sim.get(port)}`;
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, '論理演算子: 全 256 通りが JS の論理と一致 (優先順位込み)', bad ?? '');
+
+  // ! と ~ の違いを 1 点で押さえる
+  for (const sim of [wasm, ref]) sim.setInput('a', 0b0010).setInput('b', 1).eval();
+  eq(wasm.get('lnot'), 0, '論理否定: !4\'b0010 は 0');
+  eq(wasm.get('bitNot'), 0b1101, 'ビット反転: ~4\'b0010 は 4\'b1101');
+
+  // 4 ビットの && は OR リダクション 3 個 × 2 辺 + and 1 個
+  const plain = compile('module m(input [3:0] a, output y); assign y = a[0]; endmodule');
+  const logAnd = compile('module m(input [3:0] a, input [3:0] b, output y); assign y = a && b; endmodule');
+  eqs(logAnd.stats.gates - plain.stats.gates, 7,
+    '論理演算子: 4 ビット同士の && は or 6 個 + and 1 個',
+    `差分=${logAnd.stats.gates - plain.stats.gates}`);
+
+  // 1 ビット同士なら潰す必要がないのでゲート 1 個
+  const bit1 = compile('module m(input a, input b, output y); assign y = a && b; endmodule');
+  const bit1ref = compile('module m(input a, input b, output y); assign y = a & b; endmodule');
+  eqs(bit1.stats.gates, bit1ref.stats.gates,
+    '論理演算子: 1 ビット同士の && は & と同じゲート数',
+    `&&=${bit1.stats.gates} &=${bit1ref.stats.gates}`);
+
+  // 64 レーン
+  wasm.reset();
+  for (let lane = 0; lane < 64; lane++) {
+    wasm.setInputLane('a', lane, lane & 3).setInputLane('b', lane, (lane >> 2) & 3);
+  }
+  wasm.eval();
+  const lanes = wasm.getLanes('land');
+  let laneBad = 0;
+  for (let lane = 0; lane < 64; lane++) {
+    const want = (lane & 3) !== 0 && ((lane >> 2) & 3) !== 0 ? 1 : 0;
+    if (Number(lanes[lane]) !== want) laneBad++;
+  }
+  ok(laneBad === 0, '論理演算子: 64 レーンが独立に評価される', `${laneBad} レーン不一致`);
+}
+
+// ------------------------------------------------ 論理演算子を使った回路
+async function testWindow() {
+  const { all } = await bothSims(example('window.v'));
+  for (const sim of all) {
+    const kind = sim.constructor.name;
+    let bad = null;
+    for (let x = 0; x < 16 && !bad; x++) {
+      for (let lo = 0; lo < 16 && !bad; lo++) {
+        for (let hi = 0; hi < 16 && !bad; hi++) {
+          for (const valid of [0, 1]) {
+            sim.setInput('x', x).setInput('lo', lo).setInput('hi', hi).setInput('valid', valid).eval();
+            const inside = valid !== 0 && x >= lo && x <= hi ? 1 : 0;
+            if (Number(sim.get('inside')) !== inside) {
+              bad = `inside: x=${x} lo=${lo} hi=${hi} valid=${valid}`
+                + ` 期待 ${inside} / 実際 ${sim.get('inside')}`;
+            } else if (Number(sim.get('outside')) !== 1 - inside) {
+              bad = `outside: x=${x} lo=${lo} hi=${hi} valid=${valid} 実際 ${sim.get('outside')}`;
+            } else if (Number(sim.get('empty')) !== (lo > hi ? 1 : 0)) {
+              bad = `empty: lo=${lo} hi=${hi} 実際 ${sim.get('empty')}`;
+            }
+            if (bad) break;
+          }
+        }
+      }
+    }
+    ok(!bad, `${kind} window: 範囲判定が全 16×16×16×2 通り一致`, bad ?? '');
+  }
+}
+
 // ------------------------------------------------------------------ シフト
 //
 // 定数シフトと可変シフトで幅の扱いが変わるので、両方を JS のシフトと比べる。
@@ -868,8 +992,11 @@ async function testErrors() {
     ['>>> は未対応',
       `module m(input [3:0] a, output [3:0] y); assign y = a >>> 1; endmodule`,
       />>> は未対応/],
-    ['論理演算子は未対応',
-      `module m(input a, b, output y); assign y = a && b; endmodule`,
+    ['リダクション演算子は未対応',
+      `module m(input [3:0] a, output y); assign y = &a; endmodule`,
+      /式が必要/],
+    ['リダクション ^ も未対応',
+      `module m(input [3:0] a, output y); assign y = ^a; endmodule`,
       /式が必要/],
     ['casez は未対応',
       `module m(input clk, input [1:0] s, output reg q);
@@ -939,10 +1066,15 @@ function randomDesign(rng, nWires) {
       if (k < 0.5) return `1'b${Math.floor(rng() * 2)}`;
       return s;
     }
-    if (r < 0.42) return `(~${expr(depth - 1)})`;
-    if (r < 0.55) return `(${expr(depth - 1)} & ${expr(depth - 1)})`;
-    if (r < 0.65) return `(${expr(depth - 1)} | ${expr(depth - 1)})`;
-    if (r < 0.75) return `(${expr(depth - 1)} ^ ${expr(depth - 1)})`;
+    if (r < 0.4) return `(~${expr(depth - 1)})`;
+    if (r < 0.52) return `(${expr(depth - 1)} & ${expr(depth - 1)})`;
+    if (r < 0.62) return `(${expr(depth - 1)} | ${expr(depth - 1)})`;
+    if (r < 0.72) return `(${expr(depth - 1)} ^ ${expr(depth - 1)})`;
+    if (r < 0.75) {
+      const lg = ['&&', '||'][Math.floor(rng() * 2)];
+      return `(${expr(depth - 1)} ${lg} ${expr(depth - 1)})`;
+    }
+    if (r < 0.77) return `(!${expr(depth - 1)})`;
     if (r < 0.79) return `(${expr(depth - 1)} + ${expr(depth - 1)})`;
     if (r < 0.84) return `(${expr(depth - 1)} - ${expr(depth - 1)})`;
     if (r < 0.86) return `(-${expr(depth - 1)})`;
@@ -1012,7 +1144,7 @@ async function testRandomDiff() {
   let mismatch = null;
 
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
-  const seen = { 'if': 0, 'case': 0, '+ / -': 0, '比較': 0, 'シフト': 0 };
+  const seen = { 'if': 0, 'case': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0 };
 
   for (let d = 0; d < 25 && !mismatch; d++) {
     const src = randomDesign(rng, 6);
@@ -1021,6 +1153,7 @@ async function testRandomDiff() {
     if (/[-+] /.test(src)) seen['+ / -']++;
     if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
     if (/(<<|>>)/.test(src)) seen['シフト']++;
+    if (/(&&|\|\||\(!)/.test(src)) seen['論理']++;
     let compiled;
     try {
       compiled = compile(src);
@@ -1495,6 +1628,8 @@ const suites = [
   ['ゲートプリミティブ', testGates],
   ['加算・減算', testArith],
   ['比較器', testCompare],
+  ['論理演算子', testLogical],
+  ['範囲判定', testWindow],
   ['シフト', testShift],
   ['シフト回路', testShifter],
   ['if / case', testIfCase],
