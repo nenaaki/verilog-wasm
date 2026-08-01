@@ -332,6 +332,148 @@ endmodule`);
   }
 }
 
+// ---------------------------------------------- 定数畳み込みと共通部分式除去
+//
+// ゲートを作る所でたたむので、たたんだ結果が正しいことを真理値表で押さえる。
+// ゲート数の主張は「同じ意味の書き方どうしで一致する」形にして、実装が変わっても
+// 意味のある不変条件が残るようにしてある。
+async function testFoldCse() {
+  // --- たたんだ結果が真理値表として正しいか ---
+  const src = `module f(
+  input a,
+  input b,
+  input [3:0] v,
+  output andZero, output andOne, output orOne, output orZero,
+  output xorZero, output xorOne, output notNot,
+  output selfAnd, output selfOr, output selfXor,
+  output muxTrue, output muxFalse, output muxSame, output muxIdent, output muxInv,
+  output [3:0] maskLow, output [3:0] orAll
+);
+  assign andZero  = a & 1'b0;
+  assign andOne   = a & 1'b1;
+  assign orOne    = a | 1'b1;
+  assign orZero   = a | 1'b0;
+  assign xorZero  = a ^ 1'b0;
+  assign xorOne   = a ^ 1'b1;
+  assign notNot   = ~(~a);
+  assign selfAnd  = a & a;
+  assign selfOr   = a | a;
+  assign selfXor  = a ^ a;
+  assign muxTrue  = 1'b1 ? a : b;
+  assign muxFalse = 1'b0 ? a : b;
+  assign muxSame  = b ? a : a;
+  assign muxIdent = a ? 1'b1 : 1'b0;
+  assign muxInv   = a ? 1'b0 : 1'b1;
+  assign maskLow  = v & 4'b0011;
+  assign orAll    = v | 4'b1111;
+endmodule`;
+  const { compiled, wasm, ref } = await bothSims(src);
+
+  let bad = null;
+  for (let a = 0; a < 2 && !bad; a++) {
+    for (let b = 0; b < 2 && !bad; b++) {
+      for (let v = 0; v < 16 && !bad; v++) {
+        for (const sim of [wasm, ref]) {
+          sim.setInput('a', a).setInput('b', b).setInput('v', v).eval();
+        }
+        const expect = {
+          andZero: 0, andOne: a, orOne: 1, orZero: a,
+          xorZero: a, xorOne: 1 - a, notNot: a,
+          selfAnd: a, selfOr: a, selfXor: 0,
+          muxTrue: a, muxFalse: b, muxSame: a, muxIdent: a, muxInv: 1 - a,
+          maskLow: v & 3, orAll: 15,
+        };
+        for (const [port, want] of Object.entries(expect)) {
+          for (const sim of [wasm, ref]) {
+            if (Number(sim.get(port)) !== want && !bad) {
+              bad = `${sim.constructor.name} ${port}: a=${a} b=${b} v=${v}`
+                + ` 期待 ${want} / 実際 ${sim.get(port)}`;
+            }
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, '畳み込み: たたんだ 17 通りの形が真理値表と一致', bad ?? '');
+
+  // 上の回路は全部たためるので、論理ゲートが 1 個も残らないはず
+  // (残るのは出力を駆動する buf、~a の not、定数ゲートだけ)
+  const kindsOf = (c) => {
+    const n = {};
+    for (const gi of c.order) {
+      const op = c.netlist.gates[gi].op;
+      n[op] = (n[op] ?? 0) + 1;
+    }
+    return n;
+  };
+  const kinds = kindsOf(compiled);
+  ok(!kinds.and && !kinds.or && !kinds.xor && !kinds.mux,
+    '畳み込み: and / or / xor / mux が 1 個も残らない', JSON.stringify(kinds));
+
+  // --- 定数を含む形が、定数を書かない形と同じ回路になるか ---
+  const pairs = [
+    ['a & 1\'b1 と a', 'assign y = a & 1\'b1;', 'assign y = a;'],
+    ['a ^ 1\'b0 と a', 'assign y = a ^ 1\'b0;', 'assign y = a;'],
+    ['~(~a) と a', 'assign y = ~(~a);', 'assign y = a;'],
+    ['a ? 1\'b1 : 1\'b0 と a', 'assign y = a ? 1\'b1 : 1\'b0;', 'assign y = a;'],
+    ['v + 4\'d0 と v', 'assign y = v + 4\'d0;', 'assign y = v;'],
+    ['v - 4\'d0 と v', 'assign y = v - 4\'d0;', 'assign y = v;'],
+    ['v << 0 と v', 'assign y = v << 0;', 'assign y = v;'],
+  ];
+  for (const [label, folded, plainBody] of pairs) {
+    const wrap = (body) => `module m(input a, input [3:0] v, output [3:0] y); ${body} endmodule`;
+    const f = compile(wrap(folded));
+    const g = compile(wrap(plainBody));
+    eqs(f.stats.gates, g.stats.gates, `畳み込み: ${label} が同じゲート数`,
+      `${f.stats.gates} vs ${g.stats.gates}`);
+  }
+
+  // --- 共通部分式除去 ---
+  // 同じ式を 2 回書いても、2 回目はゲートを作らない
+  const once = compile('module m(input [3:0] a, input [3:0] b, output [3:0] y); assign y = a ^ b; endmodule');
+  const twice = compile(`module m(input [3:0] a, input [3:0] b, output [3:0] y, output [3:0] z);
+    assign y = a ^ b;
+    assign z = a ^ b;
+  endmodule`);
+  eqs(twice.stats.gates - once.stats.gates, 4,
+    'CSE: 同じ式を 2 回書いても増えるのは出力の buf 4 個だけ',
+    `1 回=${once.stats.gates} 2 回=${twice.stats.gates}`);
+
+  // 入力の順番が違っても同じゲートになる (and / or / xor は可換)
+  const swapped = compile(`module m(input [3:0] a, input [3:0] b, output [3:0] y, output [3:0] z);
+    assign y = a & b;
+    assign z = b & a;
+  endmodule`);
+  const oneAnd = compile('module m(input [3:0] a, input [3:0] b, output [3:0] y); assign y = a & b; endmodule');
+  eqs(swapped.stats.gates - oneAnd.stats.gates, 4,
+    'CSE: a & b と b & a が共有される', `${oneAnd.stats.gates} → ${swapped.stats.gates}`);
+
+  // 共有しても値は正しい
+  const { all: sw } = await bothSims(`module m(input [3:0] a, input [3:0] b, output [3:0] y, output [3:0] z);
+    assign y = a & b;
+    assign z = b & a;
+  endmodule`);
+  for (const sim of sw) {
+    let mismatch = 0;
+    for (let a = 0; a < 16; a++) {
+      for (let b = 0; b < 16; b++) {
+        sim.setInput('a', a).setInput('b', b).eval();
+        if (Number(sim.get('y')) !== (a & b) || Number(sim.get('z')) !== (a & b)) mismatch++;
+      }
+    }
+    eqs(mismatch, 0, `${sim.constructor.name} CSE: 共有しても全 256 通り正しい`);
+  }
+
+  // --- 定数だけの式は完全にたためる (加算器が丸ごと消える) ---
+  const constOnly = compile(`module m(output [3:0] y); assign y = (4'd3 + 4'd4) & 4'hF; endmodule`);
+  const constKinds = kindsOf(constOnly);
+  ok(!constKinds.and && !constKinds.or && !constKinds.xor && !constKinds.mux,
+    '畳み込み: 定数だけの式は論理ゲートが残らない', JSON.stringify(constKinds));
+  const cs = await WasmSimulator.create(constOnly);
+  cs.eval();
+  eq(cs.get('y'), 7, '畳み込み: 定数だけの式の値が正しい');
+}
+
 // -------------------------------------------------- 到達不能ゲートの刈り取り
 //
 // 消してよいのは「出力にもレジスタにも届かないゲート」だけ。観測できる信号が
@@ -588,15 +730,17 @@ endmodule`;
     'リテラル幅: サイズ無しのほうが刈り取り量が多い',
     `${plus1.stats.pruned} vs ${plus1Sized.stats.pruned}`);
 
-  // ただしシフト量の式に使うと刈り取りが効かない。バレルシフタは「幅を超えたか」の
-  // 判定で全ビットを見るので、32 ビット減算器がまるごと生きてしまう。
-  // 例題 shifter.v が 4'd8 とサイズを書いているのはこのため。
+  // シフト量の式でも同じ。刈り取りは効かない位置 (バレルシフタは「幅を超えたか」の
+  // 判定でシフト量の全ビットを見る) だが、定数畳み込みが 32 ビット減算器を
+  // たたんでしまうので、サイズを書いても書かなくても同じ回路になる。
   const amtUnsized = compile('module m(input [7:0] p, input [2:0] s, output [7:0] y); assign y = p >> (8 - s); endmodule');
   const amtSized = compile("module m(input [7:0] p, input [2:0] s, output [7:0] y); assign y = p >> (4'd8 - s); endmodule");
-  eqs(amtUnsized.stats.pruned, 0, 'リテラル幅: シフト量の 32 ビット減算器は刈り取れない');
-  ok(amtUnsized.stats.gates > amtSized.stats.gates * 3,
-    'リテラル幅: シフト量にサイズを書かないと 3 倍以上高くつく',
+  eqs(amtUnsized.stats.gates, amtSized.stats.gates,
+    'リテラル幅: シフト量の式でもサイズ有無でゲート数が変わらない',
     `サイズ無し=${amtUnsized.stats.gates} サイズ付き=${amtSized.stats.gates}`);
+  eqs(amtUnsized.stats.wasmBytes, amtSized.stats.wasmBytes,
+    'リテラル幅: WASM のバイト数まで同じ',
+    `サイズ無し=${amtUnsized.stats.wasmBytes} サイズ付き=${amtSized.stats.wasmBytes}`);
 
   // 加算の桁上げも「代入先を 1 ビット広くする」で受けられる
   const carry = `module c(input [3:0] a, input [3:0] b, output [3:0] s4, output [4:0] s5);
@@ -1928,6 +2072,7 @@ const suites = [
   ['ゲートプリミティブ', testGates],
   ['加算・減算', testArith],
   ['文脈依存幅', testContextWidth],
+  ['畳み込み / CSE', testFoldCse],
   ['刈り取り', testPrune],
   ['比較器', testCompare],
   ['論理演算子', testLogical],

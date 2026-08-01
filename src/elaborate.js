@@ -48,10 +48,89 @@ export function elaborate(mod) {
     drivers.set(netId, what);
   };
 
+  // ---- 定数畳み込みと共通部分式除去 -----------------------------------------
+  //
+  // ゲートは「入力だけで決まる純粋な関数」なので、作る前に 2 つ挟める:
+  //   - 定数畳み込み: 入力が $const0 / $const1 なら答えのネットをそのまま返す
+  //   - 共通部分式除去: 同じ op と同じ入力の組が既にあれば、その出力を使い回す
+  //
+  // ここは全ゲート生成の唯一の入口なので、加算器・比較器・バレルシフタ・mux 木の
+  // すべてが自動的に恩恵を受ける。とくにゼロ拡張 (resize が $const0 を詰める) と
+  // サイズ無しリテラルの 32 ビット化で入る定数が、ここで大量に消える。
+
+  const gateOf = new Map();   // 出力ネット → そのゲート (~~x = x をたたむのに使う)
+  const cse = new Map();      // `op:入力` → 既存の出力ネット
+
+  /** 片方がもう片方の not か。x & ~x / x | ~x をたたむのに使う */
+  function isInverseOf(a, b) {
+    const ga = gateOf.get(a);
+    if (ga && ga.op === 'not' && ga.in[0] === b) return true;
+    const gb = gateOf.get(b);
+    return !!(gb && gb.op === 'not' && gb.in[0] === a);
+  }
+
+  /** たためたら結果のネット ID、たためなければ null */
+  function fold(op, ins) {
+    if (op === 'not') {
+      const [a] = ins;
+      if (a === CONST0) return CONST1;
+      if (a === CONST1) return CONST0;
+      const g = gateOf.get(a);
+      if (g && g.op === 'not') return g.in[0];          // ~~x = x
+      return null;
+    }
+    if (op === 'and') {
+      const [a, b] = ins;
+      if (a === CONST0 || b === CONST0) return CONST0;
+      if (a === CONST1) return b;
+      if (b === CONST1) return a;
+      if (a === b) return a;                           // x & x = x
+      return isInverseOf(a, b) ? CONST0 : null;        // x & ~x = 0
+    }
+    if (op === 'or') {
+      const [a, b] = ins;
+      if (a === CONST1 || b === CONST1) return CONST1;
+      if (a === CONST0) return b;
+      if (b === CONST0) return a;
+      if (a === b) return a;                           // x | x = x
+      return isInverseOf(a, b) ? CONST1 : null;        // x | ~x = 1
+    }
+    if (op === 'xor') {
+      const [a, b] = ins;
+      if (a === b) return CONST0;                      // x ^ x = 0
+      if (a === CONST0) return b;
+      if (b === CONST0) return a;
+      if (a === CONST1) return newGate('not', [b]);    // 1 ^ x = ~x
+      if (b === CONST1) return newGate('not', [a]);
+      return null;
+    }
+    if (op === 'mux') {
+      const [s, a, b] = ins;
+      if (s === CONST1) return a;
+      if (s === CONST0) return b;
+      if (a === b) return a;
+      if (a === CONST1 && b === CONST0) return s;      // s ? 1 : 0 = s
+      if (a === CONST0 && b === CONST1) return newGate('not', [s]);
+      return null;
+    }
+    return null;
+  }
+
   const newGate = (op, ins, tag) => {
+    const folded = fold(op, ins);
+    if (folded !== null) return folded;
+
+    // and / or / xor は入力の順番を問わないので、揃えてから引く
+    const keyIns = op === 'mux' ? ins : [...ins].sort((a, b) => a - b);
+    const hit = cse.get(`${op}:${keyIns}`);
+    if (hit !== undefined) return hit;
+
     const out = newNet(`$${op}${gates.length}${tag ? `_${tag}` : ''}`);
-    gates.push({ op, out, in: ins });
+    const gate = { op, out, in: ins };
+    gates.push(gate);
+    gateOf.set(out, gate);
     drivers.set(out, 'ゲート');
+    cse.set(`${op}:${keyIns}`, out);
     return out;
   };
 
