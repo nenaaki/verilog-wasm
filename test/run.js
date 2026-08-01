@@ -11,8 +11,11 @@ import { compile, CompileError } from '../src/compile.js';
 import { WasmSimulator } from '../src/sim.js';
 import { RefSimulator } from '../src/interp.js';
 import {
-  SAMPLE_CIRCUITS, checkName, decodeCircuit, encodeCircuit, expandCircuit, packCircuit, toVerilog,
+  SAMPLE_CIRCUITS, blockPorts, checkName, decodeCircuit, encodeCircuit, expandCircuit,
+  flattenGraph, insOf, outsOf, packCircuit, toVerilog,
 } from '../src/schematic.js';
+
+const MAX_DEPTH_TEST = 10;   // src 側の上限 (8) より深くする
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const example = (n) => readFileSync(join(HERE, '..', 'examples', n), 'utf8');
@@ -582,6 +585,145 @@ async function testSchematic() {
   }
   ok(checkName('q_2$') === null, '名前: Verilog の識別子は通す');
   ok(checkName('q', new Set(['q'])) !== null, '名前: 重複を弾く');
+
+  // ---- 回路部品 (block) ----
+  // 半加算器を「保存した回路」に見立てて、2 個から全加算器を組む
+  const halfDef = packCircuit(expandCircuit(SAMPLE_CIRCUITS['半加算器 (sum / carry)']));
+  const halfPorts = blockPorts(halfDef);
+  eqs(halfPorts.inputs.join(','), 'a,b', '部品: 中身の入力が端子になる');
+  eqs(halfPorts.outputs.join(','), 'sum,carry', '部品: 中身の出力が端子になる (名前もそのまま)');
+
+  const fullAdder = {
+    nodes: [
+      [1, 'in', 20, 40, 1, 'a'], [2, 'in', 20, 140, 1, 'b'], [3, 'in', 20, 300, 1, 'cin'],
+      [10, 'block', 200, 60, 0, null, { ref: '半加算器', def: halfDef }],
+      [11, 'block', 420, 200, 0, null, { ref: '半加算器', def: halfDef }],
+      [20, 'or', 640, 320],
+      [30, 'out', 800, 200, 0, 'sum'], [31, 'out', 800, 340, 0, 'cout'],
+    ],
+    wires: [
+      [1, 0, 10, 0], [2, 0, 10, 1],       // a, b → 1 段目
+      [10, 0, 11, 0], [3, 0, 11, 1],      // 1 段目の sum, cin → 2 段目
+      [11, 0, 30, 0],                     // 2 段目の sum → sum
+      [10, 1, 20, 0], [11, 1, 20, 1],     // 桁上がり 2 本 → OR
+      [20, 0, 31, 0],
+    ],
+  };
+  const fa = expandCircuit(fullAdder);
+  eq(insOf(fa.nodes.find((n) => n.id === 10)), 2, '部品: 入力端子は 2 個');
+  eq(outsOf(fa.nodes.find((n) => n.id === 10)), 2, '部品: 出力端子は 2 個');
+  eq(fa.wires.length, 8, '部品: 端子番号 1 への配線も通る');
+
+  const flatFa = flattenGraph(fa);
+  ok(flatFa.nodes.every((n) => n.type !== 'block'), '平坦化: ブロックは残らない');
+  eq(flatFa.outletOf.size, 4, '平坦化: 出力端子ぶんの観測点ができる');
+
+  const faPlan = toVerilog(fa);
+  ok(!faPlan.source.includes('block'), '平坦化: Verilog は 1 個の module');
+  ok(faPlan.source.includes('assign u10_a = a;'), '平坦化: 端子は中継の assign になる', faPlan.source);
+  ok(faPlan.source.includes('u10_n3 = u10_a ^ u10_b'), '平坦化: 中身の信号に u<id>_ が付く', faPlan.source);
+  eqs(faPlan.inputs.map((i) => i.name).join(','), 'a,b,cin', '平坦化: 最上位の入力だけがポート');
+
+  const { all: faSims } = await bothSims(faPlan.source);
+  for (const sim of faSims) {
+    for (let v = 0; v < 8; v++) {
+      const a = v & 1, b = (v >> 1) & 1, cin = (v >> 2) & 1;
+      sim.setInput('a', a).setInput('b', b).setInput('cin', cin).eval();
+      const total = a + b + cin;
+      eq(sim.get('sum'), total & 1, `${sim.constructor.name} 部品: 全加算器 sum(${a},${b},${cin})`);
+      eq(sim.get('cout'), total >> 1, `${sim.constructor.name} 部品: 全加算器 cout(${a},${b},${cin})`);
+    }
+  }
+
+  // 部品の中の値も観測できる (画面で端子に色を付けるため)
+  const faSim = await WasmSimulator.create(compile(faPlan.source));
+  faSim.setInput('a', 1).setInput('b', 1).setInput('cin', 0).eval();
+  const carry1 = faPlan.signalOf.get(faPlan.outletOf.get('10:1'));
+  eq(faSim.get(carry1), 1, '部品: 出力端子 (1 段目の carry) の値を読める');
+
+  // 入れ子: 全加算器を部品にして 2 個並べる (2 ビット加算器)
+  const faDef = packCircuit(fa);
+  const nested = expandCircuit({
+    nodes: [
+      [1, 'in', 20, 20, 0, 'a0'], [2, 'in', 20, 80, 0, 'b0'],
+      [3, 'in', 20, 140, 0, 'a1'], [4, 'in', 20, 200, 0, 'b1'],
+      [5, 'const', 20, 260, 0],
+      [10, 'block', 200, 20, 0, null, { ref: '全加算器', def: faDef }],
+      [11, 'block', 200, 200, 0, null, { ref: '全加算器', def: faDef }],
+      [20, 'out', 500, 20, 0, 's0'], [21, 'out', 500, 100, 0, 's1'], [22, 'out', 500, 180, 0, 'c2'],
+    ],
+    wires: [
+      [1, 0, 10, 0], [2, 0, 10, 1], [5, 0, 10, 2],
+      [3, 0, 11, 0], [4, 0, 11, 1], [10, 1, 11, 2],
+      [10, 0, 20, 0], [11, 0, 21, 0], [11, 1, 22, 0],
+    ],
+  });
+  const nestedPlan = toVerilog(nested);
+  ok(nestedPlan.source.includes('u10_u10_'), '入れ子: 2 段の接頭辞が付く');
+  const { wasm: nsim } = await bothSims(nestedPlan.source);
+  let addBad = 0;
+  for (let v = 0; v < 16; v++) {
+    const a = v & 3, b = (v >> 2) & 3;
+    nestedPlan.inputs.forEach((i) => {
+      const bit = { a0: a & 1, a1: (a >> 1) & 1, b0: b & 1, b1: (b >> 1) & 1 }[i.name];
+      nsim.setInput(i.name, bit);
+    });
+    nsim.eval();
+    const got = Number(nsim.get('s0')) + 2 * Number(nsim.get('s1')) + 4 * Number(nsim.get('c2'));
+    if (got !== a + b) { addBad++; }
+  }
+  eq(addBad, 0, '入れ子: 全加算器 2 個で 2 ビットの足し算になる');
+
+  // メモリを含む回路も部品にできる
+  const memDef = packCircuit(expandCircuit(SAMPLE_CIRCUITS['書き込みイネーブル付き 1 ビットメモリ']));
+  const withMem = expandCircuit({
+    nodes: [
+      [1, 'in', 20, 20, 1, 'din'], [2, 'in', 20, 100, 1, 'wr'],
+      [10, 'block', 200, 20, 0, null, { ref: 'メモリ', def: memDef }],
+      [20, 'out', 500, 20, 0, 'q'],
+    ],
+    wires: [[1, 0, 10, 0], [2, 0, 10, 1], [10, 0, 20, 0]],
+  });
+  const memPlan = toVerilog(withMem);
+  ok(memPlan.source.includes('always @(posedge clk)'), '部品: 中のメモリも動く形になる', memPlan.source);
+  eq(memPlan.regs.length, 1, '部品: メモリは 1 個');
+  const { wasm: msim } = await bothSims(memPlan.source);
+  msim.reset().setInput('din', 1).setInput('wr', 1).eval();
+  eq(msim.get('q'), 0, '部品: クロック前は 0');
+  msim.step();
+  eq(msim.get('q'), 1, '部品: 中のメモリに書ける');
+  msim.setInput('wr', 0).setInput('din', 0).eval();
+  msim.step(); msim.step();
+  eq(msim.get('q'), 1, '部品: 中のメモリが保持する');
+
+  // 保存・共有リンクは中身を埋め込んでいるので単体で完結する
+  const faLink = decodeCircuit(encodeCircuit(fa));
+  eqs(JSON.stringify(packCircuit(faLink)), JSON.stringify(packCircuit(fa)),
+    '部品: リンク経由でも中身ごと往復する');
+  eq(toVerilog(faLink).inputs.length, 3, '部品: 復元した回路も同じようにコンパイルできる');
+
+  // 壊れた部品は弾く
+  for (const [nodes, why] of [
+    [[[1, 'block', 0, 0, 0, null]], '中身が無い'],
+    [[[1, 'block', 0, 0, 0, null, { def: null }]], 'def が null'],
+    [[[1, 'block', 0, 0, 0, null, { def: { nodes: 'x', wires: [] } }]], 'def の形が違う'],
+    [[[1, 'block', 0, 0, 0, null, { def: { nodes: [[1, 'zzz', 0, 0]], wires: [] } }]], '中身に知らない部品'],
+    [[[1, 'alias', 0, 0]], '内部用の部品を直接置く'],
+  ]) {
+    let err = null;
+    try { expandCircuit({ nodes, wires: [] }); } catch (e) { err = e; }
+    ok(err !== null, `部品: ${why} を弾く`, err ? '' : '通ってしまった');
+  }
+
+  // 入れ子が深すぎるものは弾く
+  let deep = { nodes: [[1, 'in', 0, 0, 0, 'x'], [2, 'out', 100, 0, 0, 'y']], wires: [[1, 0, 2, 0]] };
+  for (let i = 0; i < MAX_DEPTH_TEST; i++) {
+    deep = { nodes: [[1, 'block', 0, 0, 0, null, { ref: `d${i}`, def: deep }]], wires: [] };
+  }
+  let deepErr = null;
+  try { expandCircuit(deep); } catch (e) { deepErr = e; }
+  ok(deepErr !== null && /入れ子/.test(deepErr.message), '部品: 深すぎる入れ子を弾く',
+    deepErr?.message ?? '通ってしまった');
 
   // ---- 保存形式 (pack / expand / リンク) ----
   for (const [name, c] of Object.entries(SAMPLE_CIRCUITS)) {

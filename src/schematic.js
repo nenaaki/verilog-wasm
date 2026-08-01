@@ -25,10 +25,29 @@ export const PARTS = {
   xnor:  { label: 'XNOR',   glyph: 'XNOR', ins: 2, outs: 1 },
   // 1 ビットのメモリ (D フリップフロップ)。クロックは 1 本を全体で共有するので端子には出さない
   dff:   { label: '1 ビットメモリ', glyph: 'DFF', ins: 1, outs: 1, reg: true, named: true },
+  // 保存した回路をまるごと 1 個の部品にしたもの。端子の数は中身で決まる (insOf / outsOf)
+  block: { label: '回路部品', glyph: 'BLOCK', ins: 0, outs: 0, block: true },
+  // 平坦化のときだけ作る内部部品。ブロックの端子と中身をつなぐ中継で assign x = y; になる
+  alias: { label: '中継', glyph: '', ins: 1, outs: 1, internal: true },
 };
+
+/** その部品の入力端子の数。ブロックだけ中身で変わる */
+export const insOf = (node) =>
+  (node.type === 'block' ? (node._ports?.inputs.length ?? 0) : PARTS[node.type].ins);
+
+/** その部品の出力端子の数 */
+export const outsOf = (node) =>
+  (node.type === 'block' ? (node._ports?.outputs.length ?? 0) : PARTS[node.type].outs);
 
 /** メモリを 1 個でも使うときに生える暗黙のクロック入力 */
 export const CLOCK = 'clk';
+
+// 保存形式の上限。サンプルの組み立てより先に評価される必要がある
+const MAX_NODES = 500;
+const MAX_NAME = 32;
+const COORD_MAX = 4000;
+const MAX_DEPTH = 8;          // 部品の入れ子の深さ
+const MAX_FLAT_NODES = 4000;  // 平坦化した後のノード数
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_$]*$/;
 const RESERVED = new Set([
@@ -50,6 +69,17 @@ export function checkName(name, taken = new Set()) {
   return null;
 }
 
+/** 半加算器。回路部品のサンプルからも中身として使うので独立させてある */
+const HALF_ADDER = {
+  nodes: [
+    [1, 'in', 40, 90, 1], [2, 'in', 40, 260, 1],
+    [3, 'xor', 300, 90], [4, 'and', 300, 260],
+    [5, 'out', 560, 90, 0, 'sum'], [6, 'out', 560, 260, 0, 'carry'],
+  ],
+  wires: [[1, 0, 3, 0], [2, 0, 3, 1], [1, 0, 4, 0], [2, 0, 4, 1], [3, 0, 5, 0], [4, 0, 6, 0]],
+  expect: { sum: [0, 1, 1, 0], carry: [0, 0, 0, 1] },
+};
+
 /**
  * GUI エディタのサンプル回路。examples/*.v の回路グラフ版。
  * 圧縮形式: nodes は [id, type, x, y, 入力の初期値, 端子名], wires は [出力ノード, 端子, 入力ノード, 端子]。
@@ -61,15 +91,7 @@ export const SAMPLE_CIRCUITS = {
     wires: [[1, 0, 3, 0], [2, 0, 3, 1], [3, 0, 4, 0]],
     expect: { y0: [0, 0, 0, 1] },
   },
-  '半加算器 (sum / carry)': {
-    nodes: [
-      [1, 'in', 40, 90, 1], [2, 'in', 40, 260, 1],
-      [3, 'xor', 300, 90], [4, 'and', 300, 260],
-      [5, 'out', 560, 90, 0, 'sum'], [6, 'out', 560, 260, 0, 'carry'],
-    ],
-    wires: [[1, 0, 3, 0], [2, 0, 3, 1], [1, 0, 4, 0], [2, 0, 4, 1], [3, 0, 5, 0], [4, 0, 6, 0]],
-    expect: { sum: [0, 1, 1, 0], carry: [0, 0, 0, 1] },
-  },
+  '半加算器 (sum / carry)': HALF_ADDER,
   'NAND 4 個で XOR': {
     nodes: [
       [1, 'in', 30, 100, 1], [2, 'in', 30, 300, 0],
@@ -144,7 +166,37 @@ export const SAMPLE_CIRCUITS = {
     loop: true,
   },
   '4 ビットバレルシフタ (論理左シフト)': barrelShifter4(),
+  // 「全加算器 (半加算器を部品にして 2 個)」はファイル末尾で足す
+  //  (packCircuit / expandCircuit を使うので、それらの宣言より後に評価する必要がある)
 };
+
+/**
+ * 半加算器を「回路部品」として 2 個置いて全加算器にしたサンプル。
+ * 部品の中身は参照ではなく埋め込みなので、これ 1 つで完結している。
+ */
+function fullAdderFromBlocks() {
+  const def = packCircuit(expandCircuit(HALF_ADDER));
+  return {
+    nodes: [
+      [1, 'in', 20, 40, 1, 'a'], [2, 'in', 20, 130, 1, 'b'], [3, 'in', 20, 330, 1, 'cin'],
+      [10, 'block', 170, 30, 0, null, { ref: '半加算器', def }],
+      [11, 'block', 170, 200, 0, null, { ref: '半加算器', def }],
+      [20, 'or', 420, 330],
+      [30, 'out', 620, 210, 0, 'sum'], [31, 'out', 620, 340, 0, 'cout'],
+    ],
+    wires: [
+      [1, 0, 10, 0], [2, 0, 10, 1],        // a, b → 1 段目
+      [10, 0, 11, 0], [3, 0, 11, 1],       // 1 段目の sum と cin → 2 段目
+      [11, 0, 30, 0],                      // 2 段目の sum が答え
+      [10, 1, 20, 0], [11, 1, 20, 1],      // 桁上がり 2 本を OR
+      [20, 0, 31, 0],
+    ],
+    expect: {
+      sum:  [0, 1, 1, 0, 1, 0, 0, 1],
+      cout: [0, 0, 0, 1, 0, 1, 1, 1],
+    },
+  };
+}
 
 /**
  * 4 ビットのバレルシフタ。2:1 マルチプレクサの 2 段（1 ビットぶん / 2 ビットぶん）で
@@ -205,21 +257,28 @@ function barrelShifter4() {
 // 保存・読み込み・共有リンクは全部この圧縮形式を通す。サンプルと同じ形なので
 // 「保存した回路」も「サンプル」もまったく同じ経路で読める。
 //
-//   { nodes: [[id, type, x, y, 値, 名前], …], wires: [[出力ノード, 0, 入力ノード, 端子], …] }
+//   { nodes: [[id, type, x, y, 値, 名前, 付加情報], …],
+//     wires: [[出力ノード, 端子, 入力ノード, 端子], …] }
+//
+// 「付加情報」は回路部品 (block) だけが使う { ref, def }。ref は元になった回路の名前
+// (表示用) で、def は**中身をそのまま埋め込んだ圧縮形式**。参照ではなく埋め込みなのは
+// 保存や共有リンクを単体で完結させるため。おかげで相手の localStorage に元の回路が
+// 無くても開ける。元を直したときは「部品を更新」で埋め込みを差し替える。
 //
 // 読み込むデータは URL 経由で他人から来ることもあるので、素朴に信じないで検査する。
 
-const MAX_NODES = 500;
-const MAX_NAME = 32;
-const COORD_MAX = 4000;
 
 /** 編集中のグラフを圧縮形式にする */
 export function packCircuit(graph) {
   return {
     nodes: graph.nodes.map((n) => {
       const row = [n.id, n.type, Math.round(n.x), Math.round(n.y)];
-      if (n.value || n.name) row.push(n.value ? 1 : 0);
-      if (n.name) row.push(n.name);
+      if (n.type === 'block') {
+        row.push(n.value ? 1 : 0, n.name ?? null, { ref: n.ref ?? null, def: n.def });
+      } else {
+        if (n.value || n.name) row.push(n.value ? 1 : 0);
+        if (n.name) row.push(n.name);
+      }
       return row;
     }),
     wires: graph.wires.map((w) => [w.from.node, w.from.port, w.to.node, w.to.port]),
@@ -229,10 +288,24 @@ export function packCircuit(graph) {
 const coord = (v) => (Number.isFinite(v) ? Math.max(0, Math.min(COORD_MAX, v)) : 0);
 
 /**
+ * 回路部品の端子。中身の入力ノード・出力ノードが並び順のまま端子になる。
+ * 名前もそのまま端子名になるので、中身に名前を付けておくと部品が読みやすくなる。
+ */
+export function blockPorts(def, depth = 0) {
+  const sub = expandCircuit(def, depth);
+  const names = assignNames(sub.nodes);
+  return {
+    inputs: sub.nodes.filter((n) => n.type === 'in').map((n) => names.get(n.id)),
+    outputs: sub.nodes.filter((n) => n.type === 'out').map((n) => names.get(n.id)),
+  };
+}
+
+/**
  * 圧縮形式を編集可能なグラフに展開する。壊れたデータは理由を付けて弾く。
  * 配線だけは繋ぎ先が無いなど筋の通らないものを黙って捨てる（回路自体は開けたほうが良い）。
  */
-export function expandCircuit(c) {
+export function expandCircuit(c, depth = 0) {
+  if (depth > MAX_DEPTH) throw new Error(`回路部品の入れ子が深すぎます (${MAX_DEPTH} 段まで)`);
   if (!c || !Array.isArray(c.nodes) || !Array.isArray(c.wires)) {
     throw new Error('回路データの形が違います');
   }
@@ -244,15 +317,23 @@ export function expandCircuit(c) {
   const ids = new Set();
   for (const row of c.nodes) {
     if (!Array.isArray(row)) throw new Error('部品データの形が違います');
-    const [id, type, x, y, value, name] = row;
+    const [id, type, x, y, value, name, extra] = row;
     if (!Number.isInteger(id) || id <= 0) throw new Error(`部品の id が不正です: ${id}`);
     if (ids.has(id)) throw new Error(`部品の id が重複しています: ${id}`);
     if (!PARTS[type]) throw new Error(`知らない部品です: ${type}`);
+    if (PARTS[type].internal) throw new Error(`${type} は内部用の部品なので置けません`);
     ids.add(id);
-    nodes.push({
+    const node = {
       id, type, x: coord(x), y: coord(y), value: value ? 1 : 0,
       ...(typeof name === 'string' && name.length > 0 && name.length <= MAX_NAME ? { name } : {}),
-    });
+    };
+    if (type === 'block') {
+      if (!extra || typeof extra !== 'object') throw new Error('回路部品に中身がありません');
+      node.def = extra.def;
+      node.ref = typeof extra.ref === 'string' ? extra.ref : null;
+      node._ports = blockPorts(node.def, depth + 1);   // ここで中身も検査される
+    }
+    nodes.push(node);
   }
 
   const byId = new Map(nodes.map((n) => [n.id, n]));
@@ -263,13 +344,116 @@ export function expandCircuit(c) {
     const [fn, fp, tn, tp] = row;
     const from = byId.get(fn);
     const to = byId.get(tn);
-    if (!from || !to || fp !== 0 || !PARTS[from.type].outs) continue;
-    if (!Number.isInteger(tp) || tp < 0 || tp >= PARTS[to.type].ins) continue;
+    if (!from || !to) continue;
+    if (!Number.isInteger(fp) || fp < 0 || fp >= outsOf(from)) continue;
+    if (!Number.isInteger(tp) || tp < 0 || tp >= insOf(to)) continue;
     if (taken.has(`${tn}:${tp}`)) continue;        // 入力端子は 1 本だけ
     taken.add(`${tn}:${tp}`);
-    wires.push({ from: { node: fn, port: 0 }, to: { node: tn, port: tp } });
+    wires.push({ from: { node: fn, port: fp }, to: { node: tn, port: tp } });
   }
   return { nodes, wires };
+}
+
+// ------------------------------------------------------------ 平坦化
+// 回路部品は「中身を親に取り込む」ことで実現する。Verilog のモジュール階層には
+// 手を付けず、生成されるソースは 1 個の平坦な module のままになる。
+//
+// 部品の端子ごとに中継ノード (alias = assign x = y;) を 1 個作り、
+//   親の配線 → 中継 → 中身        (入力端子)
+//   中身 → 中継 → 親の配線        (出力端子)
+// と繋ぐ。中身の in / out ノードはこの中継に置き換えて消える。
+//
+// 中継を挟むのは順序を気にしなくて済むから。部品同士を相互に繋いだ場合も
+// ただのグラフの循環になるので、組合せループとして schedule.js が見つけてくれる。
+
+/**
+ * ブロックを展開した平坦なグラフを作る。
+ * @returns {{nodes, wires, outletOf: Map<string, number>}}
+ *   outletOf は `${ブロックの id}:${出力端子}` → 値を観測できるノード id
+ */
+export function flattenGraph(graph) {
+  const ctx = {
+    nodes: [],
+    wires: [],
+    outletOf: new Map(),
+    next: Math.max(0, ...graph.nodes.map((n) => n.id)) + 1,
+    idGen() { return this.next++; },
+  };
+  copyLevel(graph, ctx, '', 0, null, null);
+  return { nodes: ctx.nodes, wires: ctx.wires, outletOf: ctx.outletOf };
+}
+
+/**
+ * 1 段ぶんを平坦グラフに写す。
+ * @param {Map|null} inAlias  中身の入力ノード id → 親が作った中継ノード id (最上位は null)
+ * @param {Map|null} outAlias 中身の出力ノード id → 親が作った中継ノード id (最上位は null)
+ */
+function copyLevel(g, ctx, prefix, depth, inAlias, outAlias) {
+  if (depth > MAX_DEPTH) throw new Error(`回路部品の入れ子が深すぎます (${MAX_DEPTH} 段まで)`);
+
+  const map = new Map();          // この段のノード id → 平坦グラフの id
+  const pinIn = new Map();        // `${ブロック id}:${入力端子}` → 中継ノード id
+  const pinOut = new Map();       // `${ブロック id}:${出力端子}` → 中継ノード id
+
+  const push = (node) => {
+    if (ctx.nodes.length >= MAX_FLAT_NODES) {
+      throw new Error(`部品を広げた後の部品数が多すぎます (${MAX_FLAT_NODES} まで)`);
+    }
+    ctx.nodes.push(node);
+    return node.id;
+  };
+
+  for (const n of g.nodes) {
+    if (n.type === 'block') continue;                     // 後でまとめて広げる
+    if (inAlias && n.type === 'in') { map.set(n.id, inAlias.get(n.id)); continue; }
+    if (outAlias && n.type === 'out') { map.set(n.id, outAlias.get(n.id)); continue; }
+    const id = prefix === '' ? n.id : ctx.idGen();        // 最上位は id をそのまま保つ
+    map.set(n.id, id);
+    push({
+      ...n, id,
+      // 部品の中の信号は u<インスタンス>_ が付いた名前になる (生成 Verilog を読むため)
+      ...(prefix ? { name: `${prefix}${n.name ?? `n${n.id}`}` } : {}),
+    });
+  }
+
+  for (const n of g.nodes) {
+    if (n.type !== 'block') continue;
+    const ports = n._ports ?? blockPorts(n.def, depth + 1);
+    const sub = expandCircuit(n.def, depth + 1);
+    const subIn = sub.nodes.filter((x) => x.type === 'in');
+    const subOut = sub.nodes.filter((x) => x.type === 'out');
+    const ia = new Map();
+    const oa = new Map();
+    const tag = `${prefix}u${n.id}_`;
+
+    subIn.forEach((s, i) => {
+      const id = push({ id: ctx.idGen(), type: 'alias', x: n.x, y: n.y, value: 0,
+        name: `${tag}${ports.inputs[i]}` });
+      ia.set(s.id, id);
+      pinIn.set(`${n.id}:${i}`, id);
+    });
+    subOut.forEach((s, j) => {
+      const id = push({ id: ctx.idGen(), type: 'alias', x: n.x, y: n.y, value: 0,
+        name: `${tag}${ports.outputs[j]}` });
+      oa.set(s.id, id);
+      pinOut.set(`${n.id}:${j}`, id);
+      if (prefix === '') ctx.outletOf.set(`${n.id}:${j}`, id);   // 画面から値を読むのは最上位だけ
+    });
+
+    copyLevel(sub, ctx, tag, depth + 1, ia, oa);
+  }
+
+  for (const w of g.wires) {
+    const src = g.nodes.find((n) => n.id === w.from.node)?.type === 'block'
+      ? pinOut.get(`${w.from.node}:${w.from.port}`)
+      : map.get(w.from.node);
+    const dstNode = g.nodes.find((n) => n.id === w.to.node);
+    const dst = dstNode?.type === 'block'
+      ? { node: pinIn.get(`${w.to.node}:${w.to.port}`), port: 0 }
+      : { node: map.get(w.to.node), port: w.to.port };
+    if (src === undefined || dst.node === undefined) continue;   // 端子の無いブロックなど
+    ctx.wires.push({ from: { node: src, port: 0 }, to: dst });
+  }
 }
 
 /** 共有リンクに載せる文字列 (URL に置ける base64) */
@@ -288,6 +472,7 @@ export function decodeCircuit(text) {
 }
 
 const EXPR = {
+  alias: ([a]) => a,          // 回路部品の端子をつなぐ中継
   not:  ([a]) => `~${a}`,
   and:  ([a, b]) => `${a} & ${b}`,
   or:   ([a, b]) => `${a} | ${b}`,
@@ -317,7 +502,7 @@ function assignNames(nodes) {
   const nameOf = new Map();
 
   for (const n of nodes) {
-    if (!PARTS[n.type].named || !n.name) continue;
+    if (!n.name) continue;
     if (checkName(n.name, used)) continue;
     used.add(n.name);
     nameOf.set(n.id, n.name);
@@ -362,12 +547,16 @@ function assignNames(nodes) {
  */
 export function toVerilog(graph, opts = {}) {
   const top = opts.top ?? 'sketch';
-  const nodes = graph.nodes ?? [];
+  // 回路部品があれば先に中身を取り込んで平坦にする。以降はブロックを知らなくて済む
+  const hasBlock = (graph.nodes ?? []).some((n) => n.type === 'block');
+  const flat = hasBlock ? flattenGraph(graph) : { ...graph, outletOf: new Map() };
+  const outletOf = flat.outletOf ?? new Map();
+  const nodes = flat.nodes ?? [];
   const byId = new Map(nodes.map((n) => [n.id, n]));
 
   // (ノード, 入力端子) → その端子を駆動しているノードの出力
   const driver = new Map();
-  for (const w of graph.wires ?? []) {
+  for (const w of flat.wires ?? []) {
     if (!byId.has(w.from.node) || !byId.has(w.to.node)) continue;
     driver.set(`${w.to.node}:${w.to.port}`, w.from);
   }
@@ -375,8 +564,7 @@ export function toVerilog(graph, opts = {}) {
   // 未配線の入力端子を持つノードを起点に、下流へ「未完成」を伝播させる
   const incomplete = new Set();
   for (const n of nodes) {
-    const spec = PARTS[n.type];
-    for (let p = 0; p < spec.ins; p++) {
+    for (let p = 0; p < insOf(n); p++) {
       if (!driver.has(`${n.id}:${p}`)) { incomplete.add(n.id); break; }
     }
   }
@@ -384,7 +572,7 @@ export function toVerilog(graph, opts = {}) {
     changed = false;
     for (const n of nodes) {
       if (incomplete.has(n.id)) continue;
-      for (let p = 0; p < PARTS[n.type].ins; p++) {
+      for (let p = 0; p < insOf(n); p++) {
         if (incomplete.has(driver.get(`${n.id}:${p}`).node)) {
           incomplete.add(n.id);
           changed = true;
@@ -415,7 +603,7 @@ export function toVerilog(graph, opts = {}) {
 
   const regs = outputs.filter((o) => o.kind === 'reg');
   if (inputs.length === 0 && outputs.length === 0) {
-    return { source: null, signalOf, inputs, outputs, regs, incomplete };
+    return { source: null, signalOf, inputs, outputs, regs, incomplete, outletOf };
   }
 
   // メモリを 1 個でも使うなら暗黙のクロックが生える。エッジは step() が打つので端子には出さない
@@ -427,7 +615,7 @@ export function toVerilog(graph, opts = {}) {
 
   const argsOf = (n) => {
     const args = [];
-    for (let p = 0; p < PARTS[n.type].ins; p++) {
+    for (let p = 0; p < insOf(n); p++) {
       args.push(signalOf.get(driver.get(`${n.id}:${p}`).node));
     }
     return args;
@@ -451,5 +639,7 @@ export function toVerilog(graph, opts = {}) {
 
   const decl = `module ${top}(\n${ports.join(',\n')}\n);\n`;
   const source = `${decl}${body.map((l) => `${l}\n`).join('')}endmodule\n`;
-  return { source, signalOf, inputs, outputs, regs, incomplete };
+  return { source, signalOf, inputs, outputs, regs, incomplete, outletOf };
 }
+
+SAMPLE_CIRCUITS['全加算器 (半加算器を部品にして 2 個)'] = fullAdderFromBlocks();

@@ -102,6 +102,7 @@
   #waveNames text { font-family: var(--mono); font-size: 11px; fill: var(--dim); dominant-baseline: central; }
   #waveNames text.reg { fill: var(--blue); }
   #waveNames text.out { fill: var(--amber); }
+  #waveNames text.block { fill: #7fd6b8; }
   #waveSvg .lane { stroke: #262b36; stroke-width: 1; }
   #waveSvg .cyc { font-family: var(--mono); font-size: 9.5px; fill: #6b7382; text-anchor: middle; }
   #waveSvg .edge { stroke: #232833; stroke-width: 1; }
@@ -126,6 +127,12 @@
   .node.reg rect.body { fill: #1f2836; stroke: #3d5f8f; }
   .node.reg text.name { fill: var(--blue); }
   .node.konst rect.body { fill: #2a2519; stroke: #6b5a2a; }
+  .node.blk rect.body { fill: #1d2a28; stroke: #3f6f60; }
+  .node text.blkname { font-size: 11.5px; fill: #7fd6b8; }
+  .node text.pinlab { font-size: 9.5px; fill: var(--dim); }
+  .node text.pinlab.l { text-anchor: start; }
+  .node text.pinlab.r { text-anchor: end; }
+  .node .blkline { stroke: #34564c; stroke-width: 1; }
   .node text.konst { font-size: 17px; font-weight: 700; fill: var(--amber); }
 
   /* 端子の名前を変えるときに部品の上に重ねる入力欄 */
@@ -192,6 +199,11 @@
   <button id="save">保存</button>
   <button id="delSave">保存を削除</button>
   <button id="share">リンクをコピー</button>
+  <span class="sep"></span>
+  <span class="label">部品にする</span>
+  <select id="blockPick" title="保存した回路を部品として置く"></select>
+  <button id="placeBlock">置く</button>
+  <button id="syncBlocks" title="置いてある部品の中身を、保存されている最新の内容に入れ替える">部品を更新</button>
   <span class="label" style="text-transform:none;flex-basis:100%">入力・定数の箱をクリックで 0/1 反転・端子をクリック→クリックで配線・線をクリックで切断<br>
     背景をドラッグで範囲選択・Shift+クリックで選択に追加・Ctrl+C / Ctrl+V でコピーと貼り付け・Ctrl+Z で戻す<br>
     Ctrl + ホイールで拡大縮小・Shift+ドラッグでスクロール・境界をつまんで幅の変更<br>
@@ -243,12 +255,14 @@
 import { compile, CompileError } from '../src/compile.js';
 import { WasmSimulator } from '../src/sim.js';
 import {
-  CLOCK, PARTS, SAMPLE_CIRCUITS,
-  checkName, decodeCircuit, encodeCircuit, expandCircuit, packCircuit, toVerilog,
+  CLOCK, PARTS, SAMPLE_CIRCUITS, blockPorts, checkName, decodeCircuit, encodeCircuit,
+  expandCircuit, insOf, outsOf, packCircuit, toVerilog,
 } from '../src/schematic.js';
 import { LANES } from '../src/signals.js';
 
-const W = 68, H = 44;              // 部品の箱のサイズ
+const W = 68, H = 44;              // ふつうの部品の箱のサイズ
+const BLOCK_W = 120;               // 回路部品の箱の幅
+const PIN_PITCH = 22, BLOCK_PAD = 13;
 const CANVAS = { w: 900, h: 480 };
 const MAX_TABLE_BITS = 6;          // 2^6 = 64 = レーン数。入力 + メモリの合計ビット数
 
@@ -267,6 +281,7 @@ let pan = null;                    // {sx, sy, x, y, k} Shift + 背景ドラッ�
 let sim = null, compiled = null;
 let plan = null;                   // toVerilog の結果
 let values = new Map();            // ノード id → 0 | 1 | null(不明)
+let pinVals = new Map();           // `${回路部品の id}:${出力端子}` → 0 | 1 | null
 let seq = 0;                       // 非同期コンパイルの世代番号
 let cycles = 0;                    // 打ったクロックの回数
 let frames = [];                  // 波形の列 [{label, v:{信号名: 0|1|null}}]
@@ -331,6 +346,21 @@ function refreshList(select = '') {
     sel.appendChild(mine);
   }
   sel.value = select;
+
+  // 「部品にする」のリストも同じ顔ぶれ
+  const pick = $('blockPick');
+  const keep = pick.value;
+  pick.textContent = '';
+  if (names.length === 0) {
+    pick.appendChild(new Option('（保存した回路がありません）', ''));
+  } else {
+    for (const name of names) pick.appendChild(new Option(name, name));
+    if (names.includes(keep)) pick.value = keep;
+  }
+  pick.disabled = names.length === 0;
+  $('placeBlock').disabled = names.length === 0;
+  $('placeBlock').title = names.length === 0
+    ? 'まず回路に名前を付けて保存してください' : '選んだ回路を 1 個の部品として置く';
 }
 
 function loadFromList(value) {
@@ -350,16 +380,27 @@ function loadFromList(value) {
 const spec = (n) => PARTS[n.type];
 
 /** 入力端子の座標 (ノードローカル) */
-function inPin(node, port) {
-  const k = spec(node).ins;
-  const ys = k === 1 ? [H / 2] : [H * 0.3, H * 0.7];
-  return { x: 0, y: ys[port] };
+/** 部品の箱の大きさ。回路部品だけ端子の数で縦に伸びる */
+function sizeOf(node) {
+  if (node.type !== 'block') return { w: W, h: H };
+  const rows = Math.max(insOf(node), outsOf(node), 1);
+  return { w: BLOCK_W, h: Math.max(H, 2 * BLOCK_PAD + (rows - 1) * PIN_PITCH) };
 }
-const outPin = () => ({ x: W, y: H / 2 });
+
+/** 端子を縦に並べた位置 */
+function pinYs(node, count) {
+  const h = sizeOf(node).h;
+  if (node.type !== 'block') return count === 1 ? [h / 2] : [h * 0.3, h * 0.7];
+  const top = (h - (count - 1) * PIN_PITCH) / 2;
+  return Array.from({ length: count }, (_, i) => top + i * PIN_PITCH);
+}
+
+const inPin = (node, port) => ({ x: 0, y: pinYs(node, insOf(node))[port] });
+const outPin = (node, port) => ({ x: sizeOf(node).w, y: pinYs(node, outsOf(node))[port] });
 
 function pinPos(nodeId, port, isInput) {
   const n = byId(nodeId);
-  const p = isInput ? inPin(n, port) : outPin();
+  const p = isInput ? inPin(n, port) : outPin(n, port);
   return { x: n.x + p.x, y: n.y + p.y };
 }
 
@@ -530,6 +571,62 @@ function paste() {
   rebuild();
 }
 
+// ---------------------------------------------------- 回路を部品として置く
+// 中身は参照ではなく **その場でコピーして埋め込む**。保存や共有リンクが単体で
+// 完結し、相手の localStorage に元の回路が無くても開けるのが理由。
+// 元を直したときは「部品を更新」で埋め込みを差し替える。
+async function placeBlock(name) {
+  const def = readSaved()[name];
+  if (!def) { setMsg('保存した回路を選んでください', 'warn'); return; }
+
+  let ports;
+  try {
+    ports = blockPorts(def);
+  } catch (e) {
+    setMsg(`「${name}」は部品にできません: ${e.message}`, 'err');
+    return;
+  }
+  if (ports.inputs.length === 0 && ports.outputs.length === 0) {
+    setMsg(`「${name}」には入出力が無いので部品になりません`, 'warn');
+    return;
+  }
+
+  pushUndo();
+  const node = {
+    id: nextId++, type: 'block', value: 0, ref: name, def, _ports: ports,
+    // 回路部品は箱が広いので、ゲートの列 (x=300) と重ならない場所に置く
+    x: 140, y: 24 + (graph.nodes.filter((n) => n.type === 'block').length * 116) % 348,
+  };
+  graph.nodes.push(node);
+  selection = new Set([node.id]);
+  await rebuild();          // rebuild もメッセージを出すので、待ってから上書きする
+  setMsg(`「${name}」を部品として置きました（入力 ${ports.inputs.length} / 出力 ${ports.outputs.length}）`, 'ok');
+}
+
+/** 置いてある部品の中身を、保存されている最新の内容に入れ替える */
+async function syncBlocks() {
+  const all = readSaved();
+  const hit = graph.nodes.filter((n) => n.type === 'block' && n.ref && all[n.ref]);
+  if (hit.length === 0) { setMsg('更新できる部品がありません', 'warn'); return; }
+
+  pushUndo();
+  const before = JSON.stringify(hit.map((n) => n.def));
+  for (const n of hit) n.def = all[n.ref];
+  // 端子が増減しているかもしれないので、検査を通して筋の通らない配線を落とす
+  try {
+    graph = expandCircuit(packCircuit(graph));
+  } catch (e) {
+    setMsg(`部品を更新できませんでした: ${e.message}`, 'err');
+    undo();
+    return;
+  }
+  const changed = before !== JSON.stringify(
+    graph.nodes.filter((n) => n.type === 'block' && n.ref && all[n.ref]).map((n) => n.def));
+  await rebuild();
+  setMsg(changed ? `${hit.length} 個の部品を最新の内容に更新しました`
+    : `${hit.length} 個の部品は既に最新でした`, 'ok');
+}
+
 function selectAll() {
   selection = new Set(graph.nodes.map((n) => n.id));
   render();
@@ -562,7 +659,7 @@ async function rebuild() {
     const st = c.stats;
     $('stats').textContent = `nets=${st.nets} gates=${st.gates} regs=${st.regs} `
       + `state=${st.stateBytes}B wasm=${st.wasmBytes}B`;
-    const dead = plan.incomplete.size;
+    const dead = deadCount();
     setMsg(`コンパイル成功 — ${st.gates} ゲート`
       + (st.regs ? ` / ${st.regs} ビットのメモリ` : '')
       + `を ${st.wasmBytes} バイトの WASM に変換`
@@ -589,16 +686,47 @@ function updateClockUI() {
   $('cyc').textContent = n === 0 ? '' : `cyc=${cycles}`;
 }
 
+/** その部品の入力端子が 1 つでも未配線か */
+function unwired(node) {
+  for (let p = 0; p < insOf(node); p++) if (!driverOf(node.id, p)) return true;
+  return false;
+}
+
+/** 画面に見えている部品のうち、回路から除外されている数 (平坦化後の内部部品は数えない) */
+function deadCount() {
+  return graph.nodes.filter((n) => (n.type === 'block' ? unwired(n) : plan.incomplete.has(n.id))).length;
+}
+
+/** 出力端子の値。回路部品だけ端子ごとに別の値を持つ */
+function outValue(nodeId, port = 0) {
+  return byId(nodeId)?.type === 'block'
+    ? (pinVals.get(`${nodeId}:${port}`) ?? null)
+    : (values.get(nodeId) ?? null);
+}
+
 /** 入力を書き込んで eval し、全ノードの値を取り直す (描画はしない) */
 function refreshValues() {
   values = new Map();
+  pinVals = new Map();
   if (sim) {
     for (const i of plan.inputs) sim.setInput(i.name, byId(i.node).value ? 1 : 0);
     sim.eval();
     const known = new Set(compiled.layout.signalTable.map((s) => s.name));
+    const read = (id) => {
+      const name = plan.signalOf.get(id);
+      return known.has(name) && !plan.incomplete.has(id) ? Number(sim.get(name)) : null;
+    };
     for (const n of graph.nodes) {
-      const name = plan.signalOf.get(n.id);
-      values.set(n.id, known.has(name) && !plan.incomplete.has(n.id) ? Number(sim.get(name)) : null);
+      if (n.type === 'block') {
+        // 部品の中身は平坦化で別のノードになっているので、端子ごとに引き当てる
+        values.set(n.id, null);
+        for (let p = 0; p < outsOf(n); p++) {
+          const flat = plan.outletOf.get(`${n.id}:${p}`);
+          pinVals.set(`${n.id}:${p}`, flat === undefined ? null : read(flat));
+        }
+      } else {
+        values.set(n.id, read(n.id));
+      }
     }
   } else {
     // コンパイルできていない間も入力の 0/1 だけは見せる
@@ -677,7 +805,7 @@ function render() {
     const d = wirePath(pinPos(w.from.node, 0, false), pinPos(w.to.node, w.to.port, true));
     const g = el('g', { class: 'wgroup' }, gw);
     const hit = el('path', { class: 'whit', d }, g);           // 太い透明な当たり判定
-    const v = values.get(w.from.node);
+    const v = outValue(w.from.node, w.from.port);
     el('path', { class: `wire ${v === null ? 'dead' : v ? 'one' : ''}`, d }, g);
     hit.addEventListener('pointerdown', (e) => {
       e.stopPropagation();
@@ -690,13 +818,17 @@ function render() {
     const v = values.get(n.id);
     const cls = ['node'];
     if (selection.has(n.id)) cls.push('sel');
-    if (v === null) cls.push('dead');
+    // 回路部品は値が 1 個に決まらないので、未配線の端子があるかどうかで判断する
+    const dead = n.type === 'block' ? unwired(n) : v === null;
+    if (dead) cls.push('dead');
     if (spec(n).reg) cls.push('reg');
     if (spec(n).konst) cls.push('konst');
+    if (n.type === 'block') cls.push('blk');
     const g = el('g',
       { class: cls.join(' '), transform: `translate(${n.x} ${n.y})`, 'data-id': n.id }, gn);
 
-    el('rect', { class: 'body', x: 0, y: 0, width: W, height: H, rx: 7 }, g);
+    const size = sizeOf(n);
+    el('rect', { class: 'body', x: 0, y: 0, width: size.w, height: size.h, rx: 7 }, g);
 
     if (n.type === 'in') {
       el('text', { x: 22, y: H / 2 }, g).textContent = plan?.signalOf.get(n.id) ?? '?';
@@ -717,14 +849,24 @@ function render() {
       el('circle', { class: `lamp ${v === 1 ? 'one' : ''}`, cx: W - 18, cy: H / 2, r: 10 }, g);
       el('text', { class: `val ${v === 1 ? 'on' : ''}`, x: W - 18, y: H / 2 }, g)
         .textContent = v === null ? '' : v;
+    } else if (n.type === 'block') {
+      // 中身は見せず、名前と端子の名札だけ出す
+      el('text', { class: 'blkname', x: size.w / 2, y: 15 }, g).textContent = n.ref ?? '回路部品';
+      el('line', { class: 'blkline', x1: 8, y1: 26, x2: size.w - 8, y2: 26 }, g);
+      insOf(n) && pinYs(n, insOf(n)).forEach((y, i) => {
+        el('text', { class: 'pinlab l', x: 10, y }, g).textContent = n._ports.inputs[i];
+      });
+      outsOf(n) && pinYs(n, outsOf(n)).forEach((y, i) => {
+        el('text', { class: 'pinlab r', x: size.w - 10, y }, g).textContent = n._ports.outputs[i];
+      });
     } else {
       el('text', { x: W / 2, y: H / 2 }, g).textContent = spec(n).glyph;
     }
 
-    for (let p = 0; p < spec(n).ins; p++) {
+    for (let p = 0; p < insOf(n); p++) {
       const q = inPin(n, p);
       const dv = driverOf(n.id, p);
-      const pv = dv ? values.get(dv.from.node) : null;
+      const pv = dv ? outValue(dv.from.node, dv.from.port) : null;
       const c = el('circle', { class: `pin ${pv === 1 ? 'one' : ''}`, cx: q.x, cy: q.y, r: 6 }, g);
       c.addEventListener('pointerdown', (e) => {
         e.stopPropagation();
@@ -733,15 +875,16 @@ function render() {
         else if (dv) disconnect(dv);                          // 始点がなければ切断
       });
     }
-    if (spec(n).outs) {
-      const q = outPin();
-      const isArmed = armed && armed.node === n.id;
+    for (let p = 0; p < outsOf(n); p++) {
+      const q = outPin(n, p);
+      const isArmed = armed && armed.node === n.id && armed.port === p;
+      const ov = outValue(n.id, p);
       const c = el('circle',
-        { class: `pin ${isArmed ? 'armed' : v === 1 ? 'one' : ''}`, cx: q.x, cy: q.y, r: 6 }, g);
+        { class: `pin ${isArmed ? 'armed' : ov === 1 ? 'one' : ''}`, cx: q.x, cy: q.y, r: 6 }, g);
       c.addEventListener('pointerdown', (e) => {
         e.stopPropagation();
         if (e.button !== 0) return;
-        armed = isArmed ? null : { node: n.id, port: 0 };
+        armed = isArmed ? null : { node: n.id, port: p };
         render();
       });
     }
@@ -803,6 +946,10 @@ function sample(append) {
     const name = plan?.signalOf.get(n.id);
     if (name) v[name] = values.get(n.id) ?? null;
   }
+  for (const [key, flat] of plan?.outletOf ?? []) {
+    const name = plan.signalOf.get(flat);
+    if (name) v[name] = pinVals.get(key) ?? null;
+  }
   const label = hasRegs() ? cycles : frames.length;
   if (append || frames.length === 0) frames.push({ label, v });
   else frames[frames.length - 1] = { label: frames[frames.length - 1].label, v };
@@ -815,6 +962,10 @@ function waveRows() {
   const rows = [
     ...plan.inputs.map((i) => ({ ...i, kind: 'in' })),
     ...plan.regs,
+    // 回路部品の出力端子。中身は見えないので、端子の値は既定で出す
+    ...[...plan.outletOf.values()]
+      .map((flat) => ({ node: flat, name: plan.signalOf.get(flat), kind: 'block' }))
+      .filter((r) => r.name),
     ...plan.outputs.filter((o) => o.kind === 'out'),
   ];
   if ($('waveGates').checked) rows.push(...plan.outputs.filter((o) => o.kind === 'gate'));
@@ -844,7 +995,7 @@ function renderWave() {
 
   rows.forEach((r, i) => {
     const y = WAVE.top + i * WAVE.rowH;
-    const t = el('text', { class: r.kind === 'reg' ? 'reg' : r.kind, x: 8, y: y + WAVE.rowH / 2 }, names);
+    const t = el('text', { class: r.kind, x: 8, y: y + WAVE.rowH / 2 }, names);
     t.textContent = r.name;
     el('line', { class: 'lane', x1: 0, y1: y, x2: cols * WAVE.colW, y2: y }, svg2);
   });
@@ -1095,12 +1246,13 @@ svg.addEventListener('pointermove', (e) => {
     const x2 = Math.max(band.x0, band.x1), y2 = Math.max(band.y0, band.y1);
     selection = new Set(band.base);
     for (const n of graph.nodes) {
-      if (n.x <= x2 && n.x + W >= x && n.y <= y2 && n.y + H >= y) selection.add(n.id);
+      const sz = sizeOf(n);
+      if (n.x <= x2 && n.x + sz.w >= x && n.y <= y2 && n.y + sz.h >= y) selection.add(n.id);
     }
     render();
     updateEditUI();
   } else if (armed) {
-    $('rubber').setAttribute('d', wirePath(pinPos(armed.node, 0, false), pt));
+    $('rubber').setAttribute('d', wirePath(pinPos(armed.node, armed.port, false), pt));
   }
 });
 
@@ -1200,6 +1352,7 @@ window.addEventListener('keydown', (e) => {
 
 // ------------------------------------------------------------ ツールバー
 for (const [type, p] of Object.entries(PARTS)) {
+  if (p.internal || p.block) continue;      // 中継は内部用、回路部品は「部品にする」から置く
   const b = document.createElement('button');
   b.className = 'part';
   b.textContent = p.btn ?? p.glyph;
@@ -1266,6 +1419,8 @@ $('redo').onclick = redo;
 $('copy').onclick = copySelection;
 $('pasteBtn').onclick = paste;
 $('fit').onclick = resetView;
+$('placeBlock').onclick = () => placeBlock($('blockPick').value);
+$('syncBlocks').onclick = syncBlocks;
 $('renameBtn').onclick = () => {
   if (selection.size !== 1) setMsg('名前を変える部品を 1 個だけ選んでください', 'warn');
   else startRename([...selection][0]);

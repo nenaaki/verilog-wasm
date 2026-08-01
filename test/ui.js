@@ -256,6 +256,34 @@ const HELPERS = `
     s.value = [...s.options].map((o) => o.value).find((v) => v.includes(part));
     s.dispatchEvent(new Event('change')); return s.value; };
   window.__renameBoxOpen = () => !!document.getElementById('renameBox');
+  // 回路部品
+  window.__blockCount = () => document.querySelectorAll('#gNodes .node.blk').length;
+  window.__blockLabels = () => [...document.querySelectorAll('#gNodes .node.blk text.blkname')]
+    .map((t) => t.textContent).join(',');
+  window.__pinLabels = () => [...document.querySelectorAll('#gNodes .node.blk text.pinlab')]
+    .map((t) => t.textContent).join(',');
+  window.__blockPins = () => document.querySelectorAll('#gNodes .node.blk .pin').length;
+  window.__setPick = (v) => { document.getElementById('blockPick').value = v; };
+  window.__pickOptions = () => [...document.getElementById('blockPick').options]
+    .map((o) => o.value).join('|');
+  // ブロックの n 個目の入力端子 / 出力端子 (端子は入力→出力の順に描いている)
+  window.__blockPin = (kind, i, nIn) => {
+    const pins = [...document.querySelector('#gNodes .node.blk').querySelectorAll('.pin')];
+    const p = kind === 'in' ? pins[i] : pins[nIn + i];
+    const r = p.getBoundingClientRect();
+    return [r.x + r.width / 2, r.y + r.height / 2];
+  };
+  window.__blockAt = (n) => {
+    const g = document.querySelectorAll('#gNodes .node.blk')[n];
+    const r = g.getBoundingClientRect();
+    return [r.x + r.width / 2, r.y + r.height / 2];
+  };
+  window.__blockPinOf = (n, kind, i, nIn) => {
+    const pins = [...document.querySelectorAll('#gNodes .node.blk')[n].querySelectorAll('.pin')];
+    const p = kind === 'in' ? pins[i] : pins[nIn + i];
+    const r = p.getBoundingClientRect();
+    return [r.x + r.width / 2, r.y + r.height / 2];
+  };
   true;
 `;
 
@@ -816,6 +844,106 @@ await click(await js('__btn("copy")'));
 await click(await js('__btn("pasteBtn")'));
 await sleep(300);
 ok(await js('__nodeCount()') === 7, '貼り付け: ボタンからも使える', String(await js('__nodeCount()')));
+
+// ==================================================== 回路部品 (block)
+// サンプルの「半加算器を部品にして 2 個」がそのまま全加算器になっているか
+await js('__preset("全加算器")');
+await sleep(700);
+ok(await js('__blockCount()') === 2, 'サンプル: 部品が 2 個', String(await js('__blockCount()')));
+ok((await js('__blockLabels()')) === '半加算器,半加算器', 'サンプル: 部品の名前が出る', await js('__blockLabels()'));
+ok((await js('__msg()')).includes('コンパイル成功'), 'サンプル: そのままコンパイルできる', await js('__msg()'));
+ok(await js('__truth()') === 'abcinsumcout/00000/10010/01010/11001/00110/10101/01101/11111',
+  'サンプル: 全加算器の真理値表になる', await js('__truth()'));
+
+// 半加算器を保存して、それを部品として 2 個置き、全加算器を組んで真理値表で確かめる
+await js('__preset("半加算器")');
+await sleep(500);
+await js('__setName("半加算器")');
+await click(await js('__btn("save")'));
+ok((await js('__pickOptions()')) === '半加算器', '部品: 保存すると部品リストに出る', await js('__pickOptions()'));
+
+await click(await js('__btn("clear")'));
+await sleep(300);
+await js('__setPick("半加算器")');
+await click(await js('__btn("placeBlock")'));
+await sleep(400);
+ok(await js('__blockCount()') === 1, '部品: 置ける', String(await js('__blockCount()')));
+ok((await js('__blockLabels()')) === '半加算器', '部品: 元の回路名が出る', await js('__blockLabels()'));
+ok((await js('__pinLabels()')) === 'a,b,sum,carry', '部品: 端子の名札が出る', await js('__pinLabels()'));
+ok(await js('__blockPins()') === 4, '部品: 端子は 4 個', String(await js('__blockPins()')));
+ok((await js('__msg()')).includes('入力 2 / 出力 2'), '部品: 端子の数を知らせる', await js('__msg()'));
+
+// 入力 2 個と出力 2 個を繋ぐ
+await click(await js('__button("入力")'));
+await click(await js('__button("入力")'));
+await click(await js('__button("出力")'));
+await click(await js('__button("出力")'));
+await sleep(300);
+ok((await js('__msg()')).includes('未配線の部品が 3 個'),
+  '部品: 未配線は画面の部品で数える (平坦化後の内部部品は数えない)', await js('__msg()'));
+
+await click(await js('__pinCenter("a", -1)'));         // 入力 a の出力端子
+await click(await js('__blockPin("in", 0, 2)'));       // 部品の入力端子 0
+await click(await js('__pinCenter("b", -1)'));
+await click(await js('__blockPin("in", 1, 2)'));
+await click(await js('__blockPin("out", 0, 2)'));      // 部品の出力端子 0 (sum)
+await click(await js('__pinCenter("y0", 0)'));
+await click(await js('__blockPin("out", 1, 2)'));      // 出力端子 1 (carry)
+await click(await js('__pinCenter("y1", 0)'));
+await sleep(300);
+ok(await js('__wireCount()') === 4, '部品: 端子ごとに配線できる', String(await js('__wireCount()')));
+ok((await js('__msg()')).includes('コンパイル成功'), '部品: コンパイルできる', await js('__msg()'));
+ok((await js('__verilog()')).includes('assign u'), '部品: 中継の assign が生える', await js('__verilog()'));
+ok(await js('__truth()') === 'aby0y1/0000/1010/0110/1101',
+  '部品: 半加算器の真理値表になる', await js('__truth()'));
+
+// 部品の出力端子の値が画面に出る (a=1, b=1 → sum=0, carry=1)
+await click(await js('__nodeCenter("a")'));
+await click(await js('__nodeCenter("b")'));
+await sleep(200);
+ok(await js('__nodeText("y0")') === 'y00', '部品: sum の値が伝わる', await js('__nodeText("y0")'));
+ok(await js('__nodeText("y1")') === 'y11', '部品: carry の値が伝わる', await js('__nodeText("y1")'));
+
+// 波形にも部品の端子が出る
+ok((await js('__waveSigs()')).includes('u'), '部品: 波形に端子の信号が出る', await js('__waveSigs()'));
+
+// コピー・Undo も効く
+await click(await js('__blockAt(0)'));
+await ctrlKey('c');
+await ctrlKey('v');
+await sleep(400);
+ok(await js('__blockCount()') === 2, '部品: コピーして増やせる', String(await js('__blockCount()')));
+await ctrlKey('z');
+ok(await js('__blockCount()') === 1, '部品: Undo で戻る', String(await js('__blockCount()')));
+
+// 保存 → 開き直しても部品ごと残る (中身を埋め込んでいる)
+await js('__setName("全加算器のもと")');
+await click(await js('__btn("save")'));
+const blockVerilog = await js('__verilog()');
+await reopen();
+ok(await js('__blockCount()') === 1, '部品: 開き直しても残る', String(await js('__blockCount()')));
+ok(await js('__verilog()') === blockVerilog, '部品: 中身も同じ', await js('__verilog()'));
+
+// 元の回路を書き換えて「部品を更新」すると中身が入れ替わる
+await js('__preset("半加算器")');
+await sleep(400);
+await click(await js('__wireHit(5)'));                  // carry への配線を切る
+await sleep(200);
+await js('__setName("半加算器")');
+await click(await js('__btn("save")'));                 // 壊れた版で上書き保存
+await sleep(200);
+await js('(() => { const s = document.getElementById("presets"); s.value = "u:全加算器のもと";'
+  + ' s.dispatchEvent(new Event("change")); })()');
+await sleep(500);
+ok(await js('__verilog()') === blockVerilog, '部品: 元を直しても埋め込みは変わらない', await js('__verilog()'));
+await click(await js('__btn("syncBlocks")'));
+await sleep(500);
+ok((await js('__msg()')).includes('更新しました'), '部品を更新: 完了が出る', await js('__msg()'));
+ok(await js('__verilog()') !== blockVerilog, '部品を更新: 中身が入れ替わる');
+ok(await js('__pinLabels()') === 'a,b,sum,carry', '部品を更新: 端子は残る', await js('__pinLabels()'));
+await ctrlKey('z');
+await sleep(400);
+ok(await js('__verilog()') === blockVerilog, '部品を更新: Undo で戻せる', await js('__verilog()'));
 
 // ------------------------------------------------------------------ 結果
 console.log(`${passed} 件成功, ${failures.length} 件失敗`);
