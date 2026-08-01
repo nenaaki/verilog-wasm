@@ -332,6 +332,181 @@ endmodule`);
   }
 }
 
+// ---------------------------------------------------------------- if / case
+//
+// 分岐は「代入されなかったビットは保持」がいちばん間違えやすいので、JS の素直な
+// モデルをサイクルごとに突き合わせる。
+async function testIfCase() {
+  const src = `module ctrl(
+  input clk,
+  input [1:0] sel,
+  input c,
+  input [3:0] d,
+  input [3:0] any,
+  output reg [3:0] hold,
+  output reg [3:0] both,
+  output reg [3:0] chain,
+  output reg [3:0] cse,
+  output reg [3:0] multi,
+  output reg [3:0] nodflt,
+  output reg [3:0] lastwins,
+  output reg [3:0] nest,
+  output reg [3:0] dup,
+  output reg [3:0] midDflt,
+  output reg [3:0] wideCond
+);
+  always @(posedge clk) begin
+    if (c) hold <= d;                       // else なし → 保持
+
+    if (c) both <= d; else both <= 4'hF;
+
+    if (sel == 2'b00) chain <= 4'h1;
+    else if (sel == 2'b01) chain <= 4'h2;
+    else if (sel == 2'b10) chain <= 4'h3;
+    else chain <= 4'h4;
+
+    case (sel)
+      2'b00: cse <= 4'h9;
+      2'b01: cse <= 4'hA;
+      default: cse <= 4'h0;
+    endcase
+
+    case (sel)
+      2'b00, 2'b11: multi <= 4'h5;          // 1 項目に複数ラベル
+      default: multi <= 4'h6;
+    endcase
+
+    case (sel)
+      2'b00: nodflt <= 4'h7;                // default なし → 他は保持
+    endcase
+
+    lastwins <= 4'h0;                       // 既定値を置いてから上書きする形
+    if (c) lastwins <= d;
+
+    case (sel)
+      2'b01: begin
+        if (c) nest <= 4'hC;
+        else nest <= 4'hD;
+      end
+      default: nest <= 4'hE;
+    endcase
+
+    case (sel)
+      2'b01: dup <= 4'h1;
+      2'b01: dup <= 4'h2;                   // 上が勝つので到達しない
+      default: dup <= 4'h0;
+    endcase
+
+    case (sel)
+      2'b00: midDflt <= 4'h8;
+      default: midDflt <= 4'h3;
+      2'b10: midDflt <= 4'h9;               // default より後でも項目が優先される
+    endcase
+
+    if (any) wideCond <= 4'hA; else wideCond <= 4'hB;   // 4 ビット条件 → OR リダクション
+  end
+endmodule`;
+
+  const { compiled, wasm, ref } = await bothSims(src);
+  eqs(compiled.warnings.length, 0, 'if / case: 未駆動の警告なし', compiled.warnings.join(' / '));
+
+  // 同じ意味を JS で素直に書いたもの
+  const model = (st, sel, c, d, any) => ({
+    hold: c ? d : st.hold,
+    both: c ? d : 0xf,
+    chain: sel === 0 ? 1 : sel === 1 ? 2 : sel === 2 ? 3 : 4,
+    cse: sel === 0 ? 9 : sel === 1 ? 0xa : 0,
+    multi: sel === 0 || sel === 3 ? 5 : 6,
+    nodflt: sel === 0 ? 7 : st.nodflt,
+    lastwins: c ? d : 0,
+    nest: sel === 1 ? (c ? 0xc : 0xd) : 0xe,
+    dup: sel === 1 ? 1 : 0,
+    midDflt: sel === 0 ? 8 : sel === 2 ? 9 : 3,
+    wideCond: any !== 0 ? 0xa : 0xb,
+  });
+
+  const ports = ['hold', 'both', 'chain', 'cse', 'multi', 'nodflt',
+    'lastwins', 'nest', 'dup', 'midDflt', 'wideCond'];
+  let st = {};
+  for (const p of ports) st[p] = 0;
+
+  const vectors = [
+    [0, 0, 3, 0], [0, 1, 5, 1], [1, 1, 9, 0], [1, 0, 2, 8], [2, 1, 7, 0],
+    [3, 0, 1, 5], [3, 1, 0xf, 0], [1, 1, 6, 2], [0, 0, 0, 0], [2, 0, 4, 15],
+  ];
+  let bad = null;
+  for (const [sel, c, d, any] of vectors) {
+    for (const sim of [wasm, ref]) {
+      sim.setInput('sel', sel).setInput('c', c).setInput('d', d).setInput('any', any).step();
+    }
+    st = model(st, sel, c, d, any);
+    for (const p of ports) {
+      for (const sim of [wasm, ref]) {
+        if (Number(sim.get(p)) !== st[p] && !bad) {
+          bad = `${sim.constructor.name} ${p}: sel=${sel} c=${c} d=${d} any=${any}`
+            + ` 期待 ${st[p]} / 実際 ${sim.get(p)}`;
+        }
+      }
+    }
+  }
+  ok(!bad, `if / case: ${vectors.length} サイクル × ${ports.length} 出力が JS のモデルと一致`, bad ?? '');
+
+  // 部分代入。触っていないビットは未駆動として 0 に固定される (既存の挙動)
+  const part = compile(`module p(input clk, input [1:0] sel, output reg [3:0] q);
+  always @(posedge clk) if (sel[0]) q[1:0] <= sel;
+endmodule`);
+  ok(/q\[2\], q\[3\]/.test(part.warnings[0] ?? ''),
+    'if / case: 分岐の中の部分代入も未駆動検査に乗る', part.warnings.join(' / '));
+
+  // if だけで代入されるレジスタは D に自分の Q が回り込む。組合せループにはならない
+  const selfHold = await bothSims(`module h(input clk, input c, input [3:0] d, output reg [3:0] q);
+  always @(posedge clk) if (c) q <= d;
+endmodule`);
+  for (const sim of selfHold.all) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('c', 1).setInput('d', 0xa).step();
+    eq(sim.get('q'), 0xa, `${kind} 保持: c=1 で取り込む`);
+    sim.setInput('c', 0).setInput('d', 0x5).run(4);
+    eq(sim.get('q'), 0xa, `${kind} 保持: c=0 なら 4 クロック経っても変わらない`);
+    sim.setInput('c', 1).step();
+    eq(sim.get('q'), 0x5, `${kind} 保持: c=1 に戻すと取り込む`);
+  }
+}
+
+// ------------------------------------------------------------------- FSM
+async function testSeqDet() {
+  const { compiled, all } = await bothSims(example('seqdet.v'));
+  eqs(compiled.stats.regs, 3, 'seqdet: state 2 ビット + found 1 ビット');
+
+  const step = (st, din) => {
+    if (st === 0) return [din ? 1 : 0, 0];
+    if (st === 1) return [din ? 1 : 2, 0];
+    if (st === 2) return [din ? 3 : 0, 0];
+    return din ? [1, 1] : [2, 0];
+  };
+
+  const stream = [1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 1, 1];
+  for (const sim of all) {
+    const kind = sim.constructor.name;
+    sim.reset();
+    let st = 0;
+    const hits = [];
+    let bad = null;
+    stream.forEach((din, i) => {
+      sim.setInput('din', din).step();
+      const [ns, f] = step(st, din);
+      st = ns;
+      if (f) hits.push(i);
+      if ((Number(sim.get('state')) !== st || Number(sim.get('found')) !== f) && !bad) {
+        bad = `i=${i} din=${din} 実際(state=${sim.get('state')},found=${sim.get('found')})`
+          + ` 期待(state=${st},found=${f})`;
+      }
+    });
+    ok(!bad, `${kind} seqdet: 20 サイクルがモデルと一致`, bad ?? '');
+    eqs(hits.join(','), '3,6,9,13,19', `${kind} seqdet: "1011" の終端位置で検出`);
+  }
+}
+
 // -------------------------------------------------------------- カウンタ
 async function testCounter8() {
   const { all } = await bothSims(example('counter8.v'));
@@ -553,6 +728,32 @@ async function testErrors() {
     ['論理演算子は未対応',
       `module m(input a, b, output y); assign y = a && b; endmodule`,
       /式が必要/],
+    ['casez は未対応',
+      `module m(input clk, input [1:0] s, output reg q);
+       always @(posedge clk) casez (s) 2'b00: q <= 1'b1; endcase endmodule`,
+      /casez は未対応/],
+    ['endcase 忘れ',
+      `module m(input clk, input [1:0] s, output reg q);
+       always @(posedge clk) case (s) 2'b00: q <= 1'b1; endmodule`,
+      /'endcase' が見つからない/],
+    ['end 忘れ',
+      `module m(input clk, input a, output reg q);
+       always @(posedge clk) begin if (a) q <= 1'b1; endmodule`,
+      /'end' が見つからない/],
+    ['空の case',
+      `module m(input clk, input [1:0] s, output reg q);
+       always @(posedge clk) case (s) endcase endmodule`,
+      /case の中身が空/],
+    ['default が 2 つ',
+      `module m(input clk, input [1:0] s, output reg q);
+       always @(posedge clk) case (s) default: q <= 1'b1; default: q <= 1'b0; endcase endmodule`,
+      /default が 2 つ/],
+    ['if の中でブロッキング代入',
+      `module m(input clk, input a, output reg q); always @(posedge clk) if (a) q = 1'b1; endmodule`,
+      /ノンブロッキング/],
+    ['if で wire を駆動',
+      `module m(input clk, input a, output y); always @(posedge clk) if (a) y <= 1'b1; endmodule`,
+      /reg 宣言が必要/],
   ];
 
   for (const [label, src, pattern] of cases) {
@@ -621,6 +822,25 @@ function randomDesign(rng, nWires) {
   pool.push('r');
   const regExpr = expr(3);
   lines.push(`  always @(posedge clk) r <= ${regExpr};`);
+
+  // 分岐のある always ブロックも 1 本入れる。mux 木がコード生成まで通るか見る。
+  // 分岐の中身は begin...end で囲んで、dangling else を生まないようにする。
+  lines.unshift('  reg [7:0] r2;');
+  const stmt = (depth) => {
+    const r = rng();
+    if (depth <= 0 || r < 0.4) return `r2 <= ${expr(2)};`;
+    if (r < 0.7) {
+      const then = `begin ${stmt(depth - 1)} end`;
+      const els = rng() < 0.5 ? ` else begin ${stmt(depth - 1)} end` : '';
+      return `if (${expr(2)}) ${then}${els}`;
+    }
+    const arms = [`2'd0: begin ${stmt(depth - 1)} end`, `2'd1: begin ${stmt(depth - 1)} end`];
+    if (rng() < 0.7) arms.push(`default: begin ${stmt(depth - 1)} end`);
+    return `case (${expr(1)}) ${arms.join(' ')} endcase`;
+  };
+  lines.push(`  always @(posedge clk) begin ${stmt(3)} end`);
+  lines.push(`  assign rout2 = r2;`);
+
   lines.push(`  assign y = ${expr(3)};`);
 
   return `module rnd(
@@ -629,7 +849,8 @@ function randomDesign(rng, nWires) {
   input [7:0] b,
   input [7:0] c,
   output [7:0] y,
-  output [7:0] rout
+  output [7:0] rout,
+  output [7:0] rout2
 );
 ${lines.join('\n')}
   assign rout = r;
@@ -641,8 +862,15 @@ async function testRandomDiff() {
   let designs = 0;
   let mismatch = null;
 
+  // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
+  const seen = { 'if': 0, 'case': 0, '+ / -': 0, '比較': 0 };
+
   for (let d = 0; d < 25 && !mismatch; d++) {
     const src = randomDesign(rng, 6);
+    if (/\bif \(/.test(src)) seen['if']++;
+    if (/\bcase \(/.test(src)) seen['case']++;
+    if (/[-+] /.test(src)) seen['+ / -']++;
+    if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
     let compiled;
     try {
       compiled = compile(src);
@@ -662,7 +890,7 @@ async function testRandomDiff() {
       for (const sim of [wasm, ref]) sim.setInput('a', a).setInput('b', b).setInput('c', c);
       wasm.step();
       ref.step();
-      for (const port of ['y', 'rout']) {
+      for (const port of ['y', 'rout', 'rout2']) {
         if (wasm.get(port) !== ref.get(port)) {
           mismatch = `${port}: wasm=${wasm.get(port)} ref=${ref.get(port)} (a=${a} b=${b} c=${c} t=${t})\n${src}`;
         }
@@ -671,6 +899,9 @@ async function testRandomDiff() {
   }
 
   ok(designs === 25, 'ランダム差分: 25 回路すべてコンパイルできた', `designs=${designs}`);
+  const missing = Object.entries(seen).filter(([, n]) => n === 0).map(([k]) => k);
+  ok(missing.length === 0, 'ランダム差分: 生成器が全構文を出している',
+    `出ていない構文: ${missing.join(', ')} / 内訳 ${JSON.stringify(seen)}`);
   ok(!mismatch, `ランダム差分テスト (${designs} 回路 × 12 ベクタ)`, mismatch ?? '');
 }
 
@@ -1114,6 +1345,8 @@ const suites = [
   ['ゲートプリミティブ', testGates],
   ['加算・減算', testArith],
   ['比較器', testCompare],
+  ['if / case', testIfCase],
+  ['FSM (列検出)', testSeqDet],
   ['カウンタ', testCounter8],
   ['DFF', testDff],
   ['シフトレジスタ', testShift8],

@@ -166,6 +166,29 @@ endmodule`,
     q <= clr ? 8'h00 : (en ? q + 1 : q);
 endmodule`,
 
+  'seqdet — "1011" 検出 FSM (case + if)': `module seqdet(
+  input clk,
+  input din,
+  output reg [1:0] state,
+  output reg found
+);
+  always @(posedge clk) begin
+    found <= 1'b0;
+
+    case (state)
+      2'b00: if (din) state <= 2'b01;
+      2'b01: if (din) state <= 2'b01; else state <= 2'b10;
+      2'b10: if (din) state <= 2'b11; else state <= 2'b00;
+      2'b11: if (din) begin
+               state <= 2'b01;
+               found <= 1'b1;
+             end else begin
+               state <= 2'b10;
+             end
+    endcase
+  end
+endmodule`,
+
   'counter_mod — 上限付きカウンタ (比較器 + 加算器)': `module counter_mod(
   input clk,
   input [7:0] limit,

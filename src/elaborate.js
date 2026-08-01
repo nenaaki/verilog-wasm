@@ -14,7 +14,7 @@
 //   - + / - は桁上げが入るので max(幅)+1 で計算し、その幅を結果とする
 //   - 比較は両辺を max(幅) に揃え、結果は 1 ビット (ここは Verilog と完全に同じ)
 //   - 代入は右辺を左辺の幅に切り詰め / ゼロ拡張
-//   - ?: の選択信号が複数ビットなら OR リダクションで 1 ビットにする
+//   - ?: と if の条件が複数ビットなら OR リダクションで 1 ビットにする
 
 import { CompileError } from './errors.js';
 import { GATE_PRIMITIVES } from './parser.js';
@@ -267,6 +267,83 @@ export function elaborate(mod) {
     }
   }
 
+  // ---- always の中の文 → レジスタの次状態 ------------------------------------
+  //
+  // state は「レジスタの Q ネット → 次の値のネット」。エントリが無いビットは
+  // 「この経路では代入されていない」と読み、合流のときに Q そのもの (= 保持) を
+  // 使う。分岐のない直線的な文の列なら、上から順に上書きするだけで最後が勝つ。
+
+  const regLine = new Map();   // Q ネット → 最後に代入した行 (エラー表示用)
+
+  function lhsRegBits(node, line) {
+    const s = lookup(node.name, line);
+    if (s.kind !== 'reg') {
+      throw new CompileError(`always ブロックで代入する '${s.name}' は reg 宣言が必要`, line);
+    }
+    return refBits(node);
+  }
+
+  /**
+   * 分岐の合流。cond が真なら a 側、偽なら b 側の値を採る。
+   * a と b はどちらも base のコピーから走らせたものなので、base のキーは
+   * 必ず両方に含まれる。両側が同じネットに行き着くビットには mux を作らない
+   * (分岐が触っていないビットはこれで素通しになる)。
+   */
+  function mergeStates(cond, a, b, base) {
+    const out = new Map(base);
+    for (const qn of new Set([...a.keys(), ...b.keys()])) {
+      const av = a.get(qn) ?? qn;
+      const bv = b.get(qn) ?? qn;
+      out.set(qn, av === bv ? av : newGate('mux', [cond, av, bv]));
+    }
+    return out;
+  }
+
+  function runStmts(stmts, state) {
+    let cur = state;
+    for (const st of stmts) {
+      if (st.type === 'nb') {
+        const q = lhsRegBits(st.lhs, st.line);
+        const d = resize(evalExpr(st.rhs), q.length);
+        q.forEach((qn, i) => {
+          cur.set(qn, d[i]);
+          regLine.set(qn, st.line);
+        });
+        continue;
+      }
+
+      if (st.type === 'if') {
+        const cond = reduceOr(evalExpr(st.cond), st.line);
+        const thenState = runStmts(st.then, new Map(cur));
+        const elseState = st.else ? runStmts(st.else, new Map(cur)) : new Map(cur);
+        cur = mergeStates(cond, thenState, elseState, cur);
+        continue;
+      }
+
+      if (st.type === 'case') {
+        const sel = evalExpr(st.sel);
+        // default (無ければ「保持」) を土台にして後ろの項目から積む。こうすると
+        // 先に書いた項目の mux が外側に来て、Verilog の「上から順に最初に一致
+        // したものが勝つ」がそのまま出る。
+        let acc = st.default ? runStmts(st.default, new Map(cur)) : new Map(cur);
+        for (let k = st.items.length - 1; k >= 0; k--) {
+          const it = st.items[k];
+          let cond = null;
+          for (const label of it.labels) {
+            const hit = equalBits(sel, evalExpr(label), '==')[0];
+            cond = cond === null ? hit : newGate('or', [cond, hit]);
+          }
+          acc = mergeStates(cond, runStmts(it.stmts, new Map(cur)), acc, cur);
+        }
+        cur = acc;
+        continue;
+      }
+
+      throw new CompileError(`未知の文ノード '${st.type}'`, st.line);
+    }
+    return cur;
+  }
+
   /** 左辺のネット列に右辺を接続する (buf ゲートで橋渡し) */
   function connect(lhsNode, rhsBits, what, line) {
     const lhs = refBits(lhsNode);
@@ -338,17 +415,15 @@ export function elaborate(mod) {
       clock = item.clock;
       clk.isClock = true;
 
-      for (const st of item.stmts) {
-        const s = lookup(st.lhs.name, st.line);
-        if (s.kind !== 'reg') {
-          throw new CompileError(`always ブロックで代入する '${s.name}' は reg 宣言が必要`, st.line);
-        }
-        const q = refBits(st.lhs);
-        const d = resize(evalExpr(st.rhs), q.length);
-        q.forEach((qn, i) => {
-          setDriver(qn, `always @(posedge ${clock})`, st.line);
-          regs.push({ q: qn, d: d[i], line: st.line });
-        });
+      // 文を上から順に辿り、レジスタの各ビットについて「次の値」を組み立てる。
+      // 分岐は then 側と else 側を別々に走らせてから mux でマージする。
+      // どちらの経路でも代入されなかったビットは Q そのもの (= 保持) になる。
+      const next = runStmts(item.stmts, new Map());
+
+      for (const [qn, d] of next) {
+        const line = regLine.get(qn) ?? item.line;
+        setDriver(qn, `always @(posedge ${clock})`, line);
+        regs.push({ q: qn, d, line });
       }
       continue;
     }

@@ -151,6 +151,85 @@ export function parse(src) {
     return { type: 'decl', dir, kind, range, names, line };
   }
 
+  // ---- always の中の文 -----------------------------------------------------
+  //
+  // 文は入れ子になるので、フラットな列ではなく木で返す:
+  //   { type:'nb',   lhs, rhs }              … lhs <= rhs
+  //   { type:'if',   cond, then:[], else }   … else は文の列か null
+  //   { type:'case', sel, items:[{labels,stmts}], default }
+
+  /** begin...end なら中の文の列、そうでなければ 1 文だけの列 */
+  function parseStmtBlock() {
+    if (eat('begin')) {
+      const list = [];
+      while (!at('end')) {
+        // endmodule もここで止める。止めないと次の文の左辺として読んでしまい、
+        // 「'<=' が必要」のような原因から遠いエラーになる
+        if (peek().type === 'eof' || at('endmodule')) throw err("'end' が見つからない");
+        list.push(parseStmt());
+      }
+      expect('end');
+      return list;
+    }
+    return [parseStmt()];
+  }
+
+  function parseStmt() {
+    if (at('if')) return parseIf();
+    if (at('case')) return parseCase();
+    if (at('casez') || at('casex')) {
+      throw err(`${peek().value} は未対応 (x / z を扱わないので case を使う)`);
+    }
+    const line = peek().line;
+    const lhs = parseLValue();
+    if (at('=')) throw err('always ブロック内ではノンブロッキング代入 <= を使う');
+    expect('<=');
+    const rhs = parseExpr();
+    expect(';');
+    return { type: 'nb', lhs, rhs, line };
+  }
+
+  function parseIf() {
+    const line = expect('if').line;
+    expect('(');
+    const cond = parseExpr();
+    expect(')');
+    const thenStmts = parseStmtBlock();
+    // else if は「else の中身が 1 個の if 文」として自然に入れ子になる
+    const elseStmts = eat('else') ? parseStmtBlock() : null;
+    return { type: 'if', cond, then: thenStmts, else: elseStmts, line };
+  }
+
+  function parseCase() {
+    const line = expect('case').line;
+    expect('(');
+    const sel = parseExpr();
+    expect(')');
+
+    const items = [];
+    let dflt = null;
+    while (!at('endcase')) {
+      // ラベルとして読み込んでしまう前に、ブロックの終わりを止める
+      if (peek().type === 'eof' || at('endmodule') || at('end')) {
+        throw err("'endcase' が見つからない");
+      }
+      const iline = peek().line;
+      if (eat('default')) {
+        eat(':');                       // Verilog では ':' は省略できる
+        if (dflt) throw err('default が 2 つある');
+        dflt = parseStmtBlock();
+        continue;
+      }
+      const labels = [parseExpr()];
+      while (eat(',')) labels.push(parseExpr());
+      expect(':');
+      items.push({ labels, stmts: parseStmtBlock(), line: iline });
+    }
+    expect('endcase');
+    if (items.length === 0 && !dflt) throw err('case の中身が空');
+    return { type: 'case', sel, items, default: dflt, line };
+  }
+
   function parseAlways() {
     const line = expect('always').line;
     expect('@');
@@ -163,25 +242,7 @@ export function parse(src) {
     const clock = expectIdent();
     expect(')');
 
-    const stmts = [];
-    const parseStmt = () => {
-      if (eat('begin')) {
-        while (!at('end')) {
-          if (peek().type === 'eof') throw err("'end' が見つからない");
-          parseStmt();
-        }
-        expect('end');
-        return;
-      }
-      const sline = peek().line;
-      const lhs = parseLValue();
-      if (at('=')) throw err('always ブロック内ではノンブロッキング代入 <= を使う');
-      expect('<=');
-      const rhs = parseExpr();
-      expect(';');
-      stmts.push({ lhs, rhs, line: sline });
-    };
-    parseStmt();
+    const stmts = parseStmtBlock();
 
     return { type: 'always', clock, stmts, line };
   }
