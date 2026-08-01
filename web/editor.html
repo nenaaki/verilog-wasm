@@ -559,7 +559,7 @@ function paste() {
   }
   for (const w of sub.wires) {
     graph.wires.push({
-      from: { node: idMap.get(w.from.node), port: 0 },
+      from: { node: idMap.get(w.from.node), port: w.from.port },
       to: { node: idMap.get(w.to.node), port: w.to.port },
     });
   }
@@ -798,8 +798,13 @@ function render() {
 
   for (const w of graph.wires) {
     if (!byId(w.from.node) || !byId(w.to.node)) continue;
-    const d = wirePath(pinPos(w.from.node, 0, false), pinPos(w.to.node, w.to.port, true));
-    const g = el('g', { class: 'wgroup' }, gw);
+    const d = wirePath(pinPos(w.from.node, w.from.port, false), pinPos(w.to.node, w.to.port, true));
+    const g = el('g', {
+      class: 'wgroup',
+      // テストから「どの端子からどの端子へ」を確かめられるように残す
+      'data-from': `${w.from.node}:${w.from.port}`,
+      'data-to': `${w.to.node}:${w.to.port}`,
+    }, gw);
     const hit = el('path', { class: 'whit', d }, g);           // 太い透明な当たり判定
     const v = outValue(w.from.node, w.from.port);
     el('path', { class: `wire ${v === null ? 'dead' : v ? 'one' : ''}`, d }, g);

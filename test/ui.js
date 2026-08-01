@@ -256,6 +256,31 @@ const HELPERS = `
     s.value = [...s.options].map((o) => o.value).find((v) => v.includes(part));
     s.dispatchEvent(new Event('change')); return s.value; };
   window.__renameBoxOpen = () => !!document.getElementById('renameBox');
+  // 出力端子の client 座標 (入力端子は cx=0、出力端子は cx>0 に置いている)
+  window.__outPinPoint = (nodeId, port) => {
+    const g = document.querySelector('#gNodes .node[data-id="' + nodeId + '"]');
+    const outs = [...g.querySelectorAll('.pin')].filter((c) => Number(c.getAttribute('cx')) > 0);
+    const r = outs[port].getBoundingClientRect();
+    return [r.x + r.width / 2, r.y + r.height / 2];
+  };
+  // 配線の始点が駆動元の端子とずれていないか (ずれているものを返す)
+  window.__wireStartMismatch = () => {
+    const m = document.getElementById('svg').getScreenCTM();
+    const bad = [];
+    for (const g of document.querySelectorAll('#gWires .wgroup')) {
+      const [id, port] = g.dataset.from.split(':').map(Number);
+      const path = g.querySelector('.wire');
+      const a = path.getPointAtLength(0);
+      const s = new DOMPoint(a.x, a.y).matrixTransform(m);
+      const [px, py] = __outPinPoint(id, port);
+      if (Math.abs(s.x - px) > 2 || Math.abs(s.y - py) > 2) {
+        bad.push(g.dataset.from + ' が y で ' + Math.round(s.y - py) + 'px ずれている');
+      }
+    }
+    return bad.join(' / ');
+  };
+  window.__wireFroms = () => [...document.querySelectorAll('#gWires .wgroup')]
+    .map((g) => g.dataset.from).sort().join(',');
   // 回路部品
   window.__blockCount = () => document.querySelectorAll('#gNodes .node.blk').length;
   window.__blockLabels = () => [...document.querySelectorAll('#gNodes .node.blk text.blkname')]
@@ -854,6 +879,20 @@ ok((await js('__blockLabels()')) === '半加算器,半加算器', 'サンプル:
 ok((await js('__msg()')).includes('コンパイル成功'), 'サンプル: そのままコンパイルできる', await js('__msg()'));
 ok(await js('__truth()') === 'abcinsumcout/00000/10010/01010/11001/00110/10101/01101/11111',
   'サンプル: 全加算器の真理値表になる', await js('__truth()'));
+ok(await js('__wireStartMismatch()') === '',
+  '配線: 始点は駆動している出力端子から出る', await js('__wireStartMismatch()'));
+// carry (端子 1) から出る線が 2 本あり、sum (端子 0) と同じ所から出ていないこと
+ok((await js('__wireFroms()')).includes('10:1'), '配線: 2 番目の出力端子からの線がある', await js('__wireFroms()'));
+await ctrlKey('a');
+await ctrlKey('c');
+await ctrlKey('v');
+await sleep(600);
+ok((await js('__wireFroms()')).split(',').filter((f) => f.endsWith(':1')).length === 4,
+  '貼り付け: 2 番目の出力端子からの配線も端子番号を保つ', await js('__wireFroms()'));
+ok(await js('__wireStartMismatch()') === '',
+  '貼り付け: 貼った側も端子の位置から線が出る', await js('__wireStartMismatch()'));
+await ctrlKey('z');
+await sleep(400);
 
 // 半加算器を保存して、それを部品として 2 個置き、全加算器を組んで真理値表で確かめる
 await js('__preset("半加算器")');
