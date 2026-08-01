@@ -332,6 +332,143 @@ endmodule`);
   }
 }
 
+// ------------------------------------------------------------------ シフト
+//
+// 定数シフトと可変シフトで幅の扱いが変わるので、両方を JS のシフトと比べる。
+async function testShift() {
+  // --- 定数シフト。並べ替えだけなのでゲートは増えないはず ---
+  const plain = compile('module m(input [7:0] a, output [7:0] y); assign y = a; endmodule');
+  const shifted = compile('module m(input [7:0] a, output [7:0] y); assign y = a << 3; endmodule');
+  eqs(shifted.stats.gates, plain.stats.gates,
+    '定数シフト: ゲートが増えない (配線の付け替えだけ)',
+    `素通し=${plain.stats.gates} シフト=${shifted.stats.gates}`);
+
+  const src = `module sh(
+  input [3:0] a,
+  input [2:0] amt,
+  input [3:0] wideAmt,
+  output [3:0] l1, output [3:0] l2, output [3:0] r1, output [3:0] r2,
+  output [7:0] noGrow, output [3:0] l9, output [3:0] r9,
+  output [7:0] concatPack,
+  output [3:0] vl, output [3:0] vr,
+  output [3:0] vlWide, output [3:0] vrWide,
+  output [7:0] prec1, output prec2, output [7:0] prec3
+);
+  assign l1 = a << 1;
+  assign l2 = a << 2;
+  assign r1 = a >> 1;
+  assign r2 = a >> 2;
+  assign noGrow = a << 3;              // 4 ビットのまま計算 → 押し出されたビットは戻らない
+  assign l9 = a << 9;                  // 全部押し出される
+  assign r9 = a >> 9;
+  assign concatPack = {a, 4'h0} | a;   // ニブル詰めは連接で書く
+  assign vl = a << amt;                // バレルシフタ
+  assign vr = a >> amt;
+  assign vlWide = a << wideAmt;        // シフト量が幅より大きくなり得る
+  assign vrWide = a >> wideAmt;
+  assign prec1 = a + 1 << 2;           // 算術が先 → (a+1) << 2
+  assign prec2 = a << 1 < amt;         // シフトが先 → (a<<1) < amt
+  assign prec3 = a << 1 + 1;           // 算術が先 → a << (1+1)
+endmodule`;
+  const { wasm, ref } = await bothSims(src);
+
+  let bad = null;
+  for (let a = 0; a < 16 && !bad; a++) {
+    for (let amt = 0; amt < 8 && !bad; amt++) {
+      for (let wideAmt = 0; wideAmt < 16 && !bad; wideAmt++) {
+        for (const sim of [wasm, ref]) {
+          sim.setInput('a', a).setInput('amt', amt).setInput('wideAmt', wideAmt).eval();
+        }
+        const expect = {
+          l1: (a << 1) & 15,
+          l2: (a << 2) & 15,
+          r1: a >> 1,
+          r2: a >> 2,
+          noGrow: (a << 3) & 15,     // 4 ビットで計算されるので押し出されたぶんは消える
+          l9: 0,
+          r9: 0,
+          concatPack: ((a << 4) | a) & 255,
+          vl: (a << amt) & 15,
+          vr: (a >> amt) & 15,
+          vlWide: (a << wideAmt) & 15,
+          vrWide: wideAmt >= 4 ? 0 : (a >> wideAmt) & 15,
+          prec1: ((a + 1) << 2) & 31,   // a+1 が 5 ビットなので 5 ビットでシフトされる
+          prec2: ((a << 1) & 15) < amt ? 1 : 0,
+          prec3: (a << 2) & 15,
+        };
+        for (const [port, want] of Object.entries(expect)) {
+          for (const sim of [wasm, ref]) {
+            if (Number(sim.get(port)) !== want && !bad) {
+              bad = `${sim.constructor.name} ${port}: a=${a} amt=${amt} wideAmt=${wideAmt}`
+                + ` 期待 ${want} / 実際 ${sim.get(port)}`;
+            }
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, 'シフト: 16 × 8 × 16 通りが JS のシフトと一致', bad ?? '');
+
+  // 幅は左オペランドのまま。リテラルでも定数式でも信号でも同じ規則になる
+  for (const sim of [wasm, ref]) {
+    sim.setInput('a', 5).setInput('amt', 2).setInput('wideAmt', 2).eval();
+  }
+  eq(wasm.get('l2'), 4, 'シフト: 5 << 2 は 4 ビットで 4 (リテラル量)');
+  eq(wasm.get('prec3'), 4, 'シフト: 5 << (1+1) も同じ 4 (定数式の量)');
+  eq(wasm.get('vlWide'), 4, 'シフト: 5 << amt も同じ 4 (信号の量)');
+  eq(wasm.get('noGrow'), 8, 'シフト: 広い左辺でも押し出されたビットは戻らない (5<<3 が 4 ビットで 8)');
+  eq(wasm.get('concatPack'), 0x55, 'シフト: ニブル詰めは連接 {a, 4\'h0} で書ける');
+
+  // バレルシフタの段数。8 ビットを 3 ビット量でずらすと 8×3 = 24 個の mux
+  const barrel = compile('module m(input [7:0] a, input [2:0] s, output [7:0] y); assign y = a << s; endmodule');
+  eqs(barrel.stats.gates - plain.stats.gates, 24,
+    'シフト: 8 ビット × 3 ビット量のバレルシフタは mux 24 個', `差分=${barrel.stats.gates - plain.stats.gates}`);
+
+  // シフト量が幅を超え得るビットは、段を積まずに 1 段のマスクにまとめる
+  const wide = compile('module m(input [7:0] a, input [7:0] s, output [7:0] y); assign y = a << s; endmodule');
+  eqs(wide.stats.gates - plain.stats.gates, 36,
+    'シフト: 8 ビット量でも 24 + (or 4 + mux 8) で済む', `差分=${wide.stats.gates - plain.stats.gates}`);
+
+  // 64 レーンで別々のシフト量
+  wasm.reset();
+  for (let lane = 0; lane < 64; lane++) {
+    wasm.setInputLane('a', lane, lane & 15).setInputLane('amt', lane, (lane >> 3) & 7);
+  }
+  wasm.eval();
+  const lanes = wasm.getLanes('vl');
+  let laneBad = 0;
+  for (let lane = 0; lane < 64; lane++) {
+    if (Number(lanes[lane]) !== (((lane & 15) << ((lane >> 3) & 7)) & 15)) laneBad++;
+  }
+  ok(laneBad === 0, 'シフト: 64 レーンが独立にシフトされる', `${laneBad} レーン不一致`);
+}
+
+// ---------------------------------------------------- シフトを使った回路
+async function testShifter() {
+  const { all } = await bothSims(example('shifter.v'));
+  for (const sim of all) {
+    const kind = sim.constructor.name;
+    let bad = null;
+    for (let hi = 0; hi < 16 && !bad; hi++) {
+      for (let lo = 0; lo < 16 && !bad; lo++) {
+        for (let amt = 0; amt < 8 && !bad; amt++) {
+          sim.setInput('hi', hi).setInput('lo', lo).setInput('amt', amt).eval();
+          const p = ((hi << 4) | lo) & 255;
+          const want = ((p << amt) | (p >> (8 - amt))) & 255;
+          if (Number(sim.get('packed')) !== p) {
+            bad = `packed: hi=${hi} lo=${lo} 期待 ${p} / 実際 ${sim.get('packed')}`;
+          } else if (Number(sim.get('shr')) !== (p >> 2)) {
+            bad = `shr: p=${p} 期待 ${p >> 2} / 実際 ${sim.get('shr')}`;
+          } else if (Number(sim.get('rotl')) !== want) {
+            bad = `rotl: p=${p} amt=${amt} 期待 ${want} / 実際 ${sim.get('rotl')}`;
+          }
+        }
+      }
+    }
+    ok(!bad, `${kind} shifter: 連接・定数シフト・左ローテートが全 16×16×8 通り一致`, bad ?? '');
+  }
+}
+
 // ---------------------------------------------------------------- if / case
 //
 // 分岐は「代入されなかったビットは保持」がいちばん間違えやすいので、JS の素直な
@@ -725,6 +862,12 @@ async function testErrors() {
     ['=== は未対応',
       `module m(input [3:0] a, output y); assign y = a === 4'h3; endmodule`,
       /=== は未対応/],
+    ['<<< は未対応',
+      `module m(input [3:0] a, output [3:0] y); assign y = a <<< 1; endmodule`,
+      /<<< は未対応/],
+    ['>>> は未対応',
+      `module m(input [3:0] a, output [3:0] y); assign y = a >>> 1; endmodule`,
+      />>> は未対応/],
     ['論理演算子は未対応',
       `module m(input a, b, output y); assign y = a && b; endmodule`,
       /式が必要/],
@@ -803,9 +946,15 @@ function randomDesign(rng, nWires) {
     if (r < 0.79) return `(${expr(depth - 1)} + ${expr(depth - 1)})`;
     if (r < 0.84) return `(${expr(depth - 1)} - ${expr(depth - 1)})`;
     if (r < 0.86) return `(-${expr(depth - 1)})`;
-    if (r < 0.93) {
+    if (r < 0.9) {
       const cmp = ['==', '!=', '<', '<=', '>', '>='][Math.floor(rng() * 6)];
       return `(${expr(depth - 1)} ${cmp} ${expr(depth - 1)})`;
+    }
+    if (r < 0.94) {
+      // リテラル量 (並べ替え) と信号量 (バレルシフタ) の両方を出す
+      const op = rng() < 0.5 ? '<<' : '>>';
+      const amt = rng() < 0.5 ? String(Math.floor(rng() * 10)) : expr(0);
+      return `(${expr(depth - 1)} ${op} ${amt})`;
     }
     if (r < 0.97) return `(${expr(depth - 1)} ? ${expr(depth - 1)} : ${expr(depth - 1)})`;
     return `{${expr(depth - 1)}, ${expr(depth - 1)}}`;
@@ -863,7 +1012,7 @@ async function testRandomDiff() {
   let mismatch = null;
 
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
-  const seen = { 'if': 0, 'case': 0, '+ / -': 0, '比較': 0 };
+  const seen = { 'if': 0, 'case': 0, '+ / -': 0, '比較': 0, 'シフト': 0 };
 
   for (let d = 0; d < 25 && !mismatch; d++) {
     const src = randomDesign(rng, 6);
@@ -871,6 +1020,7 @@ async function testRandomDiff() {
     if (/\bcase \(/.test(src)) seen['case']++;
     if (/[-+] /.test(src)) seen['+ / -']++;
     if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
+    if (/(<<|>>)/.test(src)) seen['シフト']++;
     let compiled;
     try {
       compiled = compile(src);
@@ -1345,6 +1495,8 @@ const suites = [
   ['ゲートプリミティブ', testGates],
   ['加算・減算', testArith],
   ['比較器', testCompare],
+  ['シフト', testShift],
+  ['シフト回路', testShifter],
   ['if / case', testIfCase],
   ['FSM (列検出)', testSeqDet],
   ['カウンタ', testCounter8],

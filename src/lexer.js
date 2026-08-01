@@ -10,10 +10,17 @@ const RE_IDENT = /[A-Za-z_][A-Za-z0-9_$]*/y;
 
 // '<=' はノンブロッキング代入と「以下」を兼ねる。どちらなのかは文脈で決まるので
 // パーサ側で解く (Verilog 本来の解き方と同じ)。
-const PUNCT2 = ['<=', '>=', '==', '!='];
+const PUNCT2 = ['<=', '>=', '==', '!=', '<<', '>>'];
 const PUNCT1 = ['?', ':', '(', ')', '[', ']', '{', '}', ',', ';', '=', '&', '|', '^', '~', '@', '+', '-', '<', '>'];
-// == / != と見た目が近いので、素通りさせずに名指しで断る
-const PUNCT3_REJECT = ['===', '!=='];
+// 対応している演算子と見た目が近いので、素通りさせずに名指しで断る。
+// どれも「扱っていないものが絡まなければ同じ意味になる」ので、黙って別扱いに
+// するより理由を出したほうがよい。
+const PUNCT3_REJECT = {
+  '===': '=== は未対応 (x / z を扱わないので == と同じ意味になる)',
+  '!==': '!== は未対応 (x / z を扱わないので != と同じ意味になる)',
+  '<<<': '<<< は未対応 (signed を扱わないので << と同じ意味になる)',
+  '>>>': '>>> は未対応 (signed を扱わないので >> と同じ意味になる)',
+};
 
 const RADIX = { b: 2, o: 8, d: 10, h: 16 };
 
@@ -91,9 +98,7 @@ export function lex(src) {
     }
 
     const three = src.slice(i, i + 3);
-    if (PUNCT3_REJECT.includes(three)) {
-      throw new CompileError(`${three} は未対応 (x / z を扱わないので == / != と同じ意味になる)`, line);
-    }
+    if (PUNCT3_REJECT[three]) throw new CompileError(PUNCT3_REJECT[three], line);
 
     const two = src.slice(i, i + 2);
     if (PUNCT2.includes(two)) {

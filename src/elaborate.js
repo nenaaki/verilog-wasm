@@ -13,6 +13,7 @@
 //   - 二項演算は両辺を max(幅) までゼロ拡張してからビットごとに適用
 //   - + / - は桁上げが入るので max(幅)+1 で計算し、その幅を結果とする
 //   - 比較は両辺を max(幅) に揃え、結果は 1 ビット (ここは Verilog と完全に同じ)
+//   - << / >> の結果は左オペランドの幅 (Verilog のシフトの自己決定幅と同じ)
 //   - 代入は右辺を左辺の幅に切り詰め / ゼロ拡張
 //   - ?: と if の条件が複数ビットなら OR リダクションで 1 ビットにする
 
@@ -206,6 +207,51 @@ export function elaborate(mod) {
     return invert ? [newGate('not', [ge])] : [ge];
   }
 
+  /**
+   * 幅を変えずに sh ビットずらす。ネットを並べ替えるだけでゲートは 1 個も増えない
+   * (空いた所には CONST0 のネット ID をそのまま並べる)。
+   *
+   * 結果の幅を左オペランドのままにするのは Verilog のシフトの自己決定幅と同じ。
+   * 広げてしまうと、比較のオペランドになったときに押し出されたビットが生き残って
+   * 結果が変わる (4 ビットの 8 << 1 は Verilog では 0、広げると 16)。
+   * 代入先の幅は見ないので、左辺が広いと押し出されたビットは戻ってこない。
+   * これは + / - と同じ割り切り (README の「幅の規則」にまとめてある)。
+   * 幅を増やしたいときは連接を使う: {hi, 4'h0} は hi << 4 と違って幅が曖昧にならない。
+   */
+  function shiftFixed(bits, sh, op) {
+    const w = bits.length;
+    if (sh >= w) return Array(w).fill(CONST0);   // 全部押し出される (巨大なリテラル対策も兼ねる)
+    if (op === '>>') return resize(bits.slice(sh), w);
+    return [...Array(sh).fill(CONST0), ...bits.slice(0, w - sh)];
+  }
+
+  /**
+   * シフト量が信号のときのシフト (バレルシフタ)。シフト量の各ビットについて
+   * 「2^j ずらすかどうか」を mux で選ぶ log 段構成。
+   *
+   * 2^j が幅以上になるビットは、立っていたら結果が全 0 になるだけなので、段を
+   * 積まずにまとめて 1 段のマスクにする。
+   */
+  function barrelShift(a, amt, op) {
+    const w = a.length;
+    let cur = a;
+    const overflow = [];
+
+    for (let j = 0; j < amt.length; j++) {
+      const sh = 2 ** j;
+      if (sh >= w) { overflow.push(amt[j]); continue; }
+      const shifted = shiftFixed(cur, sh, op);
+      cur = cur.map((n, i) => newGate('mux', [amt[j], shifted[i], n]));
+    }
+
+    if (overflow.length > 0) {
+      let big = overflow[0];
+      for (let k = 1; k < overflow.length; k++) big = newGate('or', [big, overflow[k]]);
+      cur = cur.map((n) => newGate('mux', [big, CONST0, n]));
+    }
+    return cur;
+  }
+
   function reduceOr(bits, line) {
     if (bits.length === 0) return CONST0;
     let acc = bits[0];
@@ -240,6 +286,12 @@ export function elaborate(mod) {
         if (e.op === '+' || e.op === '-') return addSub(a, b, e.op);
         if (e.op === '==' || e.op === '!=') return equalBits(a, b, e.op);
         if (CMP[e.op]) return compareBits(a, b, e.op);
+        if (e.op === '<<' || e.op === '>>') {
+          // リテラルなら並べ替えだけ、信号ならバレルシフタ。どちらも幅は変わらない
+          return e.b.type === 'num'
+            ? shiftFixed(a, Number(e.b.bits), e.op)
+            : barrelShift(a, b, e.op);
+        }
         const w = Math.max(a.length, b.length);
         const aa = resize(a, w);
         const bb = resize(b, w);

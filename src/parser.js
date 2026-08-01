@@ -1,8 +1,9 @@
 // Verilog サブセット → AST
 //
-// 式の優先順位 (低い順): ?:  |  ^  &  == !=  < <= > >=  + -  単項 (~ - +)  primary
+// 式の優先順位 (低い順):
+//   ?:  |  ^  &  == !=  < <= > >=  << >>  + -  単項 (~ - +)  primary
 // これは Verilog 本来の優先順位と一致する。等価 (== !=) は関係 (< など) より弱く、
-// どちらもビット演算より強い。算術はさらに強い。
+// 関係はシフトより弱く、シフトは算術より弱い。どれもビット演算より強い。
 //
 // '<=' はノンブロッキング代入と「以下」の両方に使われる。always 文の代入は
 // parseLValue で左辺を読んでから expect('<=') で食べるので、式の中に出てきた
@@ -82,7 +83,8 @@ export function parse(src) {
   }
 
   const parseAdd = binaryLevel(['+', '-'], () => parseUnary());
-  const parseRel = binaryLevel(['<=', '>=', '<', '>'], parseAdd);
+  const parseShift = binaryLevel(['<<', '>>'], parseAdd);
+  const parseRel = binaryLevel(['<=', '>=', '<', '>'], parseShift);
   const parseEq = binaryLevel(['==', '!='], parseRel);
   const parseAnd = binaryLevel('&', parseEq);
   const parseXor = binaryLevel('^', parseAnd);
