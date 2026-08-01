@@ -37,8 +37,9 @@ try {
   const compiled = compile(src, { top: value('--top') });
 
   const s = compiled.stats;
-  console.error(`${compiled.top}: nets=${s.nets} gates=${s.gates} regs=${s.regs} `
-    + `state=${s.stateBytes}B wasm=${s.wasmBytes}B`);
+  console.error(`${compiled.top}: nets=${s.nets} gates=${s.gates}`
+    + (s.pruned ? `(+${s.pruned} 刈り取り)` : '')
+    + ` regs=${s.regs} state=${s.stateBytes}B wasm=${s.wasmBytes}B`);
   for (const w of compiled.warnings) console.error(`warning: ${w}`);
 
   if (flag('--wat')) console.log(compiled.wat);

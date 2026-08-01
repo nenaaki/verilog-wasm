@@ -331,6 +331,106 @@ endmodule`);
   }
 }
 
+// -------------------------------------------------- 到達不能ゲートの刈り取り
+//
+// 消してよいのは「出力にもレジスタにも届かないゲート」だけ。観測できる信号が
+// 残っていることと、消しても値が変わらないことの両方を見る。
+async function testPrune() {
+  // 幅の広い式を狭い左辺に代入すると、上位ビットの計算が誰にも届かなくなる
+  const narrow = compile('module m(input [7:0] a, input [7:0] b, output [3:0] y); assign y = a - b; endmodule');
+  ok(narrow.stats.pruned > 0, '刈り取り: 切り詰められた上位ビットが消える',
+    `pruned=${narrow.stats.pruned}`);
+  eqs(narrow.stats.gates + narrow.stats.pruned, narrow.netlist.gates.length,
+    '刈り取り: gates + pruned が作ったゲート数と一致');
+  eqs(narrow.order.length, narrow.stats.gates, '刈り取り: order が刈り取り後の並び');
+
+  // 使われなかった定数ゲートも消える
+  const noConst = compile('module m(input [3:0] a, input [3:0] b, output [3:0] y); assign y = a & b; endmodule');
+  eqs(noConst.stats.pruned, 2, '刈り取り: 使われない $const0 / $const1 が消える',
+    `pruned=${noConst.stats.pruned}`);
+
+  // 消しても値は変わらない (狭い代入・上書きされた分岐の両方)
+  const live = `module m(
+  input clk,
+  input c,
+  input [7:0] a,
+  input [7:0] b,
+  output [3:0] narrowSub,
+  output reg [3:0] overwritten
+);
+  assign narrowSub = a - b;
+  always @(posedge clk) begin
+    if (c) overwritten <= a;      // この mux 木は下の代入に上書きされて死ぬ
+    overwritten <= b;
+  end
+endmodule`;
+  const { compiled, all } = await bothSims(live);
+  ok(compiled.stats.pruned > 0, '刈り取り: 上書きされた mux 木も消える',
+    `pruned=${compiled.stats.pruned}`);
+  for (const sim of all) {
+    const kind = sim.constructor.name;
+    let bad = null;
+    for (const [a, b] of [[3, 5], [200, 1], [0, 0], [255, 255], [16, 32]]) {
+      for (const cv of [0, 1]) {
+        sim.setInput('a', a).setInput('b', b).setInput('c', cv).step();
+        const want = ((a - b) % 256 + 256) % 256 & 15;
+        if (Number(sim.get('narrowSub')) !== want && !bad) {
+          bad = `narrowSub: a=${a} b=${b} 期待 ${want} / 実際 ${sim.get('narrowSub')}`;
+        }
+        if (Number(sim.get('overwritten')) !== (b & 15) && !bad) {
+          bad = `overwritten: b=${b} 期待 ${b & 15} / 実際 ${sim.get('overwritten')}`;
+        }
+      }
+    }
+    ok(!bad, `${kind} 刈り取り: 消しても観測できる値は変わらない`, bad ?? '');
+  }
+
+  // 出力ポートにつながっていない内部 reg も、signalTable から読めるので消してはいけない
+  const hidden = `module m(input clk, input [3:0] d, output [3:0] y);
+  reg [3:0] hiddenReg;
+  always @(posedge clk) hiddenReg <= d;
+  assign y = d;
+endmodule`;
+  const { all: hs } = await bothSims(hidden);
+  for (const sim of hs) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('d', 0xa).step();
+    eq(sim.get('hiddenReg'), 0xa, `${kind} 刈り取り: 出力に出ていない reg も更新される`);
+    sim.setInput('d', 0x5).step();
+    eq(sim.get('hiddenReg'), 0x5, `${kind} 刈り取り: 2 クロック目も追従する`);
+  }
+
+  // 刈りすぎていない確認。両方の定数を使う回路なら消すものが無い
+  const bothConst = compile(`module m(output [1:0] y); assign y = {1'b1, 1'b0}; endmodule`);
+  eqs(bothConst.stats.pruned, 0, '刈り取り: 全部使っている回路では 0',
+    `pruned=${bothConst.stats.pruned} gates=${bothConst.stats.gates}`);
+  eq(await (async () => {
+    const sim = await WasmSimulator.create(bothConst);
+    sim.eval();
+    return sim.get('y');
+  })(), 2, '刈り取り: 定数だけの回路も正しく動く');
+
+  // リテラルを使わない回路で消えるのは定数ゲート 2 個ちょうど
+  const fa = compile(example('full_adder.v'));
+  eqs(fa.stats.pruned, 2, '刈り取り: 定数を使わない回路では $const0 / $const1 だけ消える',
+    `pruned=${fa.stats.pruned} gates=${fa.stats.gates}`);
+
+  // 到達不能な場所にある組合せループも、刈り取りより先に見つかること
+  let caught = null;
+  try {
+    compile(`module m(input a, output y);
+      wire t, u;
+      assign t = a & u;
+      assign u = ~t;      // y にはつながっていない組合せループ
+      assign y = a;
+    endmodule`);
+  } catch (e) {
+    caught = e;
+  }
+  ok(caught instanceof CompileError && /組合せループ/.test(caught.message),
+    '刈り取り: 到達不能な組合せループも見逃さない', caught ? caught.message : 'エラーにならなかった');
+}
+
 // ------------------------------------------------------------ 文脈依存幅
 //
 // 「どの演算子が代入先の幅を受け取り、どれが受け取らないか」が本体なので、
@@ -592,12 +692,20 @@ async function testWindow() {
 //
 // 定数シフトと可変シフトで幅の扱いが変わるので、両方を JS のシフトと比べる。
 async function testShift() {
-  // --- 定数シフト。並べ替えだけなのでゲートは増えないはず ---
+  // --- 定数シフトは並べ替えだけ ---
+  // 素通しと比べて増えるのは $const0 の 1 個だけ。空いたビットに 0 を入れるために
+  // 定数ゲートが生きるぶんで、シフト量に比例するゲートは 1 個も出ない。
   const plain = compile('module m(input [7:0] a, output [7:0] y); assign y = a; endmodule');
   const shifted = compile('module m(input [7:0] a, output [7:0] y); assign y = a << 3; endmodule');
-  eqs(shifted.stats.gates, plain.stats.gates,
-    '定数シフト: ゲートが増えない (配線の付け替えだけ)',
+  eqs(shifted.stats.gates, plain.stats.gates + 1,
+    '定数シフト: 素通しに対して増えるのは $const0 の 1 個だけ',
     `素通し=${plain.stats.gates} シフト=${shifted.stats.gates}`);
+
+  const sh1 = compile('module m(input [7:0] a, output [7:0] y); assign y = a << 1; endmodule');
+  const sh7 = compile('module m(input [7:0] a, output [7:0] y); assign y = a >> 7; endmodule');
+  eqs(sh1.stats.gates, sh7.stats.gates,
+    '定数シフト: シフト量や向きを変えてもゲート数は同じ',
+    `<<1=${sh1.stats.gates} >>7=${sh7.stats.gates}`);
 
   const src = `module sh(
   input [3:0] a,
@@ -686,15 +794,17 @@ endmodule`;
   eq(wasm.get('litAmt'), 5, 'リテラル幅: a << (1 + 1) は 1+1 が 1 ビットなのでシフトされない');
   eq(wasm.get('sizedAmt'), 20, 'リテラル幅: サイズ付きの 2\'d1 + 2\'d1 なら 2 になる');
 
-  // バレルシフタの段数。8 ビットを 3 ビット量でずらすと 8×3 = 24 個の mux
+  // バレルシフタの段数。定数シフト版との差が mux のぶんそのものになる
   const barrel = compile('module m(input [7:0] a, input [2:0] s, output [7:0] y); assign y = a << s; endmodule');
-  eqs(barrel.stats.gates - plain.stats.gates, 24,
-    'シフト: 8 ビット × 3 ビット量のバレルシフタは mux 24 個', `差分=${barrel.stats.gates - plain.stats.gates}`);
+  eqs(barrel.stats.gates - shifted.stats.gates, 24,
+    'シフト: 8 ビット × 3 ビット量のバレルシフタは mux 24 個',
+    `差分=${barrel.stats.gates - shifted.stats.gates}`);
 
   // シフト量が幅を超え得るビットは、段を積まずに 1 段のマスクにまとめる
   const wide = compile('module m(input [7:0] a, input [7:0] s, output [7:0] y); assign y = a << s; endmodule');
-  eqs(wide.stats.gates - plain.stats.gates, 36,
-    'シフト: 8 ビット量でも 24 + (or 4 + mux 8) で済む', `差分=${wide.stats.gates - plain.stats.gates}`);
+  eqs(wide.stats.gates - shifted.stats.gates, 36,
+    'シフト: 8 ビット量でも 24 + (or 4 + mux 8) で済む',
+    `差分=${wide.stats.gates - shifted.stats.gates}`);
 
   // 64 レーンで別々のシフト量
   wasm.reset();
@@ -1771,6 +1881,7 @@ const suites = [
   ['ゲートプリミティブ', testGates],
   ['加算・減算', testArith],
   ['文脈依存幅', testContextWidth],
+  ['刈り取り', testPrune],
   ['比較器', testCompare],
   ['論理演算子', testLogical],
   ['範囲判定', testWindow],

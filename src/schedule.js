@@ -1,8 +1,12 @@
-// 組合せ回路のトポロジカルソート + 組合せループ検出。
+// 組合せ回路のトポロジカルソート + 組合せループ検出 + 到達不能ゲートの刈り取り。
 //
 // レジスタで回路を切断する:
 //   Q 出力は「その場にある値」= ソース、D 入力は「計算結果」= シンク。
 // これにより残りは純粋な DAG になる。
+//
+// 返す order がそのままコード生成の対象になる。ループ検出は「全ゲートを並べ切れたか」
+// で見るので、刈り取りは並べ切ってから最後にやる (順番を逆にすると、到達不能な
+// 組合せループを見逃すようになる)。
 
 import { CompileError } from './errors.js';
 
@@ -57,5 +61,40 @@ export function schedule(netlist) {
     );
   }
 
-  return order;
+  return order.filter(reachable(netlist));
+}
+
+/**
+ * 出力ポートとレジスタの D から逆向きに辿って、そこに届くゲートだけを残す判定を返す。
+ *
+ * 外から見えるネットは線形メモリにスロットを持つものだけ (入力ポート・出力ポート・
+ * レジスタの Q) で、内部の組合せ配線は WASM の local に載るだけ ([layout.js] 参照)。
+ * つまり「出力にもレジスタにも届かないゲート」は誰にも観測されないので、評価しなくても
+ * 外から見た挙動は変わらない。local は残るが値が 0 のままになるだけで、読む人がいない。
+ *
+ * 消えるのは主に、幅の広い式を狭い左辺に代入したときの上位ビット、条件付き代入を後の
+ * 無条件代入が上書きしたときの mux 木、使われなかった $const0 / $const1。
+ */
+function reachable(netlist) {
+  const { nets, gates, regs, signals } = netlist;
+
+  // ネット → それを駆動しているゲート (無ければ -1。入力ポートとレジスタ Q がこれ)
+  const driver = new Int32Array(nets.length).fill(-1);
+  gates.forEach((g, gi) => { driver[g.out] = gi; });
+
+  const live = new Uint8Array(gates.length);
+  const stack = [];
+  for (const s of signals.values()) {
+    if (s.dir === 'output') stack.push(...s.bits);
+  }
+  for (const r of regs) stack.push(r.d);
+
+  while (stack.length > 0) {
+    const gi = driver[stack.pop()];
+    if (gi < 0 || live[gi]) continue;
+    live[gi] = 1;
+    for (const n of gates[gi].in) stack.push(n);
+  }
+
+  return (gi) => live[gi] === 1;
 }

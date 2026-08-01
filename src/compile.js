@@ -52,7 +52,10 @@ export function compile(src, opts = {}) {
     bytes,
     stats: {
       nets: netlist.nets.length,
-      gates: netlist.gates.length,
+      // gates は「生成コードに乗ったゲート数」= 刈り取り後。作ったけれど出力にも
+      // レジスタにも届かなかったぶんは pruned に出す (schedule.js 参照)
+      gates: order.length,
+      pruned: netlist.gates.length - order.length,
       regs: netlist.regs.length,
       stateBytes: layout.byteSize,
       wasmBytes: bytes.length,
