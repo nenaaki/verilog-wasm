@@ -12,6 +12,7 @@
 // 幅の解決規則 (Verilog の文脈依存幅は実装せず、単純化した規則を採用):
 //   - 二項演算は両辺を max(幅) までゼロ拡張してからビットごとに適用
 //   - + / - は桁上げが入るので max(幅)+1 で計算し、その幅を結果とする
+//   - 比較は両辺を max(幅) に揃え、結果は 1 ビット (ここは Verilog と完全に同じ)
 //   - 代入は右辺を左辺の幅に切り詰め / ゼロ拡張
 //   - ?: の選択信号が複数ビットなら OR リダクションで 1 ビットにする
 
@@ -160,6 +161,51 @@ export function elaborate(mod) {
     return addBits(aa, bb, op === '+' ? CONST0 : CONST1);
   }
 
+  /**
+   * a == b / a != b。差分ビットを OR リダクションして 1 ビットにする。
+   * XNOR の AND リダクションでも同じだが、こちらは基本ゲートだけで済む。
+   */
+  function equalBits(a, b, op) {
+    const w = Math.max(a.length, b.length);
+    const aa = resize(a, w);
+    const bb = resize(b, w);
+    let diff = newGate('xor', [aa[0], bb[0]]);
+    for (let i = 1; i < w; i++) diff = newGate('or', [diff, newGate('xor', [aa[i], bb[i]])]);
+    return op === '==' ? [newGate('not', [diff])] : [diff];
+  }
+
+  /**
+   * a - b の桁上げ出力だけを作る。1 なら a >= b、0 なら a < b (符号なし)。
+   * 和は使わないので作らない。減算なので b を反転し、桁上げ入力は 1。
+   * 最下段は桁上げ入力が定数 1 に決まっているので (a&b)|(1&(a^b)) = a|b に縮む。
+   */
+  function geCarry(a, b) {
+    const w = Math.max(a.length, b.length);
+    const aa = resize(a, w);
+    const nb = resize(b, w).map((n) => newGate('not', [n]));
+    let carry = newGate('or', [aa[0], nb[0]]);
+    for (let i = 1; i < w; i++) {
+      const axb = newGate('xor', [aa[i], nb[i]]);
+      carry = newGate('or', [newGate('and', [aa[i], nb[i]]), newGate('and', [carry, axb])]);
+    }
+    return carry;
+  }
+
+  // a >= b が桁上げ出力そのもの。残り 3 つは辺の入れ替えと反転で作る。
+  const CMP = {
+    '>=': { swap: false, invert: false },
+    '<': { swap: false, invert: true },    // ~(a >= b)
+    '<=': { swap: true, invert: false },   // b >= a
+    '>': { swap: true, invert: true },     // ~(b >= a)
+  };
+
+  /** 関係演算子。結果は Verilog と同じく 1 ビット */
+  function compareBits(a, b, op) {
+    const { swap, invert } = CMP[op];
+    const ge = swap ? geCarry(b, a) : geCarry(a, b);
+    return invert ? [newGate('not', [ge])] : [ge];
+  }
+
   function reduceOr(bits, line) {
     if (bits.length === 0) return CONST0;
     let acc = bits[0];
@@ -192,6 +238,8 @@ export function elaborate(mod) {
         const a = evalExpr(e.a);
         const b = evalExpr(e.b);
         if (e.op === '+' || e.op === '-') return addSub(a, b, e.op);
+        if (e.op === '==' || e.op === '!=') return equalBits(a, b, e.op);
+        if (CMP[e.op]) return compareBits(a, b, e.op);
         const w = Math.max(a.length, b.length);
         const aa = resize(a, w);
         const bb = resize(b, w);

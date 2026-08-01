@@ -227,6 +227,111 @@ endmodule`;
   ok(compiled.stats.regs === 0, '加算・減算: レジスタなし', `regs=${compiled.stats.regs}`);
 }
 
+// ------------------------------------------------------------------ 比較器
+//
+// 加算器と同じ理由で、ここも JS の比較と直接突き合わせる。
+async function testCompare() {
+  const { compiled, wasm, ref } = await bothSims(example('cmp4.v'));
+  eqs(compiled.stats.regs, 0, '比較器: レジスタなし');
+
+  let bad = null;
+  for (let a = 0; a < 16 && !bad; a++) {
+    for (let b = 0; b < 16 && !bad; b++) {
+      for (const sim of [wasm, ref]) sim.setInput('a', a).setInput('b', b).eval();
+      const expect = { lt: a < b ? 1 : 0, eq: a === b ? 1 : 0, gt: a > b ? 1 : 0 };
+      for (const [port, want] of Object.entries(expect)) {
+        for (const sim of [wasm, ref]) {
+          if (Number(sim.get(port)) !== want) {
+            bad = `${sim.constructor.name} ${port}: a=${a} b=${b} 期待 ${want} / 実際 ${sim.get(port)}`;
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, 'cmp4: 全 256 通りが JS の比較と一致', bad ?? '');
+
+  // 6 演算子すべてと、幅の違う辺・リテラル・1 ビットになる結果
+  const src = `module cmps(
+  input [3:0] a,
+  input [3:0] b,
+  output eq, output ne, output lt, output le, output gt, output ge,
+  output narrow, output lit, output [7:0] widened,
+  output prec1, output [3:0] prec2, output prec3
+);
+  assign eq  = a == b;
+  assign ne  = a != b;
+  assign lt  = a <  b;
+  assign le  = a <= b;
+  assign gt  = a >  b;
+  assign ge  = a >= b;
+  assign narrow  = a[1:0] < b;   // 2 ビット対 4 ビット
+  assign lit     = a >= 4'h8;
+  assign widened = a < b;        // 結果は 1 ビットなのでゼロ拡張される
+  assign prec1   = a < b == 1'b1;  // 等価は関係より弱い → (a<b) == 1
+  assign prec2   = a & b == b;     // & は等価より弱い → a & (b==b) = a & 1
+  assign prec3   = a + 1 <= b;     // 算術は関係より強い → (a+1) <= b
+endmodule`;
+  const { wasm: w2, ref: r2 } = await bothSims(src);
+  let bad2 = null;
+  for (let a = 0; a < 16 && !bad2; a++) {
+    for (let b = 0; b < 16 && !bad2; b++) {
+      for (const sim of [w2, r2]) sim.setInput('a', a).setInput('b', b).eval();
+      const expect = {
+        eq: a === b ? 1 : 0,
+        ne: a !== b ? 1 : 0,
+        lt: a < b ? 1 : 0,
+        le: a <= b ? 1 : 0,
+        gt: a > b ? 1 : 0,
+        ge: a >= b ? 1 : 0,
+        narrow: (a & 3) < b ? 1 : 0,
+        lit: a >= 8 ? 1 : 0,
+        widened: a < b ? 1 : 0,
+        prec1: (a < b ? 1 : 0) === 1 ? 1 : 0,
+        prec2: a & 1,
+        prec3: ((a + 1) & 31) <= b ? 1 : 0,
+      };
+      for (const [port, want] of Object.entries(expect)) {
+        for (const sim of [w2, r2]) {
+          if (Number(sim.get(port)) !== want) {
+            bad2 = `${sim.constructor.name} ${port}: a=${a} b=${b} 期待 ${want} / 実際 ${sim.get(port)}`;
+          }
+        }
+      }
+    }
+  }
+  ok(!bad2, '比較器: 6 演算子 × 全 256 通り (幅違い・優先順位込み)', bad2 ?? '');
+
+  // 比較の幅規則は代入先を見ないが、結果が 1 ビットなので + / - と違って
+  // Verilog と食い違わない。8 ビットに代入しても 0 か 1 のまま。
+  for (const sim of [w2, r2]) sim.setInput('a', 1).setInput('b', 9).eval();
+  eq(w2.get('widened'), 1, '比較器: 8 ビットに代入しても 1 ビットの値');
+  for (const sim of [w2, r2]) sim.setInput('a', 9).setInput('b', 1).eval();
+  eq(w2.get('widened'), 0, '比較器: 偽なら 0');
+
+  // 64 レーンで別々の比較
+  w2.reset();
+  for (let lane = 0; lane < 64; lane++) {
+    w2.setInputLane('a', lane, lane & 15).setInputLane('b', lane, (lane >> 2) & 15);
+  }
+  w2.eval();
+  const lanes = w2.getLanes('ge');
+  let laneBad = 0;
+  for (let lane = 0; lane < 64; lane++) {
+    if (Number(lanes[lane]) !== ((lane & 15) >= ((lane >> 2) & 15) ? 1 : 0)) laneBad++;
+  }
+  ok(laneBad === 0, '比較器: 64 レーンが独立に比較される', `${laneBad} レーン不一致`);
+
+  // 式の中の <= (関係) と、ノンブロッキング代入の <= が同居できるか
+  const { wasm: w3 } = await bothSims(`module amb(input clk, input [3:0] a, input [3:0] b, output reg q);
+  always @(posedge clk)
+    q <= a <= b;
+endmodule`);
+  for (const [a, b] of [[3, 5], [5, 3], [4, 4]]) {
+    w3.setInput('a', a).setInput('b', b).step();
+    eq(w3.get('q'), a <= b ? 1 : 0, `<= の曖昧性: q <= a <= b (a=${a} b=${b})`);
+  }
+}
+
 // -------------------------------------------------------------- カウンタ
 async function testCounter8() {
   const { all } = await bothSims(example('counter8.v'));
@@ -442,9 +547,12 @@ async function testErrors() {
     ['乗算は未対応',
       `module m(input [3:0] a, output [7:0] y); assign y = a * a; endmodule`,
       /解釈できない文字/],
-    ['比較は未対応',
-      `module m(input [3:0] a, output y); assign y = a < 4'h3; endmodule`,
-      /解釈できない文字/],
+    ['=== は未対応',
+      `module m(input [3:0] a, output y); assign y = a === 4'h3; endmodule`,
+      /=== は未対応/],
+    ['論理演算子は未対応',
+      `module m(input a, b, output y); assign y = a && b; endmodule`,
+      /式が必要/],
   ];
 
   for (const [label, src, pattern] of cases) {
@@ -491,10 +599,14 @@ function randomDesign(rng, nWires) {
     if (r < 0.55) return `(${expr(depth - 1)} & ${expr(depth - 1)})`;
     if (r < 0.65) return `(${expr(depth - 1)} | ${expr(depth - 1)})`;
     if (r < 0.75) return `(${expr(depth - 1)} ^ ${expr(depth - 1)})`;
-    if (r < 0.81) return `(${expr(depth - 1)} + ${expr(depth - 1)})`;
-    if (r < 0.87) return `(${expr(depth - 1)} - ${expr(depth - 1)})`;
-    if (r < 0.9) return `(-${expr(depth - 1)})`;
-    if (r < 0.96) return `(${expr(depth - 1)} ? ${expr(depth - 1)} : ${expr(depth - 1)})`;
+    if (r < 0.79) return `(${expr(depth - 1)} + ${expr(depth - 1)})`;
+    if (r < 0.84) return `(${expr(depth - 1)} - ${expr(depth - 1)})`;
+    if (r < 0.86) return `(-${expr(depth - 1)})`;
+    if (r < 0.93) {
+      const cmp = ['==', '!=', '<', '<=', '>', '>='][Math.floor(rng() * 6)];
+      return `(${expr(depth - 1)} ${cmp} ${expr(depth - 1)})`;
+    }
+    if (r < 0.97) return `(${expr(depth - 1)} ? ${expr(depth - 1)} : ${expr(depth - 1)})`;
     return `{${expr(depth - 1)}, ${expr(depth - 1)}}`;
   };
 
@@ -1001,6 +1113,7 @@ const suites = [
   ['全加算器', testFullAdder],
   ['ゲートプリミティブ', testGates],
   ['加算・減算', testArith],
+  ['比較器', testCompare],
   ['カウンタ', testCounter8],
   ['DFF', testDff],
   ['シフトレジスタ', testShift8],

@@ -166,6 +166,30 @@ endmodule`,
     q <= clr ? 8'h00 : (en ? q + 1 : q);
 endmodule`,
 
+  'counter_mod — 上限付きカウンタ (比較器 + 加算器)': `module counter_mod(
+  input clk,
+  input [7:0] limit,
+  output reg [7:0] q,
+  output tc
+);
+  assign tc = q >= limit;
+
+  always @(posedge clk)
+    q <= tc ? 8'h00 : q + 1;
+endmodule`,
+
+  'cmp4 — 4bit マグニチュードコンパレータ': `module cmp4(
+  input  [3:0] a,
+  input  [3:0] b,
+  output lt,
+  output eq,
+  output gt
+);
+  assign lt = a <  b;
+  assign eq = a == b;
+  assign gt = a >  b;
+endmodule`,
+
   'full_adder — 全加算器': `module full_adder(
   input  a,
   input  b,

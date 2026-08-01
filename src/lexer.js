@@ -8,8 +8,12 @@ const RE_SIZED = /(\d+)?'([bodhBODH])([0-9a-fA-F_]+)/y;
 const RE_DEC = /\d[\d_]*/y;
 const RE_IDENT = /[A-Za-z_][A-Za-z0-9_$]*/y;
 
-const PUNCT2 = ['<='];
-const PUNCT1 = ['?', ':', '(', ')', '[', ']', '{', '}', ',', ';', '=', '&', '|', '^', '~', '@', '+', '-'];
+// '<=' はノンブロッキング代入と「以下」を兼ねる。どちらなのかは文脈で決まるので
+// パーサ側で解く (Verilog 本来の解き方と同じ)。
+const PUNCT2 = ['<=', '>=', '==', '!='];
+const PUNCT1 = ['?', ':', '(', ')', '[', ']', '{', '}', ',', ';', '=', '&', '|', '^', '~', '@', '+', '-', '<', '>'];
+// == / != と見た目が近いので、素通りさせずに名指しで断る
+const PUNCT3_REJECT = ['===', '!=='];
 
 const RADIX = { b: 2, o: 8, d: 10, h: 16 };
 
@@ -84,6 +88,11 @@ export function lex(src) {
       tokens.push({ type: 'ident', value: id[0], line });
       i += id[0].length;
       continue;
+    }
+
+    const three = src.slice(i, i + 3);
+    if (PUNCT3_REJECT.includes(three)) {
+      throw new CompileError(`${three} は未対応 (x / z を扱わないので == / != と同じ意味になる)`, line);
     }
 
     const two = src.slice(i, i + 2);
