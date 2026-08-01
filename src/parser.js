@@ -1,7 +1,7 @@
 // Verilog サブセット → AST
 //
-// 式の優先順位 (低い順): ?:  |  ^  &  ~  primary
-// これは Verilog 本来のビット演算子の優先順位と一致する。
+// 式の優先順位 (低い順): ?:  |  ^  &  + -  単項 (~ - +)  primary
+// これは Verilog 本来の優先順位と一致する (算術はビット演算より強く結合する)。
 
 import { lex } from './lexer.js';
 import { CompileError } from './errors.js';
@@ -62,25 +62,33 @@ export function parse(src) {
     return cond;
   }
 
-  function binaryLevel(op, sub) {
+  /** ops は同じ優先順位で左結合する演算子 ('+' と '-' のように複数並ぶ) */
+  function binaryLevel(ops, sub) {
+    const list = Array.isArray(ops) ? ops : [ops];
     return () => {
       let left = sub();
-      while (at(op)) {
+      for (;;) {
+        const op = list.find((o) => at(o));
+        if (!op) return left;
         const line = next().line;
         left = { type: 'bin', op, a: left, b: sub(), line };
       }
-      return left;
     };
   }
 
-  const parseAnd = binaryLevel('&', () => parseUnary());
+  const parseAdd = binaryLevel(['+', '-'], () => parseUnary());
+  const parseAnd = binaryLevel('&', parseAdd);
   const parseXor = binaryLevel('^', parseAnd);
   const parseOr = binaryLevel('|', parseXor);
 
   function parseUnary() {
-    if (at('~')) {
-      const line = next().line;
-      return { type: 'un', op: '~', a: parseUnary(), line };
+    if (at('~') || at('-')) {
+      const t = next();
+      return { type: 'un', op: t.value, a: parseUnary(), line: t.line };
+    }
+    if (at('+')) {           // 単項 + は Verilog でも何もしない
+      next();
+      return parseUnary();
     }
     return parsePrimary();
   }

@@ -156,6 +156,16 @@ const EXAMPLES = {
     q <= {q[6:0], fb};
 endmodule`,
 
+  'counter8 — 8bit カウンタ (+ が加算器になる)': `module counter8(
+  input clk,
+  input en,
+  input clr,
+  output reg [7:0] q
+);
+  always @(posedge clk)
+    q <= clr ? 8'h00 : (en ? q + 1 : q);
+endmodule`,
+
   'full_adder — 全加算器': `module full_adder(
   input  a,
   input  b,

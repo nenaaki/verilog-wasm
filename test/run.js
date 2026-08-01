@@ -136,6 +136,122 @@ async function testRegEn() {
   }
 }
 
+// -------------------------------------------------------------- 加算・減算
+//
+// 加算器はビットに展開した時点で「ふつうのゲートの塊」になるので、WASM と参照
+// 実装を突き合わせるだけでは算術としての正しさは分からない (両者は同じネット
+// リストを見ている)。ここは JS の算術と直接比べる。
+async function testArith() {
+  const src = `module arith(
+  input [3:0] a,
+  input [3:0] b,
+  output [4:0] sum,
+  output [3:0] wrap,
+  output [4:0] diff,
+  output [3:0] neg,
+  output [4:0] chain,
+  output [4:0] pre1,
+  output [4:0] pre2,
+  output [4:0] slice,
+  output [7:0] wide
+);
+  assign sum   = a + b;        // 桁上げまで受けられる 5 ビット
+  assign wrap  = a + b;        // 4 ビットに切り詰められる
+  assign diff  = a - b;
+  assign neg   = -a;
+  assign chain = a + b - a;
+  assign pre1  = a + b & 4'hC; // + は & より強い → (a+b) & C
+  assign pre2  = a & b + 4'h1; // → a & (b+1)
+  assign slice = a[2:0] + 1;
+  assign wide  = a - b;        // 左辺が広くても計算幅は max(右辺)+1 のまま
+endmodule`;
+  const { compiled, wasm, ref } = await bothSims(src);
+
+  let bad = null;
+  for (let a = 0; a < 16 && !bad; a++) {
+    for (let b = 0; b < 16 && !bad; b++) {
+      for (const sim of [wasm, ref]) sim.setInput('a', a).setInput('b', b).eval();
+      const expect = {
+        sum: (a + b) & 31,
+        wrap: (a + b) & 15,
+        diff: (a - b) & 31,       // 符号なしなので 3 - 5 は 5 ビットで 30
+        neg: (-a) & 15,
+        chain: ((a + b) - a) & 31,
+        pre1: ((a + b) & 0xc) & 31,
+        pre2: (a & ((b + 1) & 31)) & 31,
+        slice: ((a & 7) + 1) & 31,
+        wide: (a - b) & 31,     // 8 ビットに広げるのは計算の後。下の固定テスト参照
+      };
+      for (const [port, want] of Object.entries(expect)) {
+        for (const sim of [wasm, ref]) {
+          if (Number(sim.get(port)) !== want) {
+            bad = `${sim.constructor.name} ${port}: a=${a} b=${b} 期待 ${want} / 実際 ${sim.get(port)}`;
+            break;
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, '加算・減算: 全 256 通りが JS の算術と一致', bad ?? '');
+
+  // 減算の符号なし意味づけ (Verilog は文脈幅で計算するので 3 - 5 は 30)
+  for (const sim of [wasm, ref]) sim.setInput('a', 3).setInput('b', 5).eval();
+  eq(wasm.get('diff'), 30, '減算: 3 - 5 は 5 ビット幅で 30');
+  eq(wasm.get('sum'), 8, '加算: 桁上げが 5 ビット目に出る');
+  for (const sim of [wasm, ref]) sim.setInput('a', 15).setInput('b', 1).eval();
+  eq(wasm.get('sum'), 16, '加算: 15 + 1 は 5 ビットで 16');
+  eq(wasm.get('wrap'), 0, '加算: 4 ビットに代入すると 0 に回る');
+
+  // 幅の割り切りが見える所を固定しておく。
+  // 計算幅は「代入先の幅」ではなく「右辺の max(幅)+1」で決まるので、左辺が
+  // それより広いと本物の Verilog と結果が変わる (文脈依存幅は実装していない)。
+  // 3 - 5 は 8 ビット文脈なら 251 になるが、ここでは 5 ビットで計算した 30 を
+  // ゼロ拡張して 30 になる。意図した挙動なのでテストで固定する。
+  for (const sim of [wasm, ref]) sim.setInput('a', 3).setInput('b', 5).eval();
+  eq(wasm.get('wide'), 30, '減算: 左辺が広くても計算幅は max(右辺)+1');
+  eq(ref.get('wide'), 30, '減算: 参照実装も同じ幅規則');
+
+  // 64 レーン同時に別々の足し算をさせる (加算器もビット単位なので効く)
+  wasm.reset();
+  for (let lane = 0; lane < 64; lane++) {
+    wasm.setInputLane('a', lane, lane & 15).setInputLane('b', lane, (lane >> 2) & 15);
+  }
+  wasm.eval();
+  const lanes = wasm.getLanes('sum');
+  let laneBad = 0;
+  for (let lane = 0; lane < 64; lane++) {
+    if (Number(lanes[lane]) !== (((lane & 15) + ((lane >> 2) & 15)) & 31)) laneBad++;
+  }
+  ok(laneBad === 0, '加算: 64 レーンが独立に計算される', `${laneBad} レーン不一致`);
+
+  ok(compiled.stats.regs === 0, '加算・減算: レジスタなし', `regs=${compiled.stats.regs}`);
+}
+
+// -------------------------------------------------------------- カウンタ
+async function testCounter8() {
+  const { all } = await bothSims(example('counter8.v'));
+  for (const sim of all) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('clr', 0).setInput('en', 1);
+    for (let i = 1; i <= 20; i++) {
+      sim.step();
+      eq(sim.get('q'), i, `${kind} counter8: ${i} クロック目`);
+    }
+    sim.setInput('en', 0).run(5);
+    eq(sim.get('q'), 20, `${kind} counter8: en=0 で止まる`);
+
+    // 255 まで進めて 0 に回るところ
+    sim.reset().setInput('en', 1).setInput('clr', 0).run(255);
+    eq(sim.get('q'), 255, `${kind} counter8: 255 まで数える`);
+    sim.step();
+    eq(sim.get('q'), 0, `${kind} counter8: 255 の次は 0`);
+
+    sim.run(7);
+    sim.setInput('clr', 1).step();
+    eq(sim.get('q'), 0, `${kind} counter8: clr=1 でクリア`);
+  }
+}
+
 // ------------------------------------------------------------------ LFSR
 async function testLfsr() {
   const { compiled, wasm, ref } = await bothSims(example('lfsr8.v'));
@@ -323,6 +439,12 @@ async function testErrors() {
     ['モジュール階層は未対応',
       `module m(input a, output y); sub u0(y, a); endmodule`,
       /未対応/],
+    ['乗算は未対応',
+      `module m(input [3:0] a, output [7:0] y); assign y = a * a; endmodule`,
+      /解釈できない文字/],
+    ['比較は未対応',
+      `module m(input [3:0] a, output y); assign y = a < 4'h3; endmodule`,
+      /解釈できない文字/],
   ];
 
   for (const [label, src, pattern] of cases) {
@@ -365,11 +487,14 @@ function randomDesign(rng, nWires) {
       if (k < 0.5) return `1'b${Math.floor(rng() * 2)}`;
       return s;
     }
-    if (r < 0.45) return `(~${expr(depth - 1)})`;
-    if (r < 0.6) return `(${expr(depth - 1)} & ${expr(depth - 1)})`;
-    if (r < 0.72) return `(${expr(depth - 1)} | ${expr(depth - 1)})`;
-    if (r < 0.84) return `(${expr(depth - 1)} ^ ${expr(depth - 1)})`;
-    if (r < 0.93) return `(${expr(depth - 1)} ? ${expr(depth - 1)} : ${expr(depth - 1)})`;
+    if (r < 0.42) return `(~${expr(depth - 1)})`;
+    if (r < 0.55) return `(${expr(depth - 1)} & ${expr(depth - 1)})`;
+    if (r < 0.65) return `(${expr(depth - 1)} | ${expr(depth - 1)})`;
+    if (r < 0.75) return `(${expr(depth - 1)} ^ ${expr(depth - 1)})`;
+    if (r < 0.81) return `(${expr(depth - 1)} + ${expr(depth - 1)})`;
+    if (r < 0.87) return `(${expr(depth - 1)} - ${expr(depth - 1)})`;
+    if (r < 0.9) return `(-${expr(depth - 1)})`;
+    if (r < 0.96) return `(${expr(depth - 1)} ? ${expr(depth - 1)} : ${expr(depth - 1)})`;
     return `{${expr(depth - 1)}, ${expr(depth - 1)}}`;
   };
 
@@ -875,6 +1000,8 @@ async function testConstants() {
 const suites = [
   ['全加算器', testFullAdder],
   ['ゲートプリミティブ', testGates],
+  ['加算・減算', testArith],
+  ['カウンタ', testCounter8],
   ['DFF', testDff],
   ['シフトレジスタ', testShift8],
   ['イネーブル付きレジスタ', testRegEn],

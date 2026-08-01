@@ -11,6 +11,7 @@
 //
 // 幅の解決規則 (Verilog の文脈依存幅は実装せず、単純化した規則を採用):
 //   - 二項演算は両辺を max(幅) までゼロ拡張してからビットごとに適用
+//   - + / - は桁上げが入るので max(幅)+1 で計算し、その幅を結果とする
 //   - 代入は右辺を左辺の幅に切り詰め / ゼロ拡張
 //   - ?: の選択信号が複数ビットなら OR リダクションで 1 ビットにする
 
@@ -120,6 +121,45 @@ export function elaborate(mod) {
     return out;
   }
 
+  /**
+   * 桁上げ伝播加算器。a と b は同じ長さの LSB 先頭のネット配列。
+   * 全加算器 1 段は sum = a^b^cin / cout = (a&b) | (cin & (a^b))。
+   * 最上位段の桁上げ出力は作らない (使わないゲートを残すと、そのまま
+   * コード生成まで運ばれてしまう。schedule に未使用ゲートの刈り取りはない)。
+   */
+  function addBits(a, b, cin) {
+    let carry = cin;
+    const out = [];
+    for (let i = 0; i < a.length; i++) {
+      const axb = newGate('xor', [a[i], b[i]]);
+      out.push(newGate('xor', [axb, carry]));
+      if (i + 1 < a.length) {
+        carry = newGate('or', [newGate('and', [a[i], b[i]]), newGate('and', [carry, axb])]);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * a + b / a - b。
+   *
+   * 両辺を max(幅)+1 まで広げてから計算する。この「先に広げる」のが要点で、
+   * 元の幅で計算して桁上げを上に足す形にすると減算が合わない
+   * (4 ビットの 3 - 5 は、5 ビットの文脈では 14 ではなく 30)。
+   * 減算は b を反転して桁上げ入力 1、つまり 2 の補数で足す。
+   *
+   * ここで決まるのは「右辺だけを見た幅」で、代入先の幅は見ない。Verilog 本来の
+   * 文脈依存幅では代入先も計算幅に入るので、左辺が max(幅)+1 より広いと結果が
+   * 変わる (8 ビットに代入する 3 - 5 は本来 251、ここでは 30)。文脈依存幅は
+   * 実装しない方針なので、この差は割り切りとして受け入れている。
+   */
+  function addSub(a, b, op) {
+    const w = Math.max(a.length, b.length) + 1;
+    const aa = resize(a, w);
+    const bb = op === '+' ? resize(b, w) : resize(b, w).map((n) => newGate('not', [n]));
+    return addBits(aa, bb, op === '+' ? CONST0 : CONST1);
+  }
+
   function reduceOr(bits, line) {
     if (bits.length === 0) return CONST0;
     let acc = bits[0];
@@ -138,11 +178,20 @@ export function elaborate(mod) {
       }
       case 'ref':
         return refBits(e);
-      case 'un':
-        return evalExpr(e.a).map((n) => newGate('not', [n]));
+      case 'un': {
+        const a = evalExpr(e.a);
+        if (e.op === '~') return a.map((n) => newGate('not', [n]));
+        if (e.op === '-') {
+          // 2 の補数で符号反転。幅は変えない (Verilog の単項 - も同じ)
+          const inv = a.map((n) => newGate('not', [n]));
+          return addBits(inv, Array(a.length).fill(CONST0), CONST1);
+        }
+        throw new CompileError(`未対応の単項演算子 '${e.op}'`, e.line);
+      }
       case 'bin': {
         const a = evalExpr(e.a);
         const b = evalExpr(e.b);
+        if (e.op === '+' || e.op === '-') return addSub(a, b, e.op);
         const w = Math.max(a.length, b.length);
         const aa = resize(a, w);
         const bb = resize(b, w);
