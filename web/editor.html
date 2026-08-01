@@ -1,0 +1,1100 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>verilog-wasm — 回路エディタ</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel2: #1e222b;
+    --line: #2b303b;
+    --fg: #dfe3ea;
+    --dim: #8b93a3;
+    --blue: #5aa2ff;
+    --green: #4ec98a;
+    --amber: #e3b341;
+    --red: #f0776c;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.5 system-ui, "Segoe UI", "Yu Gothic UI", sans-serif;
+    /* header / ツールバー 2 段 / 回路 / 区切り / 波形 / メッセージ */
+    display: grid; grid-template-rows: auto auto auto 1fr 7px 150px auto; overflow: hidden;
+  }
+
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  header .sub { color: var(--dim); font-size: 11px; }
+  header .stats { margin-left: auto; color: var(--dim); font-family: var(--mono); font-size: 11px; }
+  header a { color: var(--blue); font-size: 11px; text-decoration: none; }
+  header a:hover { text-decoration: underline; }
+
+  .bar {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 7px 12px; border-bottom: 1px solid var(--line); background: var(--panel2);
+  }
+  .bar .label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .bar .sep { width: 1px; height: 20px; background: var(--line); margin: 0 4px; }
+
+  select, button {
+    background: #232833; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 5px; padding: 4px 9px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: var(--blue); }
+  button.part { font-family: var(--mono); font-size: 11.5px; }
+  button.primary { background: #1d3a63; border-color: #2f5d9e; }
+  button:disabled { color: #59606d; background: #1b1f27; border-color: var(--line); cursor: default; }
+  button:disabled:hover { border-color: var(--line); }
+  .bar .cyc { color: var(--dim); font-family: var(--mono); font-size: 11px; min-width: 62px; }
+  .bar input[type=text] { width: 132px; background: #232833; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 5px; padding: 4px 8px; font: inherit; }
+
+  main { display: grid; grid-template-columns: 1fr 7px minmax(240px, 30%); min-height: 0; }
+  #canvasWrap { position: relative; min-width: 0; min-height: 0; overflow: hidden; background:
+    radial-gradient(circle at 1px 1px, #232833 1px, transparent 0) 0 0 / 20px 20px, #0c0e12; }
+  #svg { width: 100%; height: 100%; display: block; touch-action: none; user-select: none; }
+  #svg.panning { cursor: grabbing; }
+
+  /* ペインの区切り。つまんでドラッグするとサイズが変わる */
+  .split { background: var(--line); }
+  .split:hover, .split.active { background: var(--blue); }
+  .split.v { cursor: col-resize; }
+  .split.h { cursor: row-resize; }
+
+  aside { display: grid; grid-template-rows: auto 1fr 7px auto 1fr; min-height: 0; min-width: 0; }
+  aside .head { padding: 5px 12px; background: var(--panel2); border-bottom: 1px solid var(--line);
+    color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  aside .scroll { overflow: auto; min-height: 0; background: #0c0e12; }
+  pre#verilog { margin: 0; padding: 10px 12px; font-family: var(--mono); font-size: 11.5px; color: #a9b3c4; }
+
+  table#truth { border-collapse: collapse; font-family: var(--mono); font-size: 11.5px; margin: 8px 12px; }
+  table#truth th, table#truth td { border: 1px solid var(--line); padding: 1px 7px; text-align: center; }
+  table#truth th { background: var(--panel2); color: var(--dim); font-weight: 500; }
+  table#truth td.one { color: var(--green); }
+  table#truth td.zero { color: #4b5262; }
+  table#truth .gap { border-top: 0; border-bottom: 0; background: var(--panel); }
+  table#truth tr.now td { background: #223044; }        /* 今の入力・メモリの行 */
+  table#truth tr.now td.gap { background: #223044; }
+
+  /* --- 波形パネル --- */
+  #wavePanel { display: grid; grid-template-rows: auto 1fr; min-height: 0; background: #0c0e12; }
+  .bar.wavebar { padding: 4px 12px; border-bottom: 1px solid var(--line); }
+  .bar.wavebar input[type=number] {
+    width: 58px; font-family: var(--mono); background: #232833; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px; font-size: 12px;
+  }
+  .bar .chk { color: var(--dim); font-size: 11px; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  #waveScroll { overflow: auto; min-height: 0; }
+  #waveRow { display: flex; align-items: flex-start; width: max-content; }
+  /* 名前の列は横スクロールしても左に残す */
+  #waveNames { position: sticky; left: 0; z-index: 1; background: var(--panel); flex: none;
+    border-right: 1px solid var(--line); }
+  #waveSvg { flex: none; }
+  #waveNames text { font-family: var(--mono); font-size: 11px; fill: var(--dim); dominant-baseline: central; }
+  #waveNames text.reg { fill: var(--blue); }
+  #waveNames text.out { fill: var(--amber); }
+  #waveSvg .lane { stroke: #262b36; stroke-width: 1; }
+  #waveSvg .cyc { font-family: var(--mono); font-size: 9.5px; fill: #6b7382; text-anchor: middle; }
+  #waveSvg .edge { stroke: #232833; stroke-width: 1; }
+  #waveSvg path.sig { fill: none; stroke: var(--green); stroke-width: 1.8; stroke-linejoin: round; }
+  #waveSvg path.sig.unknown { stroke: #4b5262; stroke-dasharray: 3 3; }
+  #waveSvg .note { font-family: var(--mono); font-size: 11px; fill: var(--dim); }
+
+  #msg { padding: 8px 12px; border-top: 1px solid var(--line); font-family: var(--mono);
+    font-size: 11.5px; min-height: 34px; white-space: pre-wrap; }
+  #msg.err { color: var(--red); }
+  #msg.warn { color: var(--amber); }
+  #msg.ok { color: var(--green); }
+
+  /* --- 回路図 --- */
+  .node rect.body { fill: #232833; stroke: var(--line); stroke-width: 1.5; }
+  .node.sel rect.body { stroke: var(--blue); stroke-width: 2; }
+  .node text { font-family: var(--mono); font-size: 12px; fill: var(--fg); text-anchor: middle;
+    dominant-baseline: central; pointer-events: none; }
+  .node text.name { font-size: 11px; fill: var(--dim); }
+  .node text.val { font-size: 11px; fill: var(--dim); }
+  .node text.val.on { fill: #0c1a12; font-weight: 700; }
+  .node.reg rect.body { fill: #1f2836; stroke: #3d5f8f; }
+  .node.reg text.name { fill: var(--blue); }
+  .node.konst rect.body { fill: #2a2519; stroke: #6b5a2a; }
+  .node text.konst { font-size: 17px; font-weight: 700; fill: var(--amber); }
+
+  /* 端子の名前を変えるときに部品の上に重ねる入力欄 */
+  #renameBox {
+    position: absolute; text-align: center; font-family: var(--mono); font-size: 12px;
+    background: #0c0e12; color: var(--fg); border: 2px solid var(--blue); border-radius: 7px;
+    padding: 0 4px; outline: none;
+  }
+  .node.dead rect.body { stroke-dasharray: 4 3; }
+  .node.dead text { fill: #5b626f; }
+  .node { cursor: grab; }
+
+  .pin { fill: #3a4250; stroke: var(--line); stroke-width: 1; cursor: crosshair; }
+  .pin.one { fill: var(--green); }
+  .pin:hover { stroke: var(--blue); stroke-width: 2; }
+  .pin.armed { fill: var(--blue); stroke: var(--blue); }
+
+  /* 見えている線は当たり判定を持たない。クリックは下の太い .whit に任せる
+     (visiblePainted のままだと線の真上を狙ったクリックがこちらに吸われる) */
+  .wire { fill: none; stroke: #4b5262; stroke-width: 2; pointer-events: none; }
+  .wire.one { stroke: var(--green); }
+  .wire.dead { stroke: #363c48; stroke-dasharray: 4 3; }
+  .whit { fill: none; stroke: transparent; stroke-width: 12; cursor: pointer; }
+  .wgroup:hover .wire { stroke: var(--red); }
+  .rubber { fill: none; stroke: var(--blue); stroke-width: 2; stroke-dasharray: 5 4; pointer-events: none; }
+  .lamp { stroke: var(--line); stroke-width: 1.5; fill: #2a2f3a; }
+  .lamp.one { fill: var(--green); stroke: var(--green); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>verilog-wasm — 回路エディタ</h1>
+  <span class="sub">部品を置いて配線すると、Verilog に変換 → WASM にコンパイル → その場で評価します</span>
+  <a href="./index.html">テキスト版 ▸</a>
+  <span class="stats" id="stats"></span>
+</header>
+
+<div class="bar">
+  <span class="label">部品</span>
+  <span id="palette"></span>
+  <span class="sep"></span>
+  <button id="clear">全部消す</button>
+  <button id="del">削除 (Del)</button>
+  <button id="renameBtn">名前 (F2)</button>
+  <button id="fit">表示リセット</button>
+  <span class="sep"></span>
+  <span class="label">クロック</span>
+  <button id="clock" class="primary">▷ 1 クロック</button>
+  <button id="zero">メモリを 0 に</button>
+  <span class="cyc" id="cyc"></span>
+</div>
+
+<div class="bar">
+  <span class="label">回路</span>
+  <select id="presets" title="サンプルと保存した回路"></select>
+  <input type="text" id="cname" placeholder="回路の名前" maxlength="32">
+  <button id="save">保存</button>
+  <button id="delSave">保存を削除</button>
+  <button id="share">リンクをコピー</button>
+  <span class="label" style="text-transform:none;flex-basis:100%">入力・定数の箱をクリックで 0/1 反転・端子をクリック→クリックで配線・線をクリックで切断<br>
+    Ctrl + ホイールで拡大縮小・何もない所をドラッグでスクロール・境界をつまんで幅の変更<br>
+    Space でクロック・入出力とメモリは右クリック (または F2) で名前を変更</span>
+</div>
+
+<main id="main">
+  <div id="canvasWrap">
+    <svg id="svg" viewBox="0 0 900 480" preserveAspectRatio="xMidYMid meet">
+      <g id="gWires"></g>
+      <g id="gNodes"></g>
+      <path id="rubber" class="rubber"></path>
+    </svg>
+  </div>
+  <div class="split v" id="splitV" title="ドラッグで幅を変える"></div>
+  <aside id="aside">
+    <div class="head">生成された Verilog</div>
+    <div class="scroll"><pre id="verilog"></pre></div>
+    <div class="split h" id="splitH" title="ドラッグで高さを変える"></div>
+    <div class="head" id="tableHead">真理値表</div>
+    <div class="scroll"><table id="truth"></table></div>
+  </aside>
+</main>
+
+<div class="split h" id="splitW" title="ドラッグで高さを変える"></div>
+
+<section id="wavePanel">
+  <div class="bar wavebar">
+    <span class="label">波形</span>
+    <button id="clockN">▷</button>
+    <input type="number" id="nclk" value="8" min="1" max="256" title="まとめて打つクロック数">
+    <span class="label" style="text-transform:none">クロック</span>
+    <button id="waveClear">波形をクリア</button>
+    <label class="chk"><input type="checkbox" id="waveGates"> 内部の配線も出す</label>
+    <span class="label" id="waveInfo" style="text-transform:none;margin-left:auto"></span>
+  </div>
+  <div id="waveScroll">
+    <div id="waveRow">
+      <svg id="waveNames"></svg>
+      <svg id="waveSvg"></svg>
+    </div>
+  </div>
+</section>
+
+<div id="msg"></div>
+
+<script type="module">
+import { compile, CompileError } from '../src/compile.js';
+import { WasmSimulator } from '../src/sim.js';
+import {
+  CLOCK, PARTS, SAMPLE_CIRCUITS,
+  checkName, decodeCircuit, encodeCircuit, expandCircuit, packCircuit, toVerilog,
+} from '../src/schematic.js';
+import { LANES } from '../src/signals.js';
+
+const W = 68, H = 44;              // 部品の箱のサイズ
+const CANVAS = { w: 900, h: 480 };
+const MAX_TABLE_BITS = 6;          // 2^6 = 64 = レーン数。入力 + メモリの合計ビット数
+
+const $ = (id) => document.getElementById(id);
+const svg = $('svg');
+const SVGNS = 'http://www.w3.org/2000/svg';
+
+// ------------------------------------------------------------------ 状態
+let graph = { nodes: [], wires: [] };
+let nextId = 1;
+let selected = null;               // 選択中のノード id
+let armed = null;                  // 配線の始点 {node, port}
+let drag = null;                   // {id, dx, dy, moved}
+let pan = null;                    // {sx, sy, x, y, k} 背景ドラッグでのスクロール
+let sim = null, compiled = null;
+let plan = null;                   // toVerilog の結果
+let values = new Map();            // ノード id → 0 | 1 | null(不明)
+let seq = 0;                       // 非同期コンパイルの世代番号
+let cycles = 0;                    // 打ったクロックの回数
+let frames = [];                  // 波形の列 [{label, v:{信号名: 0|1|null}}]
+
+// 表示範囲 (viewBox)。Ctrl + ホイールで拡大縮小、背景ドラッグでスクロールする
+const view = { x: 0, y: 0, w: CANVAS.w, h: CANVAS.h };
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// ------------------------------------------------- 回路の読み込みと保存
+// サンプルの定義は src/schematic.js 側にある (テストからも使うため)。
+// 保存した回路もサンプルと同じ圧縮形式なので、読み込み経路は 1 本で足りる。
+const STORE_KEY = 'verilog-wasm/saved';    // 名前 → 圧縮形式
+const WORK_KEY = 'verilog-wasm/work';      // 編集中の回路 (自動保存)
+
+function readSaved() {
+  try {
+    const o = JSON.parse(localStorage.getItem(STORE_KEY) ?? '{}');
+    return o && typeof o === 'object' ? o : {};
+  } catch { return {}; }               // 壊れていたら無かったことにする
+}
+
+function writeSaved(all) {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(all)); return true; }
+  catch { return false; }              // localStorage が使えない / 容量オーバー
+}
+
+/** 編集中の回路を黙って残す。次に開いたとき続きから始められる */
+function autoSave() {
+  try { localStorage.setItem(WORK_KEY, JSON.stringify(packCircuit(graph))); } catch { /* 諦める */ }
+}
+
+function loadGraph(compact, listValue = '', name = '') {
+  graph = expandCircuit(compact);
+  nextId = Math.max(0, ...graph.nodes.map((n) => n.id)) + 1;
+  selected = armed = null;
+  frames = [];
+  $('presets').value = listValue;
+  $('cname').value = name;
+  resetView();
+  return rebuild();          // 呼び出し側が読み込み完了を待てるように
+}
+
+/** サンプルと保存した回路を 1 つのリストにまとめる */
+function refreshList(select = '') {
+  const sel = $('presets');
+  sel.textContent = '';
+  sel.appendChild(new Option('— 回路を選ぶ —', ''));
+
+  const samples = document.createElement('optgroup');
+  samples.label = 'サンプル';
+  for (const name of Object.keys(SAMPLE_CIRCUITS)) samples.appendChild(new Option(name, `s:${name}`));
+  sel.appendChild(samples);
+
+  const names = Object.keys(readSaved()).sort();
+  if (names.length) {
+    const mine = document.createElement('optgroup');
+    mine.label = '保存した回路';
+    for (const name of names) mine.appendChild(new Option(name, `u:${name}`));
+    sel.appendChild(mine);
+  }
+  sel.value = select;
+}
+
+function loadFromList(value) {
+  if (!value) return Promise.resolve();
+  const name = value.slice(2);
+  try {
+    return value.startsWith('s:')
+      ? loadGraph(SAMPLE_CIRCUITS[name], value, '')
+      : loadGraph(readSaved()[name], value, name);
+  } catch (e) {
+    setMsg(`読み込めませんでした: ${e.message}`, 'err');
+    return Promise.resolve();
+  }
+}
+
+// ------------------------------------------------------------ ジオメトリ
+const spec = (n) => PARTS[n.type];
+
+/** 入力端子の座標 (ノードローカル) */
+function inPin(node, port) {
+  const k = spec(node).ins;
+  const ys = k === 1 ? [H / 2] : [H * 0.3, H * 0.7];
+  return { x: 0, y: ys[port] };
+}
+const outPin = () => ({ x: W, y: H / 2 });
+
+function pinPos(nodeId, port, isInput) {
+  const n = byId(nodeId);
+  const p = isInput ? inPin(n, port) : outPin();
+  return { x: n.x + p.x, y: n.y + p.y };
+}
+
+const byId = (id) => graph.nodes.find((n) => n.id === id);
+const driverOf = (nodeId, port) =>
+  graph.wires.find((w) => w.to.node === nodeId && w.to.port === port);
+
+// ------------------------------------------------------------ 編集操作
+function addNode(type) {
+  // 入力は左・ゲートは中央・出力は右に、同種の数だけ下にずらして置く
+  const same = graph.nodes.filter((n) => n.type === type).length;
+  const col = type === 'in' ? 40 : type === 'out' ? CANVAS.w - W - 40 : 300;
+  const node = {
+    id: nextId++, type,
+    x: col + (type === 'in' || type === 'out' ? 0 : (same % 2) * (W + 40)),
+    y: 40 + (same * 70) % (CANVAS.h - H - 60),
+    value: 0,
+  };
+  graph.nodes.push(node);
+  selected = node.id;
+  rebuild();
+}
+
+function removeNode(id) {
+  graph.nodes = graph.nodes.filter((n) => n.id !== id);
+  graph.wires = graph.wires.filter((w) => w.from.node !== id && w.to.node !== id);
+  if (selected === id) selected = null;
+  if (armed && armed.node === id) armed = null;
+  rebuild();
+}
+
+function connect(from, to) {
+  if (from.node === to.node) return;                       // 自分自身へは繋がない
+  graph.wires = graph.wires.filter((w) => !(w.to.node === to.node && w.to.port === to.port));
+  graph.wires.push({ from, to });                          // 入力端子は 1 本だけ (上書き)
+  rebuild();
+}
+
+function disconnect(wire) {
+  graph.wires = graph.wires.filter((w) => w !== wire);
+  rebuild();
+}
+
+// ------------------------------------------------- コンパイル & 評価
+async function rebuild() {
+  plan = toVerilog(graph);
+  $('verilog').textContent = plan.source ?? '// 部品がありません';
+  const my = ++seq;
+
+  if (!plan.source) {
+    sim = compiled = null;
+    values = new Map();
+    cycles = 0;
+    frames = [];
+    setMsg('部品を置いて配線してください。', '');
+    render(); renderTable(); updateClockUI();
+    return;
+  }
+
+  try {
+    const c = compile(plan.source);
+    const s = await WasmSimulator.create(c);
+    if (my !== seq) return;                                 // 追い越されたら破棄
+    compiled = c; sim = s;
+    cycles = 0;                                             // 回路を組み替えたら状態は作り直し
+    frames = [];
+    const st = c.stats;
+    $('stats').textContent = `nets=${st.nets} gates=${st.gates} regs=${st.regs} `
+      + `state=${st.stateBytes}B wasm=${st.wasmBytes}B`;
+    const dead = plan.incomplete.size;
+    setMsg(`コンパイル成功 — ${st.gates} ゲート`
+      + (st.regs ? ` / ${st.regs} ビットのメモリ` : '')
+      + `を ${st.wasmBytes} バイトの WASM に変換`
+      + (dead ? ` / 未配線の部品が ${dead} 個あるので回路から除外しました` : ''),
+      dead ? 'warn' : 'ok');
+  } catch (e) {
+    if (my !== seq) return;
+    sim = compiled = null;
+    cycles = 0;
+    frames = [];
+    $('stats').textContent = '';
+    setMsg(e instanceof CompileError ? e.message : `${e.name}: ${e.message}`, 'err');
+  }
+  evaluate('append');
+  autoSave();          // 回路が変わるたびに編集中の内容を残す
+  updateClockUI();
+}
+
+function updateClockUI() {
+  const n = compiled?.stats.regs ?? 0;
+  $('clock').disabled = $('zero').disabled = $('clockN').disabled = $('nclk').disabled = n === 0;
+  $('clock').title = n === 0 ? 'メモリ (DFF) を置くと使えます' : 'クロックを 1 回打つ';
+  $('cyc').textContent = n === 0 ? '' : `cyc=${cycles}`;
+}
+
+/** 入力を書き込んで eval し、全ノードの値を取り直す (描画はしない) */
+function refreshValues() {
+  values = new Map();
+  if (sim) {
+    for (const i of plan.inputs) sim.setInput(i.name, byId(i.node).value ? 1 : 0);
+    sim.eval();
+    const known = new Set(compiled.layout.signalTable.map((s) => s.name));
+    for (const n of graph.nodes) {
+      const name = plan.signalOf.get(n.id);
+      values.set(n.id, known.has(name) && !plan.incomplete.has(n.id) ? Number(sim.get(name)) : null);
+    }
+  } else {
+    // コンパイルできていない間も入力の 0/1 だけは見せる
+    for (const n of graph.nodes) values.set(n.id, n.type === 'in' ? (n.value ? 1 : 0) : null);
+  }
+}
+
+/**
+ * 値を取り直して全部描き直す。
+ * @param {'append'|'replace'|null} mode 波形に列を足すか、今の列を書き換えるか、触らないか
+ */
+function evaluate(mode = null) {
+  refreshValues();
+  if (mode) sample(mode === 'append');
+  render();
+  renderTable();
+  renderWave();
+}
+
+/** 入力をいじったとき: メモリがあれば「同じサイクル内の変化」なので今の列を書き換える */
+const inputChanged = () => evaluate(hasRegs() ? 'replace' : 'append');
+const hasRegs = () => (compiled?.stats.regs ?? 0) > 0;
+
+/** クロックを n 回打つ (eval → commit → eval) */
+function clockOnce(n = 1) {
+  if (!sim || !hasRegs()) return;
+  for (let i = 0; i < n; i++) {
+    sim.step();
+    cycles++;
+    refreshValues();
+    sample(true);
+  }
+  render();
+  renderTable();
+  renderWave();
+  updateClockUI();
+}
+
+function setMsg(text, cls) {
+  $('msg').textContent = text;
+  $('msg').className = cls;
+}
+
+// ---------------------------------------------------------------- 描画
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  parent?.appendChild(e);
+  return e;
+}
+
+/** 真理値表用。SVG 名前空間で tr/td を作ると表として描画されないので分けてある */
+function hel(tag, parent, className) {
+  const e = document.createElement(tag);
+  if (className) e.className = className;
+  parent?.appendChild(e);
+  return e;
+}
+
+function wirePath(a, b) {
+  if (b.x - a.x < 12) {
+    // 右から左へ戻る配線 (フィードバック)。素直に引くと部品の裏に隠れるので上に膨らませる
+    const d = Math.max(70, (a.x - b.x) * 0.35);
+    return `M ${a.x} ${a.y} C ${a.x + d} ${a.y - d}, ${b.x - d} ${b.y - d}, ${b.x} ${b.y}`;
+  }
+  const dx = Math.max(30, (b.x - a.x) * 0.5);
+  return `M ${a.x} ${a.y} C ${a.x + dx} ${a.y}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`;
+}
+
+function render() {
+  const gw = $('gWires'), gn = $('gNodes');
+  gw.textContent = ''; gn.textContent = '';
+
+  for (const w of graph.wires) {
+    if (!byId(w.from.node) || !byId(w.to.node)) continue;
+    const d = wirePath(pinPos(w.from.node, 0, false), pinPos(w.to.node, w.to.port, true));
+    const g = el('g', { class: 'wgroup' }, gw);
+    const hit = el('path', { class: 'whit', d }, g);           // 太い透明な当たり判定
+    const v = values.get(w.from.node);
+    el('path', { class: `wire ${v === null ? 'dead' : v ? 'one' : ''}`, d }, g);
+    hit.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      if (e.button === 0) disconnect(w);
+    });
+    el('title', {}, hit).textContent = 'クリックで切断';
+  }
+
+  for (const n of graph.nodes) {
+    const v = values.get(n.id);
+    const cls = ['node'];
+    if (selected === n.id) cls.push('sel');
+    if (v === null) cls.push('dead');
+    if (spec(n).reg) cls.push('reg');
+    if (spec(n).konst) cls.push('konst');
+    const g = el('g',
+      { class: cls.join(' '), transform: `translate(${n.x} ${n.y})`, 'data-id': n.id }, gn);
+
+    el('rect', { class: 'body', x: 0, y: 0, width: W, height: H, rx: 7 }, g);
+
+    if (n.type === 'in') {
+      el('text', { x: 22, y: H / 2 }, g).textContent = plan?.signalOf.get(n.id) ?? '?';
+      el('circle', { class: `lamp ${n.value ? 'one' : ''}`, cx: W - 20, cy: H / 2, r: 11 }, g);
+      el('text', { class: `val ${n.value ? 'on' : ''}`, x: W - 20, y: H / 2 }, g)
+        .textContent = n.value ? '1' : '0';
+    } else if (n.type === 'const') {
+      // 定数はポートではないので名前は出さず、値だけを大きく出す
+      el('text', { class: 'konst', x: W / 2, y: H / 2 }, g).textContent = n.value ? '1' : '0';
+    } else if (n.type === 'out') {
+      el('text', { class: 'name', x: 22, y: H / 2 }, g).textContent = plan?.signalOf.get(n.id) ?? 'y';
+      el('circle', { class: `lamp ${v === 1 ? 'one' : ''}`, cx: W - 20, cy: H / 2, r: 11 }, g);
+      el('text', { class: `val ${v === 1 ? 'on' : ''}`, x: W - 20, y: H / 2 }, g)
+        .textContent = v === null ? '' : v;
+    } else if (n.type === 'dff') {
+      // メモリは中身が見えないと意味がないので、Q の値をランプで出す
+      el('text', { class: 'name', x: 20, y: H / 2 }, g).textContent = n.name || 'DFF';
+      el('circle', { class: `lamp ${v === 1 ? 'one' : ''}`, cx: W - 18, cy: H / 2, r: 10 }, g);
+      el('text', { class: `val ${v === 1 ? 'on' : ''}`, x: W - 18, y: H / 2 }, g)
+        .textContent = v === null ? '' : v;
+    } else {
+      el('text', { x: W / 2, y: H / 2 }, g).textContent = spec(n).glyph;
+    }
+
+    for (let p = 0; p < spec(n).ins; p++) {
+      const q = inPin(n, p);
+      const dv = driverOf(n.id, p);
+      const pv = dv ? values.get(dv.from.node) : null;
+      const c = el('circle', { class: `pin ${pv === 1 ? 'one' : ''}`, cx: q.x, cy: q.y, r: 6 }, g);
+      c.addEventListener('pointerdown', (e) => {
+        e.stopPropagation();
+        if (e.button !== 0) return;
+        if (armed) { connect(armed, { node: n.id, port: p }); armed = null; }
+        else if (dv) disconnect(dv);                          // 始点がなければ切断
+      });
+    }
+    if (spec(n).outs) {
+      const q = outPin();
+      const isArmed = armed && armed.node === n.id;
+      const c = el('circle',
+        { class: `pin ${isArmed ? 'armed' : v === 1 ? 'one' : ''}`, cx: q.x, cy: q.y, r: 6 }, g);
+      c.addEventListener('pointerdown', (e) => {
+        e.stopPropagation();
+        if (e.button !== 0) return;
+        armed = isArmed ? null : { node: n.id, port: 0 };
+        render();
+      });
+    }
+
+    g.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      if (e.button !== 0) { selected = n.id; render(); return; }   // 右クリックは掴まない
+      selected = n.id;
+      armed = null;
+      const pt = toUser(e);
+      drag = { id: n.id, dx: pt.x - n.x, dy: pt.y - n.y, moved: false };
+      svg.setPointerCapture(e.pointerId);
+      render();
+    });
+    g.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      startRename(n.id);
+    });
+  }
+  $('rubber').setAttribute('d', '');
+}
+
+// ---------------------------------------------------------------- 波形
+// 1 列 = クロック 1 回。組合せ回路にはクロックがないので、入力を変えるたびに 1 列進める。
+// メモリのある回路では入力の変化は「同じサイクル内の出来事」なので今の列を書き換える。
+const WAVE = { colW: 26, rowH: 24, top: 16, nameW: 116, max: 256 };
+
+function sample(append) {
+  const v = {};
+  for (const n of graph.nodes) {
+    const name = plan?.signalOf.get(n.id);
+    if (name) v[name] = values.get(n.id) ?? null;
+  }
+  const label = hasRegs() ? cycles : frames.length;
+  if (append || frames.length === 0) frames.push({ label, v });
+  else frames[frames.length - 1] = { label: frames[frames.length - 1].label, v };
+  if (frames.length > WAVE.max) frames.shift();
+}
+
+/** 波形に出す信号。既定は入力・メモリ・出力だけ (ゲートは数が多いので任意) */
+function waveRows() {
+  if (!plan) return [];
+  const rows = [
+    ...plan.inputs.map((i) => ({ ...i, kind: 'in' })),
+    ...plan.regs,
+    ...plan.outputs.filter((o) => o.kind === 'out'),
+  ];
+  if ($('waveGates').checked) rows.push(...plan.outputs.filter((o) => o.kind === 'gate'));
+  return rows;
+}
+
+function renderWave() {
+  const names = $('waveNames'), svg2 = $('waveSvg');
+  names.textContent = svg2.textContent = '';
+  const rows = waveRows();
+  const cols = frames.length;
+  $('waveInfo').textContent = cols
+    ? `${cols} 列 / ${rows.length} 信号${hasRegs() ? '（1 列 = 1 クロック）' : '（1 列 = 入力を変えた回数）'}`
+    : '';
+
+  const h = WAVE.top + rows.length * WAVE.rowH + 6;
+  names.setAttribute('width', WAVE.nameW);
+  names.setAttribute('height', h);
+  svg2.setAttribute('width', Math.max(cols * WAVE.colW + 8, 40));
+  svg2.setAttribute('height', h);
+
+  if (rows.length === 0 || cols === 0) {
+    el('text', { class: 'note', x: 8, y: 20 }, svg2).textContent =
+      sim ? 'クロックを打つか入力を変えると波形が出ます' : '';
+    return;
+  }
+
+  rows.forEach((r, i) => {
+    const y = WAVE.top + i * WAVE.rowH;
+    const t = el('text', { class: r.kind === 'reg' ? 'reg' : r.kind, x: 8, y: y + WAVE.rowH / 2 }, names);
+    t.textContent = r.name;
+    el('line', { class: 'lane', x1: 0, y1: y, x2: cols * WAVE.colW, y2: y }, svg2);
+  });
+
+  // 列の境界とサイクル番号
+  for (let c = 0; c < cols; c++) {
+    const x = c * WAVE.colW;
+    el('line', { class: 'edge', x1: x, y1: WAVE.top, x2: x, y2: h - 6 }, svg2);
+    if (cols <= 40 || c % 4 === 0) {
+      el('text', { class: 'cyc', x: x + WAVE.colW / 2, y: 9 }, svg2).textContent = frames[c].label;
+    }
+  }
+
+  // 各信号の階段波形。値が不明な区間は破線で中央に引く
+  rows.forEach((r, i) => {
+    const y = WAVE.top + i * WAVE.rowH;
+    const hi = y + 5, lo = y + WAVE.rowH - 7, mid = (hi + lo) / 2;
+    const level = (c) => { const v = frames[c].v[r.name]; return v === null || v === undefined ? mid : v ? hi : lo; };
+    const unknown = frames.some((f) => f.v[r.name] === null || f.v[r.name] === undefined);
+    let d = `M 0 ${level(0)}`;
+    for (let c = 0; c < cols; c++) {
+      d += ` L ${c * WAVE.colW} ${level(c)} L ${(c + 1) * WAVE.colW} ${level(c)}`;
+    }
+    // data-bits は目で見る用ではなく、テストと動作確認から値を読むためのもの
+    const bits = frames.map((f) => (f.v[r.name] ?? 'x')).join('');
+    el('path', {
+      class: `sig ${unknown ? 'unknown' : ''}`, d, 'data-sig': r.name, 'data-bits': bits,
+    }, svg2);
+  });
+
+  $('waveScroll').scrollLeft = $('waveScroll').scrollWidth;
+}
+
+// ------------------------------------------------ 真理値表 / 状態遷移表
+// どちらも 64 レーンのビットスライスで作る。全パターンをレーンに並べて
+// eval() を 1 回 (メモリがあれば step 相当を 1 回) 呼ぶだけで表が埋まる。
+//
+// メモリがある回路では「入力 + 現在の Q」を並べて、出力と次の Q を読む。
+// 出力は commit の前・次の Q は commit の後に読む必要があるので順番が要る。
+function renderTable() {
+  const t = $('truth');
+  t.textContent = '';
+  const outs = plan?.outputs.filter((o) => o.kind === 'out') ?? [];
+  const regs = plan?.regs ?? [];
+  $('tableHead').textContent = regs.length
+    ? '状態遷移表（64 レーン同時評価で 1 クロックから作成）'
+    : '真理値表（64 レーン同時評価で 1 回の eval から作成）';
+
+  if (!sim || (outs.length === 0 && regs.length === 0)) {
+    setNote(t, sim ? '出力部品かメモリを置くと表が出ます' : '');
+    return;
+  }
+  const dims = [...plan.inputs, ...regs];      // 表の行を決める 1 ビットの軸
+  if (dims.length > MAX_TABLE_BITS) {
+    setNote(t, `入力とメモリで ${dims.length} ビット `
+      + `(64 レーンに収まるのは ${MAX_TABLE_BITS} ビットまで)`);
+    return;
+  }
+
+  const saved = regs.map((r) => Number(sim.get(r.name)));
+  const rows = 1 << dims.length;
+  for (let lane = 0; lane < LANES; lane++) {
+    const pat = lane < rows ? lane : 0;
+    dims.forEach((d, b) => sim.setInputLane(d.name, lane, (pat >> b) & 1));
+  }
+  sim.eval();
+  const outCols = outs.map((o) => sim.getLanes(o.name));      // 現在の状態での出力
+  let nextCols = [];
+  if (regs.length) {
+    sim.commit();
+    sim.eval();
+    nextCols = regs.map((r) => sim.getLanes(r.name));         // クロック後の Q
+  }
+
+  const head = hel('tr', t);
+  for (const d of dims) hel('th', head).textContent = d.name;
+  hel('th', head, 'gap');
+  for (const r of regs) hel('th', head).textContent = `${r.name}'`;
+  for (const o of outs) hel('th', head).textContent = o.name;
+
+  // 今の入力とメモリの値が何行目かを求めて、その行に印を付ける
+  let now = 0;
+  dims.forEach((d, b) => {
+    const n = byId(d.node);
+    const v = n?.type === 'in' ? (n.value ? 1 : 0) : saved[regs.indexOf(d)];
+    if (v) now |= 1 << b;
+  });
+
+  let nowRow = null;
+  for (let r = 0; r < rows; r++) {
+    const tr = hel('tr', t, r === now ? 'now' : '');
+    if (r === now) nowRow = tr;
+    dims.forEach((_, b) => {
+      const v = (r >> b) & 1;
+      hel('td', tr, v ? 'one' : 'zero').textContent = v;
+    });
+    hel('td', tr, 'gap');
+    for (const lanes of [...nextCols, ...outCols]) {
+      const v = Number(lanes[r]);
+      hel('td', tr, v ? 'one' : 'zero').textContent = v;
+    }
+  }
+  nowRow?.scrollIntoView({ block: 'nearest' });   // 64 行あると印が画面外に行くので
+
+  restoreState(saved);
+}
+
+/** 表を作るのにレーンを汚したので、GUI の入力値とメモリの中身を書き戻す */
+function restoreState(savedRegs) {
+  (plan.regs ?? []).forEach((r, i) => sim.setInput(r.name, savedRegs[i]));
+  for (const i of plan.inputs) sim.setInput(i.name, byId(i.node).value ? 1 : 0);
+  sim.eval();
+}
+
+function setNote(table, text) {
+  if (!text) return;
+  const td = hel('td', hel('tr', table));
+  td.textContent = text;
+  td.style.color = 'var(--dim)';
+  td.style.border = '0';
+}
+
+// ------------------------------------------------------ 端子の名前を変える
+// 部品の上に input を重ねて出す。Enter で確定・Escape で取り消し・空にすると自動名に戻る。
+function startRename(id) {
+  const n = byId(id);
+  if (!n) return;
+  if (!spec(n).named) {
+    setMsg(`${spec(n).label} には名前を付けられません (入力・出力・メモリだけ)`, 'warn');
+    return;
+  }
+  document.getElementById('renameBox')?.remove();
+
+  const g = $('gNodes').querySelector(`[data-id="${id}"]`);
+  const r = g.getBoundingClientRect();
+  const wrap = $('canvasWrap').getBoundingClientRect();
+  const inp = document.createElement('input');
+  inp.id = 'renameBox';
+  inp.type = 'text';
+  inp.spellcheck = false;
+  inp.value = n.name ?? plan?.signalOf.get(id) ?? '';
+  Object.assign(inp.style, {
+    left: `${r.x - wrap.x}px`, top: `${r.y - wrap.y}px`,
+    width: `${Math.max(r.width, 84)}px`, height: `${r.height}px`,
+  });
+  $('canvasWrap').appendChild(inp);
+  inp.focus();
+  inp.select();
+
+  let done = false;
+  const close = () => { done = true; inp.remove(); };
+  const commit = () => {
+    if (done) return;
+    const v = inp.value.trim();
+    close();
+    if (v === (n.name ?? '')) return;
+    if (v === '') { delete n.name; rebuild(); return; }   // 空 → 自動名に戻す
+    const taken = new Set([CLOCK]);
+    for (const [nodeId, name] of plan.signalOf) if (nodeId !== id) taken.add(name);
+    const err = checkName(v, taken);
+    if (err) { setMsg(err, 'err'); return; }
+    n.name = v;
+    rebuild();
+  };
+  inp.addEventListener('keydown', (e) => {
+    e.stopPropagation();                                 // Space / Del を回路側に流さない
+    if (e.key === 'Enter') commit();
+    if (e.key === 'Escape') close();
+  });
+  inp.addEventListener('blur', commit);
+}
+
+// -------------------------------------------------- 表示範囲 (拡大縮小 / スクロール)
+function applyView() {
+  svg.setAttribute('viewBox', `${view.x} ${view.y} ${view.w} ${view.h}`);
+}
+
+function resetView() {
+  Object.assign(view, { x: 0, y: 0, w: CANVAS.w, h: CANVAS.h });
+  applyView();
+}
+
+$('canvasWrap').addEventListener('wheel', (e) => {
+  if (!e.ctrlKey) return;                  // Ctrl なしのホイールはブラウザに任せる
+  e.preventDefault();                      // Ctrl + ホイールの既定動作 (ブラウザのズーム) を止める
+  const p = toUser(e);                     // カーソルの下にある点を固定して拡大縮小する
+  const dy = e.deltaY * (e.deltaMode === 1 ? 33 : 1);
+  const w = clamp(view.w * Math.exp(dy * 0.0015), CANVAS.w / 8, CANVAS.w * 4);
+  const k = w / view.w;
+  view.x = p.x - (p.x - view.x) * k;
+  view.y = p.y - (p.y - view.y) * k;
+  view.w = w;
+  view.h *= k;
+  applyView();
+}, { passive: false });
+
+// ------------------------------------------------------------ 入力操作
+function toUser(e) {
+  const m = svg.getScreenCTM().inverse();
+  const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(m);
+  return { x: p.x, y: p.y };
+}
+
+// 背景を押したら選択解除 + そのままドラッグでスクロール
+svg.addEventListener('pointerdown', (e) => {
+  selected = null;
+  armed = null;
+  const ctm = svg.getScreenCTM();
+  pan = { sx: e.clientX, sy: e.clientY, x: view.x, y: view.y, k: 1 / ctm.a };
+  svg.setPointerCapture(e.pointerId);
+  render();
+});
+
+svg.addEventListener('pointermove', (e) => {
+  const pt = toUser(e);
+  if (drag) {
+    const n = byId(drag.id);
+    if (!n) return;
+    n.x = clamp(pt.x - drag.dx, 0, CANVAS.w - W);
+    n.y = clamp(pt.y - drag.dy, 0, CANVAS.h - H);
+    drag.moved = true;
+    render();
+  } else if (pan) {
+    view.x = pan.x - (e.clientX - pan.sx) * pan.k;
+    view.y = pan.y - (e.clientY - pan.sy) * pan.k;
+    svg.classList.add('panning');
+    applyView();
+  } else if (armed) {
+    $('rubber').setAttribute('d', wirePath(pinPos(armed.node, 0, false), pt));
+  }
+});
+
+svg.addEventListener('pointerup', (e) => {
+  if (drag) {
+    const n = byId(drag.id);
+    // 動かさずに離した = クリック → 入力なら 0/1 反転
+    if (drag.moved) autoSave();                    // 位置も保存に含める
+    if (!drag.moved && (n?.type === 'in' || n?.type === 'const')) {
+      n.value = n.value ? 0 : 1;
+      n.type === 'in' ? inputChanged() : rebuild();   // 定数はリテラルなので作り直す
+    }
+  }
+  svg.releasePointerCapture?.(e.pointerId);
+  svg.classList.remove('panning');
+  drag = pan = null;
+});
+
+// ------------------------------------------------------ ペインの区切り
+const main = $('main'), aside = $('aside');
+let asideW = null, verilogH = null;   // null = CSS の初期比率のまま
+let waveH = 150;                      // 波形パネルの高さ (px)
+
+function applyPanes() {
+  main.style.gridTemplateColumns = `1fr 7px ${asideW === null ? 'minmax(240px, 30%)' : `${asideW}px`}`;
+  aside.style.gridTemplateRows = `auto ${verilogH === null ? '1fr' : `${verilogH}px`} 7px auto 1fr`;
+  document.body.style.gridTemplateRows = `auto auto auto 1fr 7px ${waveH}px auto`;
+}
+
+/** 区切りを押している間だけ onMove を呼ぶ */
+function grabSplit(elm, onMove) {
+  elm.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    elm.setPointerCapture(e.pointerId);
+    elm.classList.add('active');
+    const move = (ev) => { onMove(ev); applyPanes(); };
+    const up = (ev) => {
+      elm.releasePointerCapture(ev.pointerId);
+      elm.classList.remove('active');
+      elm.removeEventListener('pointermove', move);
+      elm.removeEventListener('pointerup', up);
+    };
+    elm.addEventListener('pointermove', move);
+    elm.addEventListener('pointerup', up);
+  });
+}
+
+grabSplit($('splitV'), (e) => {
+  asideW = clamp(window.innerWidth - e.clientX - 4, 160, window.innerWidth - 280);
+});
+
+grabSplit($('splitW'), (e) => {
+  waveH = clamp(window.innerHeight - e.clientY - 40, 40, Math.max(40, window.innerHeight - 300));
+});
+
+grabSplit($('splitH'), (e) => {
+  const heads = aside.querySelectorAll('.head');
+  const top = heads[0].getBoundingClientRect().bottom;
+  const room = aside.clientHeight - heads[0].offsetHeight - heads[1].offsetHeight - 7;
+  verilogH = clamp(e.clientY - top, 40, Math.max(40, room - 40));
+});
+
+window.addEventListener('resize', () => {
+  if (asideW !== null) asideW = clamp(asideW, 160, Math.max(160, window.innerWidth - 280));
+  waveH = clamp(waveH, 40, Math.max(40, window.innerHeight - 300));
+  applyPanes();
+});
+
+window.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;                   // 名前の入力中は何もしない
+  if (e.key === 'Escape') { armed = null; render(); }
+  if (e.key === ' ') { e.preventDefault(); clockOnce(); }     // スペースでクロック
+  if (e.key === 'F2' && selected !== null) { e.preventDefault(); startRename(selected); }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && selected !== null) {
+    e.preventDefault();
+    removeNode(selected);
+  }
+});
+
+// ------------------------------------------------------------ ツールバー
+for (const [type, p] of Object.entries(PARTS)) {
+  const b = document.createElement('button');
+  b.className = 'part';
+  b.textContent = p.btn ?? p.glyph;
+  b.title = `${p.label} を追加`;
+  b.onclick = () => addNode(type);
+  $('palette').appendChild(b);
+}
+
+$('presets').onchange = () => loadFromList($('presets').value);
+
+$('save').onclick = () => {
+  const name = $('cname').value.trim();
+  if (!name) { setMsg('保存する名前を入れてください', 'warn'); return; }
+  const all = readSaved();
+  const overwrite = name in all;
+  all[name] = packCircuit(graph);
+  if (!writeSaved(all)) {
+    setMsg('保存できませんでした (この環境では localStorage が使えないようです)', 'err');
+    return;
+  }
+  refreshList(`u:${name}`);
+  setMsg(`「${name}」を${overwrite ? '上書き' : '保存し'}ました `
+    + `(部品 ${graph.nodes.length} 個 / 配線 ${graph.wires.length} 本)`, 'ok');
+};
+
+$('cname').onkeydown = (e) => { if (e.key === 'Enter') $('save').click(); };
+
+$('delSave').onclick = () => {
+  const value = $('presets').value;
+  if (!value.startsWith('u:')) { setMsg('リストから保存した回路を選んでください', 'warn'); return; }
+  const name = value.slice(2);
+  const all = readSaved();
+  delete all[name];
+  writeSaved(all);
+  refreshList('');
+  setMsg(`「${name}」を削除しました (回路自体は開いたままです)`, 'ok');
+};
+
+$('share').onclick = async () => {
+  const code = encodeCircuit(graph);
+  const url = `${location.origin}${location.pathname}#c=${code}`;
+  window.history.replaceState(null, '', `#c=${code}`);   // アドレス欄からもコピーできるように
+  try {
+    await navigator.clipboard.writeText(url);
+    setMsg(`リンクをコピーしました (${url.length} 文字)`, 'ok');
+  } catch {
+    setMsg(`クリップボードが使えないので、アドレス欄からコピーしてください:\n${url}`, 'warn');
+  }
+};
+
+$('clear').onclick = () => {
+  graph = { nodes: [], wires: [] };
+  selected = armed = null;
+  frames = [];
+  $('stats').textContent = '';
+  $('presets').value = '';
+  rebuild();
+};
+$('del').onclick = () => { if (selected !== null) removeNode(selected); };
+$('fit').onclick = resetView;
+$('renameBtn').onclick = () => {
+  if (selected === null) setMsg('名前を変える部品を選んでください', 'warn');
+  else startRename(selected);
+};
+$('clock').onclick = () => clockOnce(1);
+$('clockN').onclick = () => clockOnce(clamp(Number($('nclk').value) || 1, 1, 256));
+$('waveClear').onclick = () => { frames = []; evaluate('append'); };
+$('waveGates').onchange = renderWave;
+$('zero').onclick = () => {
+  if (!sim) return;
+  sim.reset();                     // メモリを 0 に戻す (入力は evaluate が書き戻す)
+  cycles = 0;
+  frames = [];
+  evaluate('append');
+  updateClockUI();
+};
+applyPanes();
+refreshList();
+
+// 開くときに何を出すか。上から順に見て最初に見つかったものを使う。
+//   1. #c=... の共有リンク
+//   2. ?c=半加算器 のようなサンプル名の一部
+//   3. 前回の編集中の回路 (自動保存)
+//   4. 先頭のサンプル
+async function openInitial() {
+  const shared = new URLSearchParams(location.hash.slice(1)).get('c');
+  let failed = null;
+  if (shared) {
+    try {
+      await loadGraph(decodeCircuit(shared), '', '');
+      return;
+    } catch (e) {
+      // 理由は代わりの回路を読んだ後に出す (rebuild がメッセージを上書きするため)
+      failed = `共有リンクを読めませんでした: ${e.message}`;
+    }
+  }
+
+  const names = Object.keys(SAMPLE_CIRCUITS);
+  const wanted = new URLSearchParams(location.search).get('c');
+  const hit = wanted && names.find((n) => n.includes(wanted));
+
+  if (hit) {
+    await loadFromList(`s:${hit}`);
+  } else {
+    let work = null;
+    try { work = JSON.parse(localStorage.getItem(WORK_KEY) ?? 'null'); } catch { /* 壊れていた */ }
+    if (work?.nodes?.length) await loadGraph(work, '', '');
+    else await loadFromList(`s:${names[0]}`);
+  }
+  if (failed) setMsg(failed, 'err');
+}
+
+await openInitial();
+</script>
+</body>
+</html>

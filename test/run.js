@@ -10,6 +10,9 @@ import { dirname, join } from 'node:path';
 import { compile, CompileError } from '../src/compile.js';
 import { WasmSimulator } from '../src/sim.js';
 import { RefSimulator } from '../src/interp.js';
+import {
+  SAMPLE_CIRCUITS, checkName, decodeCircuit, encodeCircuit, expandCircuit, packCircuit, toVerilog,
+} from '../src/schematic.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const example = (n) => readFileSync(join(HERE, '..', 'examples', n), 'utf8');
@@ -20,6 +23,11 @@ const failures = [];
 function ok(cond, label, detail = '') {
   if (cond) passed++;
   else failures.push(`${label}${detail ? ` — ${detail}` : ''}`);
+}
+
+/** 文字列や個数の比較 (eq は BigInt に寄せるので分けてある) */
+function eqs(actual, expected, label) {
+  ok(actual === expected, label, actual === expected ? '' : `期待 ${expected} / 実際 ${actual}`);
 }
 
 function eq(actual, expected, label) {
@@ -434,6 +442,280 @@ async function testWat() {
   ok(/i64\.and/.test(compiled.wat), 'WAT: 論理演算がある');
 }
 
+// -------------------------------------- GUI 回路エディタ (グラフ → Verilog)
+async function testSchematic() {
+  // サンプル回路が全部コンパイルできて、期待どおりの真理値表になること
+  for (const [name, c] of Object.entries(SAMPLE_CIRCUITS)) {
+    const { source, inputs, outputs } = toVerilog(expandCircuit(c));
+    ok(source !== null, `回路グラフ ${name}: Verilog を生成`);
+
+    if (c.loop) {
+      let err = null;
+      try { compile(source); } catch (e) { err = e; }
+      ok(err instanceof CompileError && /組合せループ/.test(err.message),
+        `回路グラフ ${name}: 組合せループを検出`, err?.message ?? 'エラーが出なかった');
+      continue;
+    }
+
+    const { all } = await bothSims(source);
+
+    // メモリを含む回路: 入力を変えながらクロックを打って追いかける
+    if (c.seq) {
+      for (const sim of all) {
+        const kind = sim.constructor.name;
+        sim.reset();
+        c.seq.forEach((frame, k) => {
+          for (const [signal, v] of Object.entries(frame.set ?? {})) sim.setInput(signal, v);
+          sim.eval();
+          for (let i = 0; i < (frame.clock ?? 0); i++) sim.step();
+          for (const [signal, v] of Object.entries(frame.expect)) {
+            eq(sim.get(signal), v, `${kind} 回路グラフ ${name}: ${signal} (${k} 番目のフレーム)`);
+          }
+        });
+      }
+      continue;
+    }
+
+    for (const sim of all) {
+      for (let pat = 0; pat < (1 << inputs.length); pat++) {
+        inputs.forEach((i, b) => sim.setInput(i.name, (pat >> b) & 1));
+        sim.eval();
+        for (const [signal, table] of Object.entries(c.expect)) {
+          eq(sim.get(signal), table[pat],
+            `${sim.constructor.name} 回路グラフ ${name}: ${signal}(pat=${pat})`);
+        }
+      }
+    }
+    // 期待値を書いた出力が実際にポートとして出ていること
+    for (const signal of Object.keys(c.expect)) {
+      ok(outputs.some((o) => o.name === signal && o.kind === 'out'),
+        `回路グラフ ${name}: ${signal} が出力ポートにある`);
+    }
+  }
+
+  // メモリは output reg として宣言され、暗黙のクロックが生える
+  const mem = toVerilog(expandCircuit(SAMPLE_CIRCUITS['クロックで反転する 1 ビットメモリ']));
+  ok(/^\s+input\s+clk,?$/m.test(mem.source), '回路グラフ: メモリを置くと clk が生える', mem.source);
+  ok(/output reg q,/.test(mem.source), '回路グラフ: メモリは output reg', mem.source);
+  ok(/always @\(posedge clk\)/.test(mem.source), '回路グラフ: posedge で駆動', mem.source);
+  eq(mem.regs.length, 1, '回路グラフ: regs にメモリが 1 個');
+  eq(compile(mem.source).stats.regs, 1, '回路グラフ: ネットリスト上も 1 ビット');
+
+  // メモリを使わない回路にはクロックを生やさない
+  const comb = toVerilog(expandCircuit(SAMPLE_CIRCUITS['AND ゲート']));
+  ok(!comb.source.includes('clk'), '回路グラフ: 組合せ回路に clk は出ない', comb.source);
+  eq(comb.regs.length, 0, '回路グラフ: regs は空');
+
+  // D が未配線のメモリは下流ごと除外される
+  const openD = toVerilog({
+    nodes: [{ id: 1, type: 'dff' }, { id: 2, type: 'out' }],
+    wires: [{ from: { node: 1, port: 0 }, to: { node: 2, port: 0 } }],
+  });
+  eq(openD.incomplete.size, 2, '回路グラフ: D 未配線のメモリと下流を除外');
+  ok(openD.source === null, '回路グラフ: 残るものが無ければソースを作らない');
+
+  // メモリを挟んだフィードバックは組合せループにならない
+  const looped = toVerilog(expandCircuit(SAMPLE_CIRCUITS['クロックで反転する 1 ビットメモリ']));
+  eq(looped.incomplete.size, 0, '回路グラフ: メモリ経由の帰還は未完成にしない');
+
+  // バレルシフタ: 論理左シフトになっていること (全 64 パターン × 4 ビット)
+  const barrel = SAMPLE_CIRCUITS['4 ビットバレルシフタ (論理左シフト)'];
+  const bs = toVerilog(expandCircuit(barrel));
+  eq(bs.inputs.length, 6, 'バレルシフタ: 入力はデータ 4 + シフト量 2');
+  ok(bs.inputs.map((i) => i.name).join(',') === 'd0,d1,d2,d3,s0,s1',
+    'バレルシフタ: 付けた名前がそのまま入力名になる', bs.inputs.map((i) => i.name).join(','));
+  ok(/assign \w+ = 1'b0;/.test(bs.source), 'バレルシフタ: 定数 0 がリテラルになる');
+  const bsc = compile(bs.source);
+  ok(bsc.stats.regs === 0, 'バレルシフタ: 組合せ回路', `regs=${bsc.stats.regs}`);
+  const bsim = await WasmSimulator.create(bsc);
+  let mismatch = 0;
+  for (let pat = 0; pat < 64; pat++) {
+    bs.inputs.forEach((i, b) => bsim.setInputLane(i.name, pat, (pat >> b) & 1));
+  }
+  bsim.eval();   // 64 レーンで 64 パターンを一度に評価する
+  for (let bit = 0; bit < 4; bit++) {
+    const lanes = bsim.getLanes(`y${bit}`);
+    for (let pat = 0; pat < 64; pat++) {
+      if (Number(lanes[pat]) !== barrel.expect[`y${bit}`][pat]) mismatch++;
+    }
+  }
+  eq(mismatch, 0, 'バレルシフタ: 64 パターン × 4 ビットが論理左シフトと一致');
+
+  // ---- 端子の名前 ----
+  const named = toVerilog({
+    nodes: [
+      { id: 1, type: 'in', name: 'sel' }, { id: 2, type: 'in' },      // 2 は自動名
+      { id: 3, type: 'and' }, { id: 4, type: 'out', name: 'result' },
+    ],
+    wires: [
+      { from: { node: 1, port: 0 }, to: { node: 3, port: 0 } },
+      { from: { node: 2, port: 0 }, to: { node: 3, port: 1 } },
+      { from: { node: 3, port: 0 }, to: { node: 4, port: 0 } },
+    ],
+  });
+  eqs(named.inputs.map((i) => i.name).join(','), 'sel,a', '名前: 付けた名前と自動名が混ざる');
+  ok(named.source.includes('assign result = '), '名前: 出力名が Verilog に出る', named.source);
+  const { wasm: nw } = await bothSims(named.source);
+  nw.setInput('sel', 1).setInput('a', 1).eval();
+  eq(nw.get('result'), 1, '名前: 付けた名前で読める');
+
+  // 自動名は「空いている名前」を取る (手で 'a' を使っていたら次は 'b')
+  const collide = toVerilog({
+    nodes: [{ id: 1, type: 'in', name: 'a' }, { id: 2, type: 'in' }, { id: 3, type: 'out', name: 'y0' }, { id: 4, type: 'out' }],
+    wires: [{ from: { node: 1, port: 0 }, to: { node: 3, port: 0 } }, { from: { node: 2, port: 0 }, to: { node: 4, port: 0 } }],
+  });
+  eqs(collide.inputs.map((i) => i.name).join(','), 'a,b', '名前: 自動名は重複を避ける');
+  eqs(collide.outputs.map((o) => o.name).join(','), 'y0,y1', '名前: 出力の自動名も重複を避ける');
+
+  // 無効な名前は自動名にまわす (GUI で弾くが、通っても Verilog は壊れない)
+  const bad = toVerilog({
+    nodes: [
+      { id: 1, type: 'in', name: 'clk' },     // 予約語
+      { id: 2, type: 'in', name: '1st' },     // 識別子として無効
+      { id: 3, type: 'in', name: 'ok_1' },
+    ],
+    wires: [],
+  });
+  eqs(bad.inputs.map((i) => i.name).join(','), 'a,b,ok_1', '名前: 無効な名前は自動名になる');
+  for (const [name, why] of [['clk', '予約語'], ['1st', '識別子でない'], ['x y', '空白入り'], ['', '空']]) {
+    ok(checkName(name) !== null, `名前: ${why} を弾く (${name})`);
+  }
+  ok(checkName('q_2$') === null, '名前: Verilog の識別子は通す');
+  ok(checkName('q', new Set(['q'])) !== null, '名前: 重複を弾く');
+
+  // ---- 保存形式 (pack / expand / リンク) ----
+  for (const [name, c] of Object.entries(SAMPLE_CIRCUITS)) {
+    const g = expandCircuit(c);
+    const round = expandCircuit(packCircuit(g));
+    eqs(JSON.stringify(round), JSON.stringify(g), `保存形式: ${name} が往復して一致する`);
+    eqs(JSON.stringify(decodeCircuit(encodeCircuit(g))), JSON.stringify(g),
+      `保存形式: ${name} がリンク経由でも一致する`);
+  }
+  ok(encodeCircuit(expandCircuit(SAMPLE_CIRCUITS['AND ゲート'])).length < 200,
+    '保存形式: 小さい回路のリンクは短い',
+    String(encodeCircuit(expandCircuit(SAMPLE_CIRCUITS['AND ゲート'])).length));
+  ok(!/[+/=]/.test(encodeCircuit(expandCircuit(SAMPLE_CIRCUITS['多数決 (3 入力のうち 2 つ以上が 1)']))),
+    '保存形式: URL に置ける文字だけを使う');
+
+  // 名前と値も残る
+  const withName = expandCircuit(packCircuit({
+    nodes: [{ id: 3, type: 'in', x: 10, y: 20, value: 1, name: 'sel' },
+      { id: 4, type: 'dff', x: 30, y: 40, value: 0 }],
+    wires: [{ from: { node: 3, port: 0 }, to: { node: 4, port: 0 } }],
+  }));
+  eqs(withName.nodes[0].name, 'sel', '保存形式: 端子の名前が残る');
+  eq(withName.nodes[0].value, 1, '保存形式: 入力の値が残る');
+  eqs(withName.nodes[1].name, undefined, '保存形式: 名前なしは名前なしのまま');
+  eq(withName.wires.length, 1, '保存形式: 配線が残る');
+
+  // 壊れたデータは理由を付けて弾く
+  for (const [data, why] of [
+    [null, 'null'],
+    [{}, 'nodes が無い'],
+    [{ nodes: [], wires: {} }, 'wires が配列でない'],
+    [{ nodes: [[0, 'in', 0, 0]], wires: [] }, 'id が 0'],
+    [{ nodes: [[1.5, 'in', 0, 0]], wires: [] }, 'id が整数でない'],
+    [{ nodes: [[1, 'zzz', 0, 0]], wires: [] }, '知らない部品'],
+    [{ nodes: [[1, 'in', 0, 0], [1, 'out', 0, 0]], wires: [] }, 'id の重複'],
+    [{ nodes: 'x', wires: [] }, 'nodes が配列でない'],
+  ]) {
+    let err = null;
+    try { expandCircuit(data); } catch (e) { err = e; }
+    ok(err !== null, `保存形式: ${why} を弾く`, err ? '' : '通ってしまった');
+  }
+  let tooBig = null;
+  try {
+    expandCircuit({ nodes: Array.from({ length: 501 }, (_, i) => [i + 1, 'in', 0, 0]), wires: [] });
+  } catch (e) { tooBig = e; }
+  ok(tooBig !== null && /多すぎ/.test(tooBig.message), '保存形式: 部品が多すぎるものを弾く');
+
+  // 筋の通らない配線は黙って捨てる (回路自体は開けたほうが良い)
+  const dropped = expandCircuit({
+    nodes: [[1, 'in', 0, 0], [2, 'and', 0, 0], [3, 'out', 0, 0]],
+    wires: [
+      [1, 0, 2, 0],
+      [1, 0, 99, 0],       // 行き先が無い
+      [1, 0, 2, 5],        // 端子番号が範囲外
+      [1, 1, 2, 1],        // 出力端子は 0 しかない
+      [3, 0, 2, 1],        // 出力部品に出力端子は無い
+      [1, 0, 2, 0],        // 同じ入力端子への 2 本目
+    ],
+  });
+  eq(dropped.wires.length, 1, '保存形式: 通らない配線は捨てる');
+
+  // 座標が壊れていても落ちない
+  const coords = expandCircuit({ nodes: [[1, 'in', NaN, '9', 0], [2, 'in', -50, 99999, 0]], wires: [] });
+  eq(coords.nodes[0].x, 0, '保存形式: NaN の座標は 0 に');
+  eq(coords.nodes[1].x, 0, '保存形式: 負の座標は 0 に');
+  ok(coords.nodes[1].y <= 4000, '保存形式: 大きすぎる座標は丸める', String(coords.nodes[1].y));
+
+  let brokenLink = null;
+  try { decodeCircuit('これはbase64ではない###'); } catch (e) { brokenLink = e; }
+  ok(brokenLink !== null, '保存形式: 壊れたリンクを弾く');
+
+  // ---- 定数 ----
+  const konst = toVerilog({
+    nodes: [
+      { id: 1, type: 'const', value: 0 }, { id: 2, type: 'const', value: 1 },
+      { id: 3, type: 'or' }, { id: 4, type: 'out', name: 'y' },
+      { id: 5, type: 'and' }, { id: 6, type: 'out', name: 'z' },
+    ],
+    wires: [
+      { from: { node: 1, port: 0 }, to: { node: 3, port: 0 } },
+      { from: { node: 2, port: 0 }, to: { node: 3, port: 1 } },
+      { from: { node: 1, port: 0 }, to: { node: 5, port: 0 } },
+      { from: { node: 2, port: 0 }, to: { node: 5, port: 1 } },
+      { from: { node: 3, port: 0 }, to: { node: 4, port: 0 } },
+      { from: { node: 5, port: 0 }, to: { node: 6, port: 0 } },
+    ],
+  });
+  eqs(konst.inputs.length, 0, '定数: 入力ポートにはならない');
+  ok(konst.source.includes("assign n1 = 1'b0;"), '定数: 0 がリテラルになる', konst.source);
+  ok(konst.source.includes("assign n2 = 1'b1;"), '定数: 1 がリテラルになる', konst.source);
+  ok(konst.outputs.some((o) => o.kind === 'const'), '定数: kind は const');
+  const { all: kall } = await bothSims(konst.source);
+  for (const sim of kall) {
+    sim.eval();
+    eq(sim.get('y'), 1, `${sim.constructor.name} 定数: 0 | 1 = 1`);
+    eq(sim.get('z'), 0, `${sim.constructor.name} 定数: 0 & 1 = 0`);
+    eq(sim.get('n1'), 0, `${sim.constructor.name} 定数: 0 の値を読める`);
+    eq(sim.get('n2'), 1, `${sim.constructor.name} 定数: 1 の値を読める`);
+  }
+
+  // 未配線のノードとその下流は回路から除外される
+  const partial = toVerilog({
+    nodes: [
+      { id: 1, type: 'in' }, { id: 2, type: 'and' },   // and の入力 1 が未配線
+      { id: 3, type: 'not' }, { id: 4, type: 'out' },  // その下流
+      { id: 5, type: 'not' }, { id: 6, type: 'out' },  // こちらは完成している
+    ],
+    wires: [
+      { from: { node: 1, port: 0 }, to: { node: 2, port: 0 } },
+      { from: { node: 2, port: 0 }, to: { node: 3, port: 0 } },
+      { from: { node: 3, port: 0 }, to: { node: 4, port: 0 } },
+      { from: { node: 1, port: 0 }, to: { node: 5, port: 0 } },
+      { from: { node: 5, port: 0 }, to: { node: 6, port: 0 } },
+    ],
+  });
+  eq(partial.incomplete.size, 3, '回路グラフ: 未配線とその下流を除外');
+  ok([2, 3, 4].every((id) => partial.incomplete.has(id)), '回路グラフ: 除外されたのは and / not / out');
+  ok(!partial.source.includes('n2'), '回路グラフ: 未完成ノードは Verilog に出ない');
+  const { wasm } = await bothSims(partial.source);
+  wasm.setInput('a', 1).eval();
+  eq(wasm.get('y1'), 0, '回路グラフ: 完成している側は動く');
+
+  // 部品が何もなければソースは作らない
+  ok(toVerilog({ nodes: [], wires: [] }).source === null, '回路グラフ: 空なら null');
+
+  // ゲートの出力も観測できる (配線に値を色付けするために output にしている)
+  const half = toVerilog(expandCircuit(SAMPLE_CIRCUITS['半加算器 (sum / carry)']));
+  const gateProbe = half.outputs.find((o) => o.kind === 'gate');
+  ok(gateProbe !== undefined, '回路グラフ: ゲート出力も観測用ポートになる');
+  const { wasm: hw } = await bothSims(half.source);
+  hw.setInput('a', 1).setInput('b', 1).eval();
+  eq(hw.get(gateProbe.name), gateProbe.name === 'n3' ? 0 : 1, '回路グラフ: ゲート出力を読める');
+}
+
 // ---------------------------------------------------------------- 実行
 const suites = [
   ['全加算器', testFullAdder],
@@ -448,6 +730,7 @@ const suites = [
   ['エラー検出', testErrors],
   ['ランダム差分', testRandomDiff],
   ['WAT 出力', testWat],
+  ['GUI 回路グラフ', testSchematic],
 ];
 
 for (const [label, fn] of suites) {
