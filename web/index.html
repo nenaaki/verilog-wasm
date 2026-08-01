@@ -36,7 +36,7 @@
   main { display: grid; grid-template-columns: minmax(320px, 40%) 1fr; min-height: 0; }
   .col { display: grid; min-height: 0; min-width: 0; }
   .left { grid-template-rows: auto 1fr auto; border-right: 1px solid var(--line); }
-  .right { grid-template-rows: auto auto minmax(0, 1fr) auto; }
+  .right { grid-template-rows: auto auto minmax(0, 1fr) auto auto; }
 
   .bar {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -125,6 +125,11 @@
     </div>
     <div id="ports"></div>
     <div class="scroll" id="waveWrap"><table class="wave" id="wave"></table></div>
+    <div class="bar">
+      <span class="label">出力</span>
+      <button id="dlWasm" title="コンパイル結果のバイナリを .wasm として保存">.wasm を保存</button>
+      <button id="dlWat" title="生成された WAT をテキストとして保存">.wat を保存</button>
+    </div>
     <details id="watBox">
       <summary>生成された WAT を見る</summary>
       <div class="scroll"><pre id="wat"></pre></div>
@@ -136,6 +141,7 @@
 import { compile, CompileError } from '../src/compile.js';
 import { WasmSimulator } from '../src/sim.js';
 import { bits } from '../src/signals.js';
+import { saveFile, safeName } from './download.js';
 
 const EXAMPLES = {
   'lfsr8 — 8bit LFSR (周期255)': `module lfsr8(
@@ -241,14 +247,37 @@ async function doCompile() {
       compiled.warnings.length ? 'warn' : 'ok');
     buildPorts();
     resetSim();
+    updateDownloadUI();
   } catch (e) {
     compiled = null; sim = null;
     el.stats.textContent = '';
     el.ports.innerHTML = '';
     el.wave.innerHTML = '';
     setMsg(e instanceof CompileError ? e.message : `${e.name}: ${e.message}`, 'err');
+    updateDownloadUI();
   }
 }
+
+// ---- 出力の保存 -----------------------------------------------------------
+function updateDownloadUI() {
+  $('dlWasm').disabled = $('dlWat').disabled = compiled === null;
+}
+
+$('dlWasm').onclick = () => {
+  if (!compiled) return;
+  const file = `${safeName(compiled.top)}.wasm`;
+  saveFile(file, compiled.bytes, 'application/wasm');
+  setMsg(`${file} を保存しました (${compiled.bytes.length} バイト)`, 'ok');
+};
+
+$('dlWat').onclick = () => {
+  if (!compiled?.wat) return;
+  const file = `${safeName(compiled.top)}.wat`;
+  saveFile(file, compiled.wat, 'text/plain;charset=utf-8');
+  setMsg(`${file} を保存しました`, 'ok');
+};
+
+updateDownloadUI();
 
 // ---- 入力コントロール ------------------------------------------------------
 function buildPorts() {

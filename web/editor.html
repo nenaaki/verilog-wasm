@@ -199,6 +199,7 @@
   <button id="save">保存</button>
   <button id="delSave">保存を削除</button>
   <button id="share">リンクをコピー</button>
+  <button id="dlWasm" title="いまの回路をコンパイルした .wasm を保存">.wasm を保存</button>
   <span class="sep"></span>
   <span class="label">部品にする</span>
   <select id="blockPick" title="保存した回路を部品として置く"></select>
@@ -261,6 +262,7 @@ import {
   clamp, inPin, outPin, pinYs, sizeOf, wirePath,
 } from './geometry.js';
 import { readClip, readSaved, readWork, writeClip, writeSaved, writeWork } from './storage.js';
+import { saveFile, safeName } from './download.js';
 import { WAVE, renderWave as drawWave } from './wave.js';
 import { MAX_TABLE_BITS, renderTable as drawTable } from './table.js';
 
@@ -433,6 +435,7 @@ function updateEditUI() {
   $('copy').disabled = selection.size === 0;
   $('del').disabled = selection.size === 0;
   $('renameBtn').disabled = selection.size !== 1;
+  $('dlWasm').disabled = compiled === null;
 }
 
 // ------------------------------------------------------------ 編集操作
@@ -621,7 +624,7 @@ async function rebuild() {
     cycles = 0;
     frames = [];
     setMsg('部品を置いて配線してください。', '');
-    render(); renderTable(); updateClockUI();
+    render(); renderTable(); updateClockUI(); updateEditUI();
     return;
   }
 
@@ -1223,6 +1226,14 @@ $('share').onclick = async () => {
   } catch {
     setMsg(`クリップボードが使えないので、アドレス欄からコピーしてください:\n${url}`, 'warn');
   }
+};
+
+$('dlWasm').onclick = () => {
+  if (!compiled) { setMsg('コンパイルできている回路がありません', 'warn'); return; }
+  // 保存名があればそれを、なければ top モジュール名をファイル名にする
+  const file = `${safeName($('cname').value || compiled.top, 'circuit')}.wasm`;
+  saveFile(file, compiled.bytes, 'application/wasm');
+  setMsg(`${file} を保存しました (${compiled.bytes.length} バイト)`, 'ok');
 };
 
 $('clear').onclick = () => {

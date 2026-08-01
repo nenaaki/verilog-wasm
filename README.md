@@ -11,7 +11,10 @@ node tools/vwc.js examples/lfsr8.v --run 8 --set q=1 # 波形を出す
 node tools/vwc.js examples/lfsr8.v --wat             # 生成コードを見る
 node tools/bench.js                                  # スループット計測
 node tools/serve.js                                  # → http://localhost:8080/web/ （テキスト版 / 回路エディタ）
+node tools/vwc.js examples/lfsr8.v -o lfsr8.wasm     # .wasm を書き出す
 ```
+
+生成した WASM はブラウザ側からも保存できる。テキスト版は「出力」の `.wasm を保存` / `.wat を保存`、回路エディタは「回路」の `.wasm を保存` で、いまコンパイルできているモジュールがそのまま落ちてくる（`WebAssembly.compile` に渡せる素のバイナリなので、他のホストからも読める）。
 
 ```text
 $ node tools/vwc.js examples/shift8.v --run 8 --set din=1
@@ -68,6 +71,7 @@ WebAssembly.instantiate → sim.js
 | [web/dom.js](web/dom.js) | 要素を作る道具（SVG / HTML を取り違えないよう関数を分ける） | 21 |
 | [web/geometry.js](web/geometry.js) | 部品の寸法・端子の位置・配線のパス | 37 |
 | [web/storage.js](web/storage.js) | localStorage への出入り口 | 32 |
+| [web/download.js](web/download.js) | 生成物をファイルとして保存する（.wasm / .wat） | 25 |
 | [web/wave.js](web/wave.js) | 波形の描画 | 65 |
 | [web/table.js](web/table.js) | 真理値表 / 状態遷移表の描画 | 87 |
 
