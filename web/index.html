@@ -166,6 +166,17 @@ endmodule`,
     q <= clr ? 8'h00 : (en ? q + 1 : q);
 endmodule`,
 
+  'counter_rst — 非同期リセット付きカウンタ': `module counter_rst(
+  input clk,
+  input rst,
+  input en,
+  output reg [7:0] q
+);
+  always @(posedge clk or posedge rst)
+    if (rst) q <= 8'h00;
+    else if (en) q <= q + 1;
+endmodule`,
+
   'seqdet — "1011" 検出 FSM (case + if)': `module seqdet(
   input clk,
   input din,

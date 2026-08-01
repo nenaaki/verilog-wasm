@@ -87,7 +87,10 @@ function reachable(netlist) {
   for (const s of signals.values()) {
     if (s.dir === 'output') stack.push(...s.bits);
   }
-  for (const r of regs) stack.push(r.d);
+  for (const r of regs) {
+    stack.push(r.d);
+    if (r.qAsync != null) stack.push(r.qAsync);   // 非同期リセットの書き戻しも根
+  }
 
   while (stack.length > 0) {
     const gi = driver[stack.pop()];

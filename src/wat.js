@@ -63,6 +63,14 @@ export function emitWat(netlist, order, layout) {
   regs.forEach((r, i) => {
     L.push(`    (i64.store offset=${regNext[i]} (i32.const 0) (local.get ${id(r.d)}))`);
   });
+  if (regs.some((r) => r.qAsync != null && r.qAsync !== r.q)) {
+    L.push('    ;; --- 非同期リセット (クロックを待たずに Q を上書き) ---');
+    for (const r of regs) {
+      if (r.qAsync == null || r.qAsync === r.q) continue;
+      L.push(`    (i64.store offset=${slots.get(r.q)} (i32.const 0) (local.get ${id(r.qAsync)}))`
+        + `   ;; ${nets[r.q].name}`);
+    }
+  }
   L.push('  )');
 
   // ---- commit: クロックエッジ ----

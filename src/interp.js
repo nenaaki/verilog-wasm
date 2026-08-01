@@ -63,6 +63,12 @@ export class RefSimulator extends SignalAccess {
 
     // 次状態は専用の場所に置き、Q はまだ変えない (同時代入)
     regs.forEach((rg, i) => { this.next[i] = v[rg.d]; });
+
+    // 非同期リセットだけは Q をここで上書きする (クロックを待たない)。
+    // 次状態を取り終えたあとに書くので、WASM 側 (local を先に読む) と同じ順になる。
+    for (const rg of regs) {
+      if (rg.qAsync != null && rg.qAsync !== rg.q) v[rg.q] = v[rg.qAsync];
+    }
     return this;
   }
 

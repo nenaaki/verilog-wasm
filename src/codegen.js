@@ -135,6 +135,12 @@ export function emitWasm(netlist, order, layout) {
   for (const n of layout.outputNets) storeFromLocal(slots.get(n), n);
   regs.forEach((r, i) => storeFromLocal(regNext[i], r.d));
 
+  // 非同期リセット: クロックを待たずに Q を上書きする。
+  // Q の読み込みは 1 で済んでいるので、ここで書いても今回の eval には影響しない。
+  regs.forEach((r) => {
+    if (r.qAsync != null && r.qAsync !== r.q) storeFromLocal(slots.get(r.q), r.qAsync);
+  });
+
   emit(OP.end);
 
   const evalBody = [...vec([[...uleb(nets.length), I64]]), ...code];

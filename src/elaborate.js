@@ -6,7 +6,12 @@
 // ネットリスト IR:
 //   nets   : [{ name }]                      … 1 ネット = 1 ビット
 //   gates  : [{ op, out, in:[netId], value }] … op: const|buf|not|and|or|xor|mux
-//   regs   : [{ q, d, line }]                 … posedge clk の D フリップフロップ
+//   regs   : [{ q, d, rst, rstD, qAsync, line }] … posedge clk の D フリップフロップ
+//            rst 以下は非同期リセット付きのときだけ埋まる (無いときは null):
+//              rst    … リセットが効いている条件のネット
+//              rstD   … リセット時の値
+//              qAsync … mux(rst, rstD, q)。クロックを待たずに Q へ書き戻す値で、
+//                       eval が Q スロットに store する (d は commit 用)
 //   signals: Map<name, { dir, kind, msb, lsb, width, bits:[netId] }>
 //
 // 幅の解決は Verilog の文脈依存幅に従う。2 段階に分かれていて、
@@ -553,6 +558,73 @@ export function elaborate(mod) {
     return cur;
   }
 
+  /** 式の中に出てくる信号名を集める (どのイベント信号を見ているか判定するのに使う) */
+  function refNames(e, out = []) {
+    if (!e || typeof e !== 'object') return out;
+    if (e.type === 'ref') out.push(e.name);
+    for (const k of ['a', 'b', 'sel']) if (e[k]) refNames(e[k], out);
+    if (e.parts) for (const p of e.parts) refNames(p, out);
+    return out;
+  }
+
+  /**
+   * always のイベントリストを「クロック」と「非同期リセット」に振り分ける。
+   *
+   * イベントが 1 つなら普通の同期回路。2 つなら片方が非同期リセットで、
+   * **どちらがリセットかは本体の先頭の if がどの信号を見ているかで決める**。
+   * Verilog もイベントリストの順番では決まらず、この形で書くのが決まりになっている:
+   *
+   *   always @(posedge clk or posedge rst)   if (rst)   q <= 0; else q <= d;
+   *   always @(posedge clk or negedge rst_n) if (!rst_n) q <= 0; else q <= d;
+   *
+   * リセットが効いている条件は if の条件そのものなので、負論理リセット (!rst_n) も
+   * そのまま通る。エッジの向き自体は使わない (連続時間を持たないモデルなので、
+   * 「リセット条件が真のあいだ Q が上書きされる」ことだけを表現する)。
+   */
+  function splitReset(item) {
+    const { edges } = item;
+
+    if (edges.length === 1) {
+      if (edges[0].kind !== 'posedge') {
+        throw new CompileError('negedge は未対応 (posedge のみ)', item.line);
+      }
+      return { clkName: edges[0].name, rstCond: null, rstStmts: null, body: item.stmts };
+    }
+
+    const st = item.stmts.length === 1 ? item.stmts[0] : null;
+    if (!st || st.type !== 'if') {
+      throw new CompileError(
+        '非同期リセット付きの always は、本体全体を if (リセット条件) ... else ... にする必要がある',
+        item.line);
+    }
+
+    const inCond = new Set(refNames(st.cond));
+    const hits = edges.filter((e) => inCond.has(e.name));
+    if (hits.length !== 1) {
+      const names = edges.map((e) => e.name).join(' と ');
+      throw new CompileError(
+        `if の条件が ${names} のどちらを見ているか決まらない`
+        + ' (非同期リセット側の信号だけを条件に書く)', st.line);
+    }
+    const rstEdge = hits[0];
+    const clkEdge = edges.find((e) => e !== rstEdge);
+    if (clkEdge.kind !== 'posedge') {
+      throw new CompileError(
+        `クロック '${clkEdge.name}' は posedge でなければならない (negedge は未対応)`, item.line);
+    }
+    const rstSig = lookup(rstEdge.name, item.line);
+    if (rstSig.width !== 1) {
+      throw new CompileError(`非同期リセット '${rstEdge.name}' は 1 ビットでなければならない`, item.line);
+    }
+
+    return {
+      clkName: clkEdge.name,
+      rstCond: reduceOr(evalExpr(st.cond), st.line),
+      rstStmts: st.then,
+      body: st.else ?? [],          // else が無ければ「リセット以外では保持」
+    };
+  }
+
   /** 左辺のネット列に右辺を接続する (buf ゲートで橋渡し) */
   function connect(lhsNode, rhsBits, what, line) {
     const lhs = refBits(lhsNode);
@@ -618,23 +690,44 @@ export function elaborate(mod) {
     }
 
     if (item.type === 'always') {
-      const clk = lookup(item.clock, item.line);
-      if (clk.width !== 1) throw new CompileError(`クロック '${item.clock}' は 1 ビットでなければならない`, item.line);
-      if (clock && clock !== item.clock) {
-        throw new CompileError(`複数クロックは未対応 ('${clock}' と '${item.clock}')`, item.line);
+      const { clkName, rstCond, rstStmts, body } = splitReset(item);
+
+      const clk = lookup(clkName, item.line);
+      if (clk.width !== 1) throw new CompileError(`クロック '${clkName}' は 1 ビットでなければならない`, item.line);
+      if (clock && clock !== clkName) {
+        throw new CompileError(`複数クロックは未対応 ('${clock}' と '${clkName}')`, item.line);
       }
-      clock = item.clock;
+      clock = clkName;
       clk.isClock = true;
 
       // 文を上から順に辿り、レジスタの各ビットについて「次の値」を組み立てる。
       // 分岐は then 側と else 側を別々に走らせてから mux でマージする。
       // どちらの経路でも代入されなかったビットは Q そのもの (= 保持) になる。
-      const next = runStmts(item.stmts, new Map());
+      const next = runStmts(body, new Map());
+      const rstNext = rstStmts ? runStmts(rstStmts, new Map()) : null;
 
-      for (const [qn, d] of next) {
+      // リセット側だけで代入されるビットもあるので、両方のキーを見る
+      const touched = new Set([...next.keys(), ...(rstNext ? rstNext.keys() : [])]);
+      for (const qn of touched) {
         const line = regLine.get(qn) ?? item.line;
         setDriver(qn, `always @(posedge ${clock})`, line);
-        regs.push({ q: qn, d, line });
+        const dNormal = next.get(qn) ?? qn;      // エッジでの次の値 (無ければ保持)
+
+        if (rstCond === null) {
+          regs.push({ q: qn, d: dNormal, rst: null, rstD: null, qAsync: null, line });
+          continue;
+        }
+        const rstD = rstNext.get(qn) ?? qn;      // リセットで触られないビットは保持
+        regs.push({
+          q: qn,
+          // エッジでもリセットが優先する
+          d: newGate('mux', [rstCond, rstD, dNormal]),
+          rst: rstCond,
+          rstD,
+          // 非同期部分: クロックを待たずに Q を上書きする値 (eval で書く)
+          qAsync: newGate('mux', [rstCond, rstD, qn]),
+          line,
+        });
       }
       continue;
     }

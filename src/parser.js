@@ -235,21 +235,30 @@ export function parse(src) {
     return { type: 'case', sel, items, default: dflt, line };
   }
 
+  /** posedge x / negedge x。どちらがクロックでどちらがリセットかは elaborate が決める */
+  function parseEdge() {
+    const t = peek();
+    if (t.value !== 'posedge' && t.value !== 'negedge') {
+      throw err("'posedge' または 'negedge' が必要");
+    }
+    next();
+    return { kind: t.value, name: expectIdent(), line: t.line };
+  }
+
   function parseAlways() {
     const line = expect('always').line;
     expect('@');
     expect('(');
-    if (!at('posedge')) {
-      if (at('negedge')) throw err('negedge は未対応 (posedge のみ)');
-      throw err("'posedge' が必要");
-    }
-    next();
-    const clock = expectIdent();
+    const edges = [parseEdge()];
+    while (eat('or')) edges.push(parseEdge());
     expect(')');
+    if (edges.length > 2) {
+      throw err(`イベントは 2 つまで (クロックと非同期リセット。${edges.length} 個ある)`);
+    }
 
     const stmts = parseStmtBlock();
 
-    return { type: 'always', clock, stmts, line };
+    return { type: 'always', edges, stmts, line };
   }
 
   function parseGateInst() {

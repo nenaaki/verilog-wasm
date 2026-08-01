@@ -332,6 +332,134 @@ endmodule`);
   }
 }
 
+// ------------------------------------------------------------ 非同期リセット
+//
+// 「クロックを待たない」のが非同期の意味なので、step() ではなく eval() だけで
+// Q が変わることを確かめるのが本質。WASM と参照実装で別々に実装している所なので
+// 両方を突き合わせる。
+async function testAsyncReset() {
+  const dffr = `module dffr(input clk, input rst, input [3:0] d, output reg [3:0] q);
+  always @(posedge clk or posedge rst)
+    if (rst) q <= 4'h0;
+    else q <= d;
+endmodule`;
+  const { all } = await bothSims(dffr);
+  for (const sim of all) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('rst', 0).setInput('d', 5).step();
+    eq(sim.get('q'), 5, `${kind} 非同期リセット: 通常のロード`);
+
+    // ここが非同期の要点 — クロックを打たずに eval() だけで 0 になる
+    sim.setInput('rst', 1).eval();
+    eq(sim.get('q'), 0, `${kind} 非同期リセット: eval() だけで Q が 0 になる`);
+
+    // 続けて eval しても変わらない (べき等)
+    sim.eval().eval();
+    eq(sim.get('q'), 0, `${kind} 非同期リセット: eval を重ねても 0`);
+
+    // リセットを下げてもクロックが来るまで値は戻らない
+    sim.setInput('rst', 0).eval();
+    eq(sim.get('q'), 0, `${kind} 非同期リセット: 解除しただけでは 0 のまま`);
+
+    sim.setInput('d', 9).step();
+    eq(sim.get('q'), 9, `${kind} 非同期リセット: 解除後のクロックで取り込む`);
+
+    // リセット中は何クロック打っても 0
+    sim.setInput('rst', 1).setInput('d', 7).run(5);
+    eq(sim.get('q'), 0, `${kind} 非同期リセット: リセット中は run(5) でも 0`);
+    sim.setInput('rst', 0).step();
+    eq(sim.get('q'), 7, `${kind} 非同期リセット: 解除後に d を取り込む`);
+  }
+
+  // 負論理リセット (negedge rst_n + if (!rst_n))、非ゼロのリセット値、部分リセット、
+  // リセット側に出てこない reg
+  const lowActive = `module m(input clk, input rst_n, input [3:0] d,
+  output reg [3:0] a, output reg [3:0] b, output reg [3:0] c);
+  always @(posedge clk or negedge rst_n)
+    if (!rst_n) begin
+      a <= 4'hF;
+      b[1:0] <= 2'b01;
+    end else begin
+      a <= d;
+      b <= d;
+      c <= d;
+    end
+endmodule`;
+  const { compiled: lc, all: ls } = await bothSims(lowActive);
+  eqs(lc.warnings.length, 0, '非同期リセット: 部分リセットでも未駆動の警告なし', lc.warnings.join(' / '));
+  for (const sim of ls) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('rst_n', 1).setInput('d', 0xa).step();
+    eq(sim.get('a'), 0xa, `${kind} 負論理: 通常動作 (a)`);
+    sim.setInput('rst_n', 0).eval();
+    eq(sim.get('a'), 0xf, `${kind} 負論理: eval だけで非ゼロのリセット値になる`);
+    eq(sim.get('b'), 0b1001, `${kind} 負論理: 部分リセット (上位 2 ビットは保持)`);
+    eq(sim.get('c'), 0xa, `${kind} 負論理: リセット側に無い reg は保持`);
+    sim.setInput('rst_n', 1).setInput('d', 3).step();
+    eq(sim.get('a'), 3, `${kind} 負論理: 解除後に取り込む`);
+    eq(sim.get('b'), 3, `${kind} 負論理: b も取り込む`);
+  }
+
+  // 例題のカウンタ
+  const { all: cs } = await bothSims(example('counter_rst.v'));
+  for (const sim of cs) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('rst', 0).setInput('en', 1).run(20);
+    eq(sim.get('q'), 20, `${kind} counter_rst: 20 クロック数える`);
+    sim.setInput('rst', 1).eval();
+    eq(sim.get('q'), 0, `${kind} counter_rst: クロック無しでクリア`);
+    sim.setInput('rst', 0).setInput('en', 0).step();
+    eq(sim.get('q'), 0, `${kind} counter_rst: en=0 なら止まったまま`);
+    sim.setInput('en', 1).step();
+    eq(sim.get('q'), 1, `${kind} counter_rst: en=1 で再開`);
+  }
+
+  // else が無い形 (リセット以外では保持)
+  const noElse = `module m(input clk, input rst, output reg [3:0] q);
+  always @(posedge clk or posedge rst)
+    if (rst) q <= 4'h5;
+endmodule`;
+  const { all: ns } = await bothSims(noElse);
+  for (const sim of ns) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('rst', 1).eval();
+    eq(sim.get('q'), 5, `${kind} 非同期リセット: else 無しでもリセットは効く`);
+    sim.setInput('rst', 0).run(3);
+    eq(sim.get('q'), 5, `${kind} 非同期リセット: else 無しなら以後は保持`);
+  }
+
+  // 同期リセット (イベント 1 つ) との違い: そちらは eval() では変わらない
+  const syncRst = `module m(input clk, input rst, input [3:0] d, output reg [3:0] q);
+  always @(posedge clk)
+    if (rst) q <= 4'h0;
+    else q <= d;
+endmodule`;
+  const { all: ss } = await bothSims(syncRst);
+  for (const sim of ss) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('rst', 0).setInput('d', 6).step();
+    eq(sim.get('q'), 6, `${kind} 同期リセット: 通常のロード`);
+    sim.setInput('rst', 1).eval();
+    eq(sim.get('q'), 6, `${kind} 同期リセット: eval() では変わらない (非同期との違い)`);
+    sim.step();
+    eq(sim.get('q'), 0, `${kind} 同期リセット: クロックで 0 になる`);
+  }
+
+  // 64 レーンで別々にリセットをかける
+  const { wasm: lw } = await bothSims(dffr);
+  lw.reset();
+  for (let lane = 0; lane < 64; lane++) {
+    lw.setInputLane('d', lane, lane & 15).setInputLane('rst', lane, lane & 1);
+  }
+  lw.step();
+  const lanes = lw.getLanes('q');
+  let laneBad = 0;
+  for (let lane = 0; lane < 64; lane++) {
+    if (Number(lanes[lane]) !== ((lane & 1) ? 0 : (lane & 15))) laneBad++;
+  }
+  ok(laneBad === 0, '非同期リセット: 64 レーンが独立にリセットされる', `${laneBad} レーン不一致`);
+}
+
 // ---------------------------------------------- 定数畳み込みと共通部分式除去
 //
 // ゲートを作る所でたたむので、たたんだ結果が正しいことを真理値表で押さえる。
@@ -1415,9 +1543,29 @@ async function testErrors() {
     ['範囲外のビット選択',
       `module m(input [3:0] a, output y); assign y = a[7]; endmodule`,
       /宣言範囲/],
-    ['negedge は未対応',
+    ['単独の negedge は未対応',
       `module m(input clk, a, output reg q); always @(negedge clk) q <= a; endmodule`,
       /negedge/],
+    ['非同期リセットの本体が if でない',
+      `module m(input clk, rst, d, output reg q);
+       always @(posedge clk or posedge rst) q <= d; endmodule`,
+      /本体全体を if/],
+    ['リセット条件がどちらの信号か決まらない',
+      `module m(input clk, rst, c, d, output reg q);
+       always @(posedge clk or posedge rst) if (c) q <= 1'b0; else q <= d; endmodule`,
+      /どちらを見ているか決まらない/],
+    ['クロックが negedge',
+      `module m(input clk, rst, d, output reg q);
+       always @(negedge clk or posedge rst) if (rst) q <= 1'b0; else q <= d; endmodule`,
+      /posedge でなければならない/],
+    ['イベントが 3 つ',
+      `module m(input clk, a, b, d, output reg q);
+       always @(posedge clk or posedge a or posedge b) if (a) q <= 1'b0; else q <= d; endmodule`,
+      /イベントは 2 つまで/],
+    ['非同期リセットが多ビット',
+      `module m(input clk, input [1:0] rst, input d, output reg q);
+       always @(posedge clk or posedge rst) if (rst) q <= 1'b0; else q <= d; endmodule`,
+      /1 ビットでなければならない/],
     ['ブロッキング代入の誤用',
       `module m(input clk, a, output reg q); always @(posedge clk) q = a; endmodule`,
       /ノンブロッキング/],
@@ -1566,16 +1714,26 @@ function randomDesign(rng, nWires) {
   lines.push(`  always @(posedge clk) begin ${stmt(3)} end`);
   lines.push(`  assign rout2 = r2;`);
 
+  // 非同期リセット付きのレジスタも 1 本。eval で Q を書き戻す経路が WASM と
+  // 参照実装で別実装なので、ここを差分テストに通したい。
+  lines.unshift('  reg [7:0] r3;');
+  lines.push(`  always @(posedge clk or posedge rst)`);
+  lines.push(`    if (rst) r3 <= ${expr(1)};`);
+  lines.push(`    else r3 <= ${expr(2)};`);
+  lines.push(`  assign rout3 = r3;`);
+
   lines.push(`  assign y = ${expr(3)};`);
 
   return `module rnd(
   input clk,
+  input rst,
   input [7:0] a,
   input [7:0] b,
   input [7:0] c,
   output [7:0] y,
   output [7:0] rout,
-  output [7:0] rout2
+  output [7:0] rout2,
+  output [7:0] rout3
 );
 ${lines.join('\n')}
   assign rout = r;
@@ -1588,7 +1746,9 @@ async function testRandomDiff() {
   let mismatch = null;
 
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
-  const seen = { 'if': 0, 'case': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0 };
+  const seen = {
+    'if': 0, 'case': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0, '非同期リセット': 0,
+  };
 
   for (let d = 0; d < 25 && !mismatch; d++) {
     const src = randomDesign(rng, 6);
@@ -1598,6 +1758,7 @@ async function testRandomDiff() {
     if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
     if (/(<<|>>)/.test(src)) seen['シフト']++;
     if (/(&&|\|\||\(!)/.test(src)) seen['論理']++;
+    if (/or posedge rst/.test(src)) seen['非同期リセット']++;
     let compiled;
     try {
       compiled = compile(src);
@@ -1614,12 +1775,23 @@ async function testRandomDiff() {
       const a = Math.floor(rng() * 256);
       const b = Math.floor(rng() * 256);
       const c = Math.floor(rng() * 256);
-      for (const sim of [wasm, ref]) sim.setInput('a', a).setInput('b', b).setInput('c', c);
-      wasm.step();
-      ref.step();
-      for (const port of ['y', 'rout', 'rout2']) {
+      // rst は 1/4 の頻度で上げる。上げた回は step ではなく eval だけを回して、
+      // 「クロックなしで Q が変わる」経路も両実装で突き合わせる
+      const rst = rng() < 0.25 ? 1 : 0;
+      for (const sim of [wasm, ref]) {
+        sim.setInput('a', a).setInput('b', b).setInput('c', c).setInput('rst', rst);
+      }
+      if (rst) {
+        wasm.eval();
+        ref.eval();
+      } else {
+        wasm.step();
+        ref.step();
+      }
+      for (const port of ['y', 'rout', 'rout2', 'rout3']) {
         if (wasm.get(port) !== ref.get(port)) {
-          mismatch = `${port}: wasm=${wasm.get(port)} ref=${ref.get(port)} (a=${a} b=${b} c=${c} t=${t})\n${src}`;
+          mismatch = `${port}: wasm=${wasm.get(port)} ref=${ref.get(port)}`
+            + ` (a=${a} b=${b} c=${c} rst=${rst} t=${t})\n${src}`;
         }
       }
     }
@@ -2081,6 +2253,7 @@ const suites = [
   ['シフト回路', testShifter],
   ['if / case', testIfCase],
   ['FSM (列検出)', testSeqDet],
+  ['非同期リセット', testAsyncReset],
   ['カウンタ', testCounter8],
   ['DFF', testDff],
   ['シフトレジスタ', testShift8],
