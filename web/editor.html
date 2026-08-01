@@ -151,6 +151,8 @@
   .whit { fill: none; stroke: transparent; stroke-width: 12; cursor: pointer; }
   .wgroup:hover .wire { stroke: var(--red); }
   .rubber { fill: none; stroke: var(--blue); stroke-width: 2; stroke-dasharray: 5 4; pointer-events: none; }
+  .band { fill: rgba(90, 162, 255, .10); stroke: var(--blue); stroke-width: 1;
+    stroke-dasharray: 4 3; pointer-events: none; }
   .lamp { stroke: var(--line); stroke-width: 1.5; fill: #2a2f3a; }
   .lamp.one { fill: var(--green); stroke: var(--green); }
 </style>
@@ -168,9 +170,13 @@
   <span class="label">部品</span>
   <span id="palette"></span>
   <span class="sep"></span>
-  <button id="clear">全部消す</button>
+  <button id="undo" title="元に戻す (Ctrl+Z)">↶</button>
+  <button id="redo" title="やり直す (Ctrl+Y)">↷</button>
+  <button id="copy" title="選択をコピー (Ctrl+C)">コピー</button>
+  <button id="pasteBtn" title="貼り付け (Ctrl+V)">貼り付け</button>
   <button id="del">削除 (Del)</button>
   <button id="renameBtn">名前 (F2)</button>
+  <button id="clear">全部消す</button>
   <button id="fit">表示リセット</button>
   <span class="sep"></span>
   <span class="label">クロック</span>
@@ -187,7 +193,8 @@
   <button id="delSave">保存を削除</button>
   <button id="share">リンクをコピー</button>
   <span class="label" style="text-transform:none;flex-basis:100%">入力・定数の箱をクリックで 0/1 反転・端子をクリック→クリックで配線・線をクリックで切断<br>
-    Ctrl + ホイールで拡大縮小・何もない所をドラッグでスクロール・境界をつまんで幅の変更<br>
+    背景をドラッグで範囲選択・Shift+クリックで選択に追加・Ctrl+C / Ctrl+V でコピーと貼り付け・Ctrl+Z で戻す<br>
+    Ctrl + ホイールで拡大縮小・Shift+ドラッグでスクロール・境界をつまんで幅の変更<br>
     Space でクロック・入出力とメモリは右クリック (または F2) で名前を変更</span>
 </div>
 
@@ -197,6 +204,7 @@
       <g id="gWires"></g>
       <g id="gNodes"></g>
       <path id="rubber" class="rubber"></path>
+      <rect id="band" class="band" width="0" height="0"></rect>
     </svg>
   </div>
   <div class="split v" id="splitV" title="ドラッグで幅を変える"></div>
@@ -251,10 +259,11 @@ const SVGNS = 'http://www.w3.org/2000/svg';
 // ------------------------------------------------------------------ 状態
 let graph = { nodes: [], wires: [] };
 let nextId = 1;
-let selected = null;               // 選択中のノード id
+let selection = new Set();         // 選択中のノード id (複数)
 let armed = null;                  // 配線の始点 {node, port}
-let drag = null;                   // {id, dx, dy, moved}
-let pan = null;                    // {sx, sy, x, y, k} 背景ドラッグでのスクロール
+let drag = null;                   // {ids, from:{id→{x,y}}, sx, sy, moved, snap}
+let band = null;                   // {x0, y0, x1, y1, base} 範囲選択の矩形
+let pan = null;                    // {sx, sy, x, y, k} Shift + 背景ドラッグでのスクロール
 let sim = null, compiled = null;
 let plan = null;                   // toVerilog の結果
 let values = new Map();            // ノード id → 0 | 1 | null(不明)
@@ -292,8 +301,11 @@ function autoSave() {
 function loadGraph(compact, listValue = '', name = '') {
   graph = expandCircuit(compact);
   nextId = Math.max(0, ...graph.nodes.map((n) => n.id)) + 1;
-  selected = armed = null;
+  selection.clear();
+  armed = null;
   frames = [];
+  undoStack = [];
+  redoStack = [];              // 別の回路になったので手順は捨てる
   $('presets').value = listValue;
   $('cname').value = name;
   resetView();
@@ -355,8 +367,54 @@ const byId = (id) => graph.nodes.find((n) => n.id === id);
 const driverOf = (nodeId, port) =>
   graph.wires.find((w) => w.to.node === nodeId && w.to.port === port);
 
+// -------------------------------------------------------- 元に戻す / やり直し
+// スナップショットは保存形式 (packCircuit) をそのまま使う。回路まるごとを積むので
+// 差分を考えなくて済む。1 回路あたり数 KB なので 60 手ぶんでも軽い。
+const MAX_UNDO = 60;
+let undoStack = [];
+let redoStack = [];
+
+/** 変更を加える *前* に呼ぶ。drag のように事後になる操作は snap を渡す */
+function pushUndo(snap = packCircuit(graph)) {
+  undoStack.push(snap);
+  if (undoStack.length > MAX_UNDO) undoStack.shift();
+  redoStack = [];
+  updateEditUI();
+}
+
+function applySnapshot(snap) {
+  graph = expandCircuit(snap);
+  nextId = Math.max(0, ...graph.nodes.map((n) => n.id)) + 1;
+  selection.clear();
+  armed = null;
+  return rebuild();
+}
+
+function undo() {
+  if (undoStack.length === 0) { setMsg('これ以上戻せません', 'warn'); return; }
+  redoStack.push(packCircuit(graph));
+  applySnapshot(undoStack.pop());
+  updateEditUI();
+}
+
+function redo() {
+  if (redoStack.length === 0) { setMsg('やり直せる操作がありません', 'warn'); return; }
+  undoStack.push(packCircuit(graph));
+  applySnapshot(redoStack.pop());
+  updateEditUI();
+}
+
+function updateEditUI() {
+  $('undo').disabled = undoStack.length === 0;
+  $('redo').disabled = redoStack.length === 0;
+  $('copy').disabled = selection.size === 0;
+  $('del').disabled = selection.size === 0;
+  $('renameBtn').disabled = selection.size !== 1;
+}
+
 // ------------------------------------------------------------ 編集操作
 function addNode(type) {
+  pushUndo();
   // 入力は左・ゲートは中央・出力は右に、同種の数だけ下にずらして置く
   const same = graph.nodes.filter((n) => n.type === type).length;
   const col = type === 'in' ? 40 : type === 'out' ? CANVAS.w - W - 40 : 300;
@@ -367,28 +425,115 @@ function addNode(type) {
     value: 0,
   };
   graph.nodes.push(node);
-  selected = node.id;
+  selection = new Set([node.id]);
   rebuild();
 }
 
-function removeNode(id) {
-  graph.nodes = graph.nodes.filter((n) => n.id !== id);
-  graph.wires = graph.wires.filter((w) => w.from.node !== id && w.to.node !== id);
-  if (selected === id) selected = null;
-  if (armed && armed.node === id) armed = null;
+/** 選択している部品と、それに繋がる配線をまとめて消す */
+function removeSelection() {
+  if (selection.size === 0) return;
+  pushUndo();
+  graph.nodes = graph.nodes.filter((n) => !selection.has(n.id));
+  graph.wires = graph.wires.filter((w) => !selection.has(w.from.node) && !selection.has(w.to.node));
+  if (armed && selection.has(armed.node)) armed = null;
+  selection.clear();
   rebuild();
 }
 
 function connect(from, to) {
   if (from.node === to.node) return;                       // 自分自身へは繋がない
+  pushUndo();
   graph.wires = graph.wires.filter((w) => !(w.to.node === to.node && w.to.port === to.port));
   graph.wires.push({ from, to });                          // 入力端子は 1 本だけ (上書き)
   rebuild();
 }
 
 function disconnect(wire) {
+  pushUndo();
   graph.wires = graph.wires.filter((w) => w !== wire);
   rebuild();
+}
+
+// ------------------------------------------------------ コピーと貼り付け
+// クリップボードは localStorage にも置く。別のタブで開いた回路にも貼れる。
+const CLIP_KEY = 'verilog-wasm/clip';
+let clipboard = null;
+
+function readClip() {
+  if (clipboard) return clipboard;
+  try { return JSON.parse(localStorage.getItem(CLIP_KEY) ?? 'null'); } catch { return null; }
+}
+
+function copySelection() {
+  if (selection.size === 0) { setMsg('コピーする部品を選んでください', 'warn'); return false; }
+  // 選択の *中で閉じている* 配線だけを持っていく
+  clipboard = packCircuit({
+    nodes: graph.nodes.filter((n) => selection.has(n.id)),
+    wires: graph.wires.filter((w) => selection.has(w.from.node) && selection.has(w.to.node)),
+  });
+  try { localStorage.setItem(CLIP_KEY, JSON.stringify(clipboard)); } catch { /* 無くても動く */ }
+  setMsg(`部品 ${clipboard.nodes.length} 個 / 配線 ${clipboard.wires.length} 本をコピーしました`
+    + '（Ctrl+V で貼り付け）', '');
+  return true;
+}
+
+function cutSelection() {
+  if (copySelection()) removeSelection();
+}
+
+/** 名前が空くまで _2, _3 … を足す。コピーした端子名を活かすため */
+function freeName(base, taken) {
+  if (!taken.has(base)) return base;
+  for (let k = 2; k < 100; k++) {
+    if (!taken.has(`${base}_${k}`)) return `${base}_${k}`;
+  }
+  return undefined;
+}
+
+const PASTE_OFFSET = 28;
+
+function paste() {
+  const clip = readClip();
+  if (!clip?.nodes?.length) { setMsg('貼り付けるものがありません', 'warn'); return; }
+
+  let sub;
+  try { sub = expandCircuit(clip); } catch (e) {   // 別タブ由来の壊れたデータ避け
+    setMsg(`貼り付けられませんでした: ${e.message}`, 'err');
+    return;
+  }
+  pushUndo();
+
+  const taken = new Set(graph.nodes.map((n) => n.name).filter(Boolean));
+  const idMap = new Map();
+  const pasted = [];
+  for (const n of sub.nodes) {
+    const id = nextId++;
+    idMap.set(n.id, id);
+    const name = n.name ? freeName(n.name, taken) : undefined;
+    if (name) taken.add(name);
+    const node = {
+      ...n, id,
+      x: clamp(n.x + PASTE_OFFSET, 0, CANVAS.w - W),
+      y: clamp(n.y + PASTE_OFFSET, 0, CANVAS.h - H),
+    };
+    if (name) node.name = name; else delete node.name;
+    graph.nodes.push(node);
+    pasted.push(id);
+  }
+  for (const w of sub.wires) {
+    graph.wires.push({
+      from: { node: idMap.get(w.from.node), port: 0 },
+      to: { node: idMap.get(w.to.node), port: w.to.port },
+    });
+  }
+  selection = new Set(pasted);      // すぐドラッグして動かせるように選択しておく
+  rebuild();
+}
+
+function selectAll() {
+  selection = new Set(graph.nodes.map((n) => n.id));
+  render();
+  updateEditUI();
 }
 
 // ------------------------------------------------- コンパイル & 評価
@@ -434,6 +579,7 @@ async function rebuild() {
   evaluate('append');
   autoSave();          // 回路が変わるたびに編集中の内容を残す
   updateClockUI();
+  updateEditUI();
 }
 
 function updateClockUI() {
@@ -543,7 +689,7 @@ function render() {
   for (const n of graph.nodes) {
     const v = values.get(n.id);
     const cls = ['node'];
-    if (selected === n.id) cls.push('sel');
+    if (selection.has(n.id)) cls.push('sel');
     if (v === null) cls.push('dead');
     if (spec(n).reg) cls.push('reg');
     if (spec(n).konst) cls.push('konst');
@@ -602,21 +748,48 @@ function render() {
 
     g.addEventListener('pointerdown', (e) => {
       e.stopPropagation();
-      if (e.button !== 0) { selected = n.id; render(); return; }   // 右クリックは掴まない
-      selected = n.id;
+      if (e.button !== 0) {                                 // 右クリックは掴まない
+        selection = new Set([n.id]);
+        render(); updateEditUI();
+        return;
+      }
       armed = null;
+      if (e.shiftKey || e.ctrlKey || e.metaKey) {           // 選択に足す / 外す
+        selection.has(n.id) ? selection.delete(n.id) : selection.add(n.id);
+        render(); updateEditUI();
+        return;
+      }
+      // 選択外の部品を掴んだらそれ 1 個の選択に切り替える。選択内ならまとめて動かす
+      if (!selection.has(n.id)) selection = new Set([n.id]);
       const pt = toUser(e);
-      drag = { id: n.id, dx: pt.x - n.x, dy: pt.y - n.y, moved: false };
+      const from = new Map();
+      for (const id of selection) {
+        const m = byId(id);
+        if (m) from.set(id, { x: m.x, y: m.y });
+      }
+      drag = { ids: [...selection], from, sx: pt.x, sy: pt.y, moved: false, snap: packCircuit(graph) };
       svg.setPointerCapture(e.pointerId);
-      render();
+      render(); updateEditUI();
     });
     g.addEventListener('contextmenu', (e) => {
       e.preventDefault();
       e.stopPropagation();
+      selection = new Set([n.id]);
       startRename(n.id);
     });
   }
   $('rubber').setAttribute('d', '');
+  renderBand();
+}
+
+/** 範囲選択の矩形 */
+function renderBand() {
+  const r = $('band');
+  if (!band) { r.setAttribute('width', 0); r.setAttribute('height', 0); return; }
+  r.setAttribute('x', Math.min(band.x0, band.x1));
+  r.setAttribute('y', Math.min(band.y0, band.y1));
+  r.setAttribute('width', Math.abs(band.x1 - band.x0));
+  r.setAttribute('height', Math.abs(band.y1 - band.y0));
 }
 
 // ---------------------------------------------------------------- 波形
@@ -875,30 +1048,57 @@ function toUser(e) {
   return { x: p.x, y: p.y };
 }
 
-// 背景を押したら選択解除 + そのままドラッグでスクロール
+// 背景のドラッグは範囲選択。Shift (か中ボタン) を足すとスクロールになる。
 svg.addEventListener('pointerdown', (e) => {
-  selected = null;
   armed = null;
-  const ctm = svg.getScreenCTM();
-  pan = { sx: e.clientX, sy: e.clientY, x: view.x, y: view.y, k: 1 / ctm.a };
   svg.setPointerCapture(e.pointerId);
+  if (e.shiftKey || e.button === 1) {
+    const ctm = svg.getScreenCTM();
+    pan = { sx: e.clientX, sy: e.clientY, x: view.x, y: view.y, k: 1 / ctm.a };
+  } else {
+    const pt = toUser(e);
+    if (!(e.ctrlKey || e.metaKey)) selection.clear();     // Ctrl 付きなら今の選択に足す
+    band = { x0: pt.x, y0: pt.y, x1: pt.x, y1: pt.y, base: new Set(selection) };
+  }
   render();
+  updateEditUI();
 });
 
 svg.addEventListener('pointermove', (e) => {
   const pt = toUser(e);
   if (drag) {
-    const n = byId(drag.id);
-    if (!n) return;
-    n.x = clamp(pt.x - drag.dx, 0, CANVAS.w - W);
-    n.y = clamp(pt.y - drag.dy, 0, CANVAS.h - H);
-    drag.moved = true;
+    // 選択している部品をまとめて動かす。ずれ量は全部で共通なので端で止める分も共通
+    const dx = pt.x - drag.sx, dy = pt.y - drag.sy;
+    let lox = Infinity, hix = -Infinity, loy = Infinity, hiy = -Infinity;
+    for (const p of drag.from.values()) {
+      lox = Math.min(lox, p.x); hix = Math.max(hix, p.x);
+      loy = Math.min(loy, p.y); hiy = Math.max(hiy, p.y);
+    }
+    const ddx = clamp(dx, -lox, CANVAS.w - W - hix);
+    const ddy = clamp(dy, -loy, CANVAS.h - H - hiy);
+    for (const [id, p] of drag.from) {
+      const n = byId(id);
+      if (n) { n.x = p.x + ddx; n.y = p.y + ddy; }
+    }
+    if (Math.abs(dx) > 1 || Math.abs(dy) > 1) drag.moved = true;
     render();
   } else if (pan) {
     view.x = pan.x - (e.clientX - pan.sx) * pan.k;
     view.y = pan.y - (e.clientY - pan.sy) * pan.k;
     svg.classList.add('panning');
     applyView();
+  } else if (band) {
+    band.x1 = pt.x;
+    band.y1 = pt.y;
+    // 矩形に触れている部品を選ぶ (完全に囲まなくても掴める)
+    const x = Math.min(band.x0, band.x1), y = Math.min(band.y0, band.y1);
+    const x2 = Math.max(band.x0, band.x1), y2 = Math.max(band.y0, band.y1);
+    selection = new Set(band.base);
+    for (const n of graph.nodes) {
+      if (n.x <= x2 && n.x + W >= x && n.y <= y2 && n.y + H >= y) selection.add(n.id);
+    }
+    render();
+    updateEditUI();
   } else if (armed) {
     $('rubber').setAttribute('d', wirePath(pinPos(armed.node, 0, false), pt));
   }
@@ -906,10 +1106,14 @@ svg.addEventListener('pointermove', (e) => {
 
 svg.addEventListener('pointerup', (e) => {
   if (drag) {
-    const n = byId(drag.id);
+    const n = drag.ids.length === 1 ? byId(drag.ids[0]) : null;
+    if (drag.moved) {
+      pushUndo(drag.snap);                         // 動かす前の状態を積む
+      autoSave();
+    }
     // 動かさずに離した = クリック → 入力なら 0/1 反転
-    if (drag.moved) autoSave();                    // 位置も保存に含める
     if (!drag.moved && (n?.type === 'in' || n?.type === 'const')) {
+      if (n.type === 'const') pushUndo();
       n.value = n.value ? 0 : 1;
       n.type === 'in' ? inputChanged() : rebuild();   // 定数はリテラルなので作り直す
     }
@@ -917,6 +1121,7 @@ svg.addEventListener('pointerup', (e) => {
   svg.releasePointerCapture?.(e.pointerId);
   svg.classList.remove('panning');
   drag = pan = null;
+  if (band) { band = null; renderBand(); }
 });
 
 // ------------------------------------------------------ ペインの区切り
@@ -971,12 +1176,25 @@ window.addEventListener('resize', () => {
 
 window.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT') return;                   // 名前の入力中は何もしない
-  if (e.key === 'Escape') { armed = null; render(); }
+  const mod = e.ctrlKey || e.metaKey;
+  const key = e.key.toLowerCase();
+
+  if (mod) {
+    if (key === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
+    if (key === 'y') { e.preventDefault(); redo(); return; }
+    if (key === 'c') { e.preventDefault(); copySelection(); return; }
+    if (key === 'x') { e.preventDefault(); cutSelection(); return; }
+    if (key === 'v') { e.preventDefault(); paste(); return; }
+    if (key === 'a') { e.preventDefault(); selectAll(); return; }
+    return;                                                   // 他の Ctrl 系はブラウザに任せる
+  }
+
+  if (e.key === 'Escape') { armed = null; selection.clear(); render(); updateEditUI(); }
   if (e.key === ' ') { e.preventDefault(); clockOnce(); }     // スペースでクロック
-  if (e.key === 'F2' && selected !== null) { e.preventDefault(); startRename(selected); }
-  if ((e.key === 'Delete' || e.key === 'Backspace') && selected !== null) {
+  if (e.key === 'F2' && selection.size === 1) { e.preventDefault(); startRename([...selection][0]); }
+  if (e.key === 'Delete' || e.key === 'Backspace') {
     e.preventDefault();
-    removeNode(selected);
+    removeSelection();
   }
 });
 
@@ -1033,18 +1251,24 @@ $('share').onclick = async () => {
 };
 
 $('clear').onclick = () => {
+  if (graph.nodes.length) pushUndo();
   graph = { nodes: [], wires: [] };
-  selected = armed = null;
+  selection.clear();
+  armed = null;
   frames = [];
   $('stats').textContent = '';
   $('presets').value = '';
   rebuild();
 };
-$('del').onclick = () => { if (selected !== null) removeNode(selected); };
+$('del').onclick = removeSelection;
+$('undo').onclick = undo;
+$('redo').onclick = redo;
+$('copy').onclick = copySelection;
+$('pasteBtn').onclick = paste;
 $('fit').onclick = resetView;
 $('renameBtn').onclick = () => {
-  if (selected === null) setMsg('名前を変える部品を選んでください', 'warn');
-  else startRename(selected);
+  if (selection.size !== 1) setMsg('名前を変える部品を 1 個だけ選んでください', 'warn');
+  else startRename([...selection][0]);
 };
 $('clock').onclick = () => clockOnce(1);
 $('clockN').onclick = () => clockOnce(clamp(Number($('nclk').value) || 1, 1, 256));
