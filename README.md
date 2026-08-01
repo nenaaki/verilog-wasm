@@ -56,9 +56,20 @@ WebAssembly.instantiate → sim.js
 | [src/leb128.js](src/leb128.js) | LEB128・セクションエンコーダ | 59 |
 | [src/wat.js](src/wat.js) | WAT 出力（デバッグ用バックエンド） | 77 |
 | [src/interp.js](src/interp.js) | JS 参照実装（差分テスト用） | 73 |
-| [src/schematic.js](src/schematic.js) | 回路グラフ → Verilog・保存形式・階層の平坦化（GUI エディタ用フロントエンド） | 592 |
+| [src/schematic.js](src/schematic.js) | 回路グラフ → Verilog・保存形式・階層の平坦化（GUI エディタ用フロントエンド） | 416 |
+| [src/samples.js](src/samples.js) | エディタのサンプル回路（データ） | 185 |
 | [src/sim.js](src/sim.js) / [src/signals.js](src/signals.js) / [src/compile.js](src/compile.js) | 実行時グルー・エントリ | 178 |
-| **合計（コメント込み）** | | **1,888** |
+| **合計（コメント込み）** | | **1,897** |
+
+エディタ側は [web/editor.html](web/editor.html) に状態と操作を置き、状態を持たない部分を分けてある。
+
+| ファイル | 役割 | 行数 |
+| --- | --- | --- |
+| [web/dom.js](web/dom.js) | 要素を作る道具（SVG / HTML を取り違えないよう関数を分ける） | 21 |
+| [web/geometry.js](web/geometry.js) | 部品の寸法・端子の位置・配線のパス | 37 |
+| [web/storage.js](web/storage.js) | localStorage への出入り口 | 32 |
+| [web/wave.js](web/wave.js) | 波形の描画 | 65 |
+| [web/table.js](web/table.js) | 真理値表 / 状態遷移表の描画 | 87 |
 
 ## 対応している Verilog
 
@@ -208,6 +219,12 @@ ok   エラー検出
 ok   ランダム差分
 ok   WAT 出力
 ok   GUI 回路グラフ
+ok   メモリと回路グラフ
+ok   バレルシフタ
+ok   端子の名前
+ok   回路部品
+ok   保存形式
+ok   定数
 
 1199 件成功, 0 件失敗
 ```

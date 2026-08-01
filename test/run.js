@@ -11,9 +11,10 @@ import { compile, CompileError } from '../src/compile.js';
 import { WasmSimulator } from '../src/sim.js';
 import { RefSimulator } from '../src/interp.js';
 import {
-  SAMPLE_CIRCUITS, blockPorts, checkName, decodeCircuit, encodeCircuit, expandCircuit,
+  blockPorts, checkName, decodeCircuit, encodeCircuit, expandCircuit,
   flattenGraph, insOf, outsOf, packCircuit, toVerilog,
 } from '../src/schematic.js';
+import { SAMPLE_CIRCUITS } from '../src/samples.js';
 
 const MAX_DEPTH_TEST = 10;   // src 側の上限 (8) より深くする
 
@@ -495,7 +496,9 @@ async function testSchematic() {
         `回路グラフ ${name}: ${signal} が出力ポートにある`);
     }
   }
+}
 
+async function testBlockMemory() {
   // メモリは output reg として宣言され、暗黙のクロックが生える
   const mem = toVerilog(expandCircuit(SAMPLE_CIRCUITS['クロックで反転する 1 ビットメモリ']));
   ok(/^\s+input\s+clk,?$/m.test(mem.source), '回路グラフ: メモリを置くと clk が生える', mem.source);
@@ -520,7 +523,9 @@ async function testSchematic() {
   // メモリを挟んだフィードバックは組合せループにならない
   const looped = toVerilog(expandCircuit(SAMPLE_CIRCUITS['クロックで反転する 1 ビットメモリ']));
   eq(looped.incomplete.size, 0, '回路グラフ: メモリ経由の帰還は未完成にしない');
+}
 
+async function testBarrel() {
   // バレルシフタ: 論理左シフトになっていること (全 64 パターン × 4 ビット)
   const barrel = SAMPLE_CIRCUITS['4 ビットバレルシフタ (論理左シフト)'];
   const bs = toVerilog(expandCircuit(barrel));
@@ -543,7 +548,9 @@ async function testSchematic() {
     }
   }
   eq(mismatch, 0, 'バレルシフタ: 64 パターン × 4 ビットが論理左シフトと一致');
+}
 
+async function testPortNames() {
   // ---- 端子の名前 ----
   const named = toVerilog({
     nodes: [
@@ -585,7 +592,9 @@ async function testSchematic() {
   }
   ok(checkName('q_2$') === null, '名前: Verilog の識別子は通す');
   ok(checkName('q', new Set(['q'])) !== null, '名前: 重複を弾く');
+}
 
+async function testBlocks() {
   // ---- 回路部品 (block) ----
   // 半加算器を「保存した回路」に見立てて、2 個から全加算器を組む
   const halfDef = packCircuit(expandCircuit(SAMPLE_CIRCUITS['半加算器 (sum / carry)']));
@@ -724,7 +733,9 @@ async function testSchematic() {
   try { expandCircuit(deep); } catch (e) { deepErr = e; }
   ok(deepErr !== null && /入れ子/.test(deepErr.message), '部品: 深すぎる入れ子を弾く',
     deepErr?.message ?? '通ってしまった');
+}
 
+async function testSaveFormat() {
   // ---- 保存形式 (pack / expand / リンク) ----
   for (const [name, c] of Object.entries(SAMPLE_CIRCUITS)) {
     const g = expandCircuit(c);
@@ -794,7 +805,9 @@ async function testSchematic() {
   let brokenLink = null;
   try { decodeCircuit('これはbase64ではない###'); } catch (e) { brokenLink = e; }
   ok(brokenLink !== null, '保存形式: 壊れたリンクを弾く');
+}
 
+async function testConstants() {
   // ---- 定数 ----
   const konst = toVerilog({
     nodes: [
@@ -873,6 +886,12 @@ const suites = [
   ['ランダム差分', testRandomDiff],
   ['WAT 出力', testWat],
   ['GUI 回路グラフ', testSchematic],
+  ['メモリと回路グラフ', testBlockMemory],
+  ['バレルシフタ', testBarrel],
+  ['端子の名前', testPortNames],
+  ['回路部品', testBlocks],
+  ['保存形式', testSaveFormat],
+  ['定数', testConstants],
 ];
 
 for (const [label, fn] of suites) {

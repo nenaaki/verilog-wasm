@@ -251,20 +251,20 @@
 import { compile, CompileError } from '../src/compile.js';
 import { WasmSimulator } from '../src/sim.js';
 import {
-  CLOCK, PARTS, SAMPLE_CIRCUITS, blockPorts, checkName, decodeCircuit, encodeCircuit,
+  CLOCK, PARTS, blockPorts, checkName, decodeCircuit, encodeCircuit,
   expandCircuit, insOf, outsOf, packCircuit, toVerilog,
 } from '../src/schematic.js';
-import { LANES } from '../src/signals.js';
+import { SAMPLE_CIRCUITS } from '../src/samples.js';
+import { el, hel, $ } from './dom.js';
+import {
+  BLOCK_PAD, BLOCK_W, CANVAS, H, PIN_PITCH, W,
+  clamp, inPin, outPin, pinYs, sizeOf, wirePath,
+} from './geometry.js';
+import { readClip, readSaved, readWork, writeClip, writeSaved, writeWork } from './storage.js';
+import { WAVE, renderWave as drawWave } from './wave.js';
+import { MAX_TABLE_BITS, renderTable as drawTable } from './table.js';
 
-const W = 68, H = 44;              // ふつうの部品の箱のサイズ
-const BLOCK_W = 120;               // 回路部品の箱の幅
-const PIN_PITCH = 22, BLOCK_PAD = 13;
-const CANVAS = { w: 900, h: 480 };
-const MAX_TABLE_BITS = 6;          // 2^6 = 64 = レーン数。入力 + メモリの合計ビット数
-
-const $ = (id) => document.getElementById(id);
 const svg = $('svg');
-const SVGNS = 'http://www.w3.org/2000/svg';
 
 // ------------------------------------------------------------------ 状態
 let graph = { nodes: [], wires: [] };
@@ -284,30 +284,14 @@ let frames = [];                  // 波形の列 [{label, v:{信号名: 0|1|nul
 
 // 表示範囲 (viewBox)。Ctrl + ホイールで拡大縮小、背景ドラッグでスクロールする
 const view = { x: 0, y: 0, w: CANVAS.w, h: CANVAS.h };
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 // ------------------------------------------------- 回路の読み込みと保存
-// サンプルの定義は src/schematic.js 側にある (テストからも使うため)。
+// サンプルの定義は src/schematic.js 側 (テストからも使うため)、
+// localStorage への出入りは web/storage.js 側にある。
 // 保存した回路もサンプルと同じ圧縮形式なので、読み込み経路は 1 本で足りる。
-const STORE_KEY = 'verilog-wasm/saved';    // 名前 → 圧縮形式
-const WORK_KEY = 'verilog-wasm/work';      // 編集中の回路 (自動保存)
-
-function readSaved() {
-  try {
-    const o = JSON.parse(localStorage.getItem(STORE_KEY) ?? '{}');
-    return o && typeof o === 'object' ? o : {};
-  } catch { return {}; }               // 壊れていたら無かったことにする
-}
-
-function writeSaved(all) {
-  try { localStorage.setItem(STORE_KEY, JSON.stringify(all)); return true; }
-  catch { return false; }              // localStorage が使えない / 容量オーバー
-}
 
 /** 編集中の回路を黙って残す。次に開いたとき続きから始められる */
-function autoSave() {
-  try { localStorage.setItem(WORK_KEY, JSON.stringify(packCircuit(graph))); } catch { /* 諦める */ }
-}
+const autoSave = () => writeWork(packCircuit(graph));
 
 function loadGraph(compact, listValue = '', name = '') {
   graph = expandCircuit(compact);
@@ -373,26 +357,8 @@ function loadFromList(value) {
 }
 
 // ------------------------------------------------------------ ジオメトリ
+// 寸法の計算そのものは web/geometry.js にある (状態を持たないので)
 const spec = (n) => PARTS[n.type];
-
-/** 入力端子の座標 (ノードローカル) */
-/** 部品の箱の大きさ。回路部品だけ端子の数で縦に伸びる */
-function sizeOf(node) {
-  if (node.type !== 'block') return { w: W, h: H };
-  const rows = Math.max(insOf(node), outsOf(node), 1);
-  return { w: BLOCK_W, h: Math.max(H, 2 * BLOCK_PAD + (rows - 1) * PIN_PITCH) };
-}
-
-/** 端子を縦に並べた位置 */
-function pinYs(node, count) {
-  const h = sizeOf(node).h;
-  if (node.type !== 'block') return count === 1 ? [h / 2] : [h * 0.3, h * 0.7];
-  const top = (h - (count - 1) * PIN_PITCH) / 2;
-  return Array.from({ length: count }, (_, i) => top + i * PIN_PITCH);
-}
-
-const inPin = (node, port) => ({ x: 0, y: pinYs(node, insOf(node))[port] });
-const outPin = (node, port) => ({ x: sizeOf(node).w, y: pinYs(node, outsOf(node))[port] });
 
 function pinPos(nodeId, port, isInput) {
   const n = byId(nodeId);
@@ -400,9 +366,29 @@ function pinPos(nodeId, port, isInput) {
   return { x: n.x + p.x, y: n.y + p.y };
 }
 
-const byId = (id) => graph.nodes.find((n) => n.id === id);
-const driverOf = (nodeId, port) =>
-  graph.wires.find((w) => w.to.node === nodeId && w.to.port === port);
+// 部品と配線の索引。描画は配線ごと・端子ごとに引くので、線形探索だと二乗になる。
+// 索引は「配列そのものが差し替わった」か「長さが変わった」のを見て作り直す。
+// 中身の書き換え (座標や値) は同じオブジェクトを指したままなので張り替えは要らない。
+let nodeIdx = { arr: null, map: new Map() };
+let wireIdx = { arr: null, map: new Map() };
+
+function byId(id) {
+  if (nodeIdx.arr !== graph.nodes || nodeIdx.map.size !== graph.nodes.length) {
+    nodeIdx = { arr: graph.nodes, map: new Map(graph.nodes.map((n) => [n.id, n])) };
+  }
+  return nodeIdx.map.get(id);
+}
+
+/** その入力端子を駆動している配線 */
+function driverOf(nodeId, port) {
+  if (wireIdx.arr !== graph.wires || wireIdx.map.size !== graph.wires.length) {
+    wireIdx = {
+      arr: graph.wires,
+      map: new Map(graph.wires.map((w) => [`${w.to.node}:${w.to.port}`, w])),
+    };
+  }
+  return wireIdx.map.get(`${nodeId}:${port}`);
+}
 
 // -------------------------------------------------------- 元に戻す / やり直し
 // スナップショットは保存形式 (packCircuit) をそのまま使う。回路まるごとを積むので
@@ -493,13 +479,7 @@ function disconnect(wire) {
 
 // ------------------------------------------------------ コピーと貼り付け
 // クリップボードは localStorage にも置く。別のタブで開いた回路にも貼れる。
-const CLIP_KEY = 'verilog-wasm/clip';
-let clipboard = null;
-
-function readClip() {
-  if (clipboard) return clipboard;
-  try { return JSON.parse(localStorage.getItem(CLIP_KEY) ?? 'null'); } catch { return null; }
-}
+let clipboard = null;   // このタブでコピーしたもの (無ければ localStorage を見る)
 
 function copySelection() {
   if (selection.size === 0) { setMsg('コピーする部品を選んでください', 'warn'); return false; }
@@ -508,7 +488,7 @@ function copySelection() {
     nodes: graph.nodes.filter((n) => selection.has(n.id)),
     wires: graph.wires.filter((w) => selection.has(w.from.node) && selection.has(w.to.node)),
   });
-  try { localStorage.setItem(CLIP_KEY, JSON.stringify(clipboard)); } catch { /* 無くても動く */ }
+  writeClip(clipboard);
   setMsg(`部品 ${clipboard.nodes.length} 個 / 配線 ${clipboard.wires.length} 本をコピーしました`
     + '（Ctrl+V で貼り付け）', '');
   return true;
@@ -530,7 +510,7 @@ function freeName(base, taken) {
 const PASTE_OFFSET = 28;
 
 function paste() {
-  const clip = readClip();
+  const clip = clipboard ?? readClip();
   if (!clip?.nodes?.length) { setMsg('貼り付けるものがありません', 'warn'); return; }
 
   let sub;
@@ -767,31 +747,6 @@ function setMsg(text, cls) {
 }
 
 // ---------------------------------------------------------------- 描画
-function el(tag, attrs, parent) {
-  const e = document.createElementNS(SVGNS, tag);
-  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
-  parent?.appendChild(e);
-  return e;
-}
-
-/** 真理値表用。SVG 名前空間で tr/td を作ると表として描画されないので分けてある */
-function hel(tag, parent, className) {
-  const e = document.createElement(tag);
-  if (className) e.className = className;
-  parent?.appendChild(e);
-  return e;
-}
-
-function wirePath(a, b) {
-  if (b.x - a.x < 12) {
-    // 右から左へ戻る配線 (フィードバック)。素直に引くと部品の裏に隠れるので上に膨らませる
-    const d = Math.max(70, (a.x - b.x) * 0.35);
-    return `M ${a.x} ${a.y} C ${a.x + d} ${a.y - d}, ${b.x - d} ${b.y - d}, ${b.x} ${b.y}`;
-  }
-  const dx = Math.max(30, (b.x - a.x) * 0.5);
-  return `M ${a.x} ${a.y} C ${a.x + dx} ${a.y}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`;
-}
-
 function render() {
   const gw = $('gWires'), gn = $('gNodes');
   gw.textContent = ''; gn.textContent = '';
@@ -939,8 +894,6 @@ function renderBand() {
 // ---------------------------------------------------------------- 波形
 // 1 列 = クロック 1 回。組合せ回路にはクロックがないので、入力を変えるたびに 1 列進める。
 // メモリのある回路では入力の変化は「同じサイクル内の出来事」なので今の列を書き換える。
-const WAVE = { colW: 26, rowH: 24, top: 16, nameW: 116, max: 256 };
-
 function sample(append) {
   const v = {};
   for (const n of graph.nodes) {
@@ -974,60 +927,7 @@ function waveRows() {
 }
 
 function renderWave() {
-  const names = $('waveNames'), svg2 = $('waveSvg');
-  names.textContent = svg2.textContent = '';
-  const rows = waveRows();
-  const cols = frames.length;
-  $('waveInfo').textContent = cols
-    ? `${cols} 列 / ${rows.length} 信号${hasRegs() ? '（1 列 = 1 クロック）' : '（1 列 = 入力を変えた回数）'}`
-    : '';
-
-  const h = WAVE.top + rows.length * WAVE.rowH + 6;
-  names.setAttribute('width', WAVE.nameW);
-  names.setAttribute('height', h);
-  svg2.setAttribute('width', Math.max(cols * WAVE.colW + 8, 40));
-  svg2.setAttribute('height', h);
-
-  if (rows.length === 0 || cols === 0) {
-    el('text', { class: 'note', x: 8, y: 20 }, svg2).textContent =
-      sim ? 'クロックを打つか入力を変えると波形が出ます' : '';
-    return;
-  }
-
-  rows.forEach((r, i) => {
-    const y = WAVE.top + i * WAVE.rowH;
-    const t = el('text', { class: r.kind, x: 8, y: y + WAVE.rowH / 2 }, names);
-    t.textContent = r.name;
-    el('line', { class: 'lane', x1: 0, y1: y, x2: cols * WAVE.colW, y2: y }, svg2);
-  });
-
-  // 列の境界とサイクル番号
-  for (let c = 0; c < cols; c++) {
-    const x = c * WAVE.colW;
-    el('line', { class: 'edge', x1: x, y1: WAVE.top, x2: x, y2: h - 6 }, svg2);
-    if (cols <= 40 || c % 4 === 0) {
-      el('text', { class: 'cyc', x: x + WAVE.colW / 2, y: 9 }, svg2).textContent = frames[c].label;
-    }
-  }
-
-  // 各信号の階段波形。値が不明な区間は破線で中央に引く
-  rows.forEach((r, i) => {
-    const y = WAVE.top + i * WAVE.rowH;
-    const hi = y + 5, lo = y + WAVE.rowH - 7, mid = (hi + lo) / 2;
-    const level = (c) => { const v = frames[c].v[r.name]; return v === null || v === undefined ? mid : v ? hi : lo; };
-    const unknown = frames.some((f) => f.v[r.name] === null || f.v[r.name] === undefined);
-    let d = `M 0 ${level(0)}`;
-    for (let c = 0; c < cols; c++) {
-      d += ` L ${c * WAVE.colW} ${level(c)} L ${(c + 1) * WAVE.colW} ${level(c)}`;
-    }
-    // data-bits は目で見る用ではなく、テストと動作確認から値を読むためのもの
-    const bits = frames.map((f) => (f.v[r.name] ?? 'x')).join('');
-    el('path', {
-      class: `sig ${unknown ? 'unknown' : ''}`, d, 'data-sig': r.name, 'data-bits': bits,
-    }, svg2);
-  });
-
-  $('waveScroll').scrollLeft = $('waveScroll').scrollWidth;
+  drawWave(frames, waveRows(), { perClock: hasRegs(), ready: !!sim });
 }
 
 // ------------------------------------------------ 真理値表 / 状態遷移表
@@ -1037,86 +937,7 @@ function renderWave() {
 // メモリがある回路では「入力 + 現在の Q」を並べて、出力と次の Q を読む。
 // 出力は commit の前・次の Q は commit の後に読む必要があるので順番が要る。
 function renderTable() {
-  const t = $('truth');
-  t.textContent = '';
-  const outs = plan?.outputs.filter((o) => o.kind === 'out') ?? [];
-  const regs = plan?.regs ?? [];
-  $('tableHead').textContent = regs.length
-    ? '状態遷移表（64 レーン同時評価で 1 クロックから作成）'
-    : '真理値表（64 レーン同時評価で 1 回の eval から作成）';
-
-  if (!sim || (outs.length === 0 && regs.length === 0)) {
-    setNote(t, sim ? '出力部品かメモリを置くと表が出ます' : '');
-    return;
-  }
-  const dims = [...plan.inputs, ...regs];      // 表の行を決める 1 ビットの軸
-  if (dims.length > MAX_TABLE_BITS) {
-    setNote(t, `入力とメモリで ${dims.length} ビット `
-      + `(64 レーンに収まるのは ${MAX_TABLE_BITS} ビットまで)`);
-    return;
-  }
-
-  const saved = regs.map((r) => Number(sim.get(r.name)));
-  const rows = 1 << dims.length;
-  for (let lane = 0; lane < LANES; lane++) {
-    const pat = lane < rows ? lane : 0;
-    dims.forEach((d, b) => sim.setInputLane(d.name, lane, (pat >> b) & 1));
-  }
-  sim.eval();
-  const outCols = outs.map((o) => sim.getLanes(o.name));      // 現在の状態での出力
-  let nextCols = [];
-  if (regs.length) {
-    sim.commit();
-    sim.eval();
-    nextCols = regs.map((r) => sim.getLanes(r.name));         // クロック後の Q
-  }
-
-  const head = hel('tr', t);
-  for (const d of dims) hel('th', head).textContent = d.name;
-  hel('th', head, 'gap');
-  for (const r of regs) hel('th', head).textContent = `${r.name}'`;
-  for (const o of outs) hel('th', head).textContent = o.name;
-
-  // 今の入力とメモリの値が何行目かを求めて、その行に印を付ける
-  let now = 0;
-  dims.forEach((d, b) => {
-    const n = byId(d.node);
-    const v = n?.type === 'in' ? (n.value ? 1 : 0) : saved[regs.indexOf(d)];
-    if (v) now |= 1 << b;
-  });
-
-  let nowRow = null;
-  for (let r = 0; r < rows; r++) {
-    const tr = hel('tr', t, r === now ? 'now' : '');
-    if (r === now) nowRow = tr;
-    dims.forEach((_, b) => {
-      const v = (r >> b) & 1;
-      hel('td', tr, v ? 'one' : 'zero').textContent = v;
-    });
-    hel('td', tr, 'gap');
-    for (const lanes of [...nextCols, ...outCols]) {
-      const v = Number(lanes[r]);
-      hel('td', tr, v ? 'one' : 'zero').textContent = v;
-    }
-  }
-  nowRow?.scrollIntoView({ block: 'nearest' });   // 64 行あると印が画面外に行くので
-
-  restoreState(saved);
-}
-
-/** 表を作るのにレーンを汚したので、GUI の入力値とメモリの中身を書き戻す */
-function restoreState(savedRegs) {
-  (plan.regs ?? []).forEach((r, i) => sim.setInput(r.name, savedRegs[i]));
-  for (const i of plan.inputs) sim.setInput(i.name, byId(i.node).value ? 1 : 0);
-  sim.eval();
-}
-
-function setNote(table, text) {
-  if (!text) return;
-  const td = hel('td', hel('tr', table));
-  td.textContent = text;
-  td.style.color = 'var(--dim)';
-  td.style.border = '0';
+  drawTable(plan, sim, (nodeId) => (byId(nodeId)?.value ? 1 : 0));
 }
 
 // ------------------------------------------------------ 端子の名前を変える
@@ -1466,8 +1287,7 @@ async function openInitial() {
   if (hit) {
     await loadFromList(`s:${hit}`);
   } else {
-    let work = null;
-    try { work = JSON.parse(localStorage.getItem(WORK_KEY) ?? 'null'); } catch { /* 壊れていた */ }
+    const work = readWork();
     if (work?.nodes?.length) await loadGraph(work, '', '');
     else await loadFromList(`s:${names[0]}`);
   }
