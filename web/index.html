@@ -227,7 +227,7 @@ endmodule`,
 
   assign shr = packed >> 2;
 
-  assign rotl = (packed << amt) | (packed >> (8 - amt));
+  assign rotl = (packed << amt) | (packed >> (4'd8 - amt));
 endmodule`,
 
   'cmp4 — 4bit マグニチュードコンパレータ': `module cmp4(

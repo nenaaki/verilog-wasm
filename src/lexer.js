@@ -24,6 +24,11 @@ const PUNCT3_REJECT = {
 
 const RADIX = { b: 2, o: 8, d: 10, h: 16 };
 
+// サイズを書かないリテラル (`10` や `'hFF`) の幅。Verilog では integer と同じ
+// 32 ビットになる。値が収まる最小幅にすると、文脈幅が配られない位置 (シフト量など)
+// で `1 + 1` が 1 ビット幅の 0 になってしまい、Verilog と食い違う。
+const UNSIZED_WIDTH = 32;
+
 /** @returns {{type:'ident'|'num'|'punct'|'eof', value:string, line:number, width?:number, bits?:bigint}[]} */
 export function lex(src) {
   const tokens = [];
@@ -51,7 +56,7 @@ export function lex(src) {
       continue;
     }
 
-    // 8'hFF / 1'b0 / 4'd10 のようなサイズ付きリテラル
+    // 8'hFF / 1'b0 / 4'd10 のような基数付きリテラル (サイズは省略可)
     RE_SIZED.lastIndex = i;
     const sized = RE_SIZED.exec(src);
     if (sized) {
@@ -64,7 +69,7 @@ export function lex(src) {
         if (Number.isNaN(v)) throw new CompileError(`基数 ${radix} に対して不正な桁 '${d}'`, line);
         value = value * BigInt(radix) + BigInt(v);
       }
-      const width = widthStr ? parseInt(widthStr, 10) : Math.max(1, value.toString(2).length);
+      const width = widthStr ? parseInt(widthStr, 10) : UNSIZED_WIDTH;
       if (width < 1 || width > 4096) throw new CompileError(`ビット幅 ${width} が不正`, line);
       tokens.push({ type: 'num', value: raw, line, width, bits: value });
       i += raw.length;
@@ -81,7 +86,7 @@ export function lex(src) {
         type: 'num',
         value: raw,
         line,
-        width: Math.max(1, value.toString(2).length),
+        width: UNSIZED_WIDTH,
         bits: value,
         plain: Number(value),
       });

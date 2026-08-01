@@ -286,8 +286,9 @@ endmodule`;
         widened: a < b ? 1 : 0,
         prec1: (a < b ? 1 : 0) === 1 ? 1 : 0,
         prec2: a & 1,
-        // 比較のオペランドは自己決定なので a + 1 は 4 ビットで計算される
-        prec3: ((a + 1) & 15) <= b ? 1 : 0,
+        // 比較のオペランドは外の文脈を受け取らないが、サイズ無しの 1 が 32 ビット
+        // なので両辺が 32 ビットに揃い、a + 1 は折り返さない
+        prec3: (a + 1) <= b ? 1 : 0,
       };
       for (const [port, want] of Object.entries(expect)) {
         for (const sim of [w2, r2]) {
@@ -553,6 +554,50 @@ endmodule`;
     eq(sim.get('sum'), 16, `${kind} 文脈依存幅: 4'hFF + 4'h1 は 8 ビット文脈で 16`);
   }
 
+  // サイズ無しリテラルは 32 ビット (Verilog の integer と同じ)。文脈が配られない
+  // 位置でも折り返さない。
+  const unsized = `module u(input [3:0] a, input [3:0] b,
+    output [7:0] shiftAmt, output [7:0] noWrap, output cmp32, output [31:0] max32, output [7:0] based);
+    assign shiftAmt = a << (1 + 1);     // 1 + 1 = 2
+    assign noWrap   = a << (15 + 1);    // 15 + 1 = 16。4 ビットで折り返さないので全部押し出される
+    assign cmp32    = a + 1 <= b;       // 両辺が 32 ビットに揃うので a + 1 も折り返さない
+    assign max32    = 4294967295;       // 32 ビットに収まる最大値
+    assign based    = 'h5A;             // サイズ無しの基数付きリテラルも 32 ビット
+  endmodule`;
+  const { all: us } = await bothSims(unsized);
+  for (const sim of us) {
+    const kind = sim.constructor.name;
+    sim.setInput('a', 5).setInput('b', 0).eval();
+    eq(sim.get('shiftAmt'), 20, `${kind} リテラル幅: a << (1 + 1) は 5 << 2`);
+    eq(sim.get('noWrap'), 0, `${kind} リテラル幅: a << (15 + 1) は 16 ビットぶん押し出される`);
+    eq(sim.get('max32'), 4294967295, `${kind} リテラル幅: 32 ビットの最大値が入る`);
+    eq(sim.get('based'), 0x5a, `${kind} リテラル幅: サイズ無しの 'h5A も読める`);
+    sim.setInput('a', 15).setInput('b', 0).eval();
+    eq(sim.get('cmp32'), 0, `${kind} リテラル幅: 15 + 1 <= 0 は偽 (折り返さない)`);
+    sim.setInput('a', 1).setInput('b', 2).eval();
+    eq(sim.get('cmp32'), 1, `${kind} リテラル幅: 1 + 1 <= 2 は真`);
+  }
+
+  // 32 ビットで計算しても、届かないぶんは刈り取られるのでゲートは増えない
+  const plus1 = compile('module m(input clk, output reg [7:0] q); always @(posedge clk) q <= q + 1; endmodule');
+  const plus1Sized = compile("module m(input clk, output reg [7:0] q); always @(posedge clk) q <= q + 8'd1; endmodule");
+  eqs(plus1.stats.gates, plus1Sized.stats.gates,
+    'リテラル幅: q + 1 と q + 8\'d1 でゲート数が同じ (上位ビットは刈られる)',
+    `サイズ無し=${plus1.stats.gates} サイズ付き=${plus1Sized.stats.gates} pruned=${plus1.stats.pruned}`);
+  ok(plus1.stats.pruned > plus1Sized.stats.pruned,
+    'リテラル幅: サイズ無しのほうが刈り取り量が多い',
+    `${plus1.stats.pruned} vs ${plus1Sized.stats.pruned}`);
+
+  // ただしシフト量の式に使うと刈り取りが効かない。バレルシフタは「幅を超えたか」の
+  // 判定で全ビットを見るので、32 ビット減算器がまるごと生きてしまう。
+  // 例題 shifter.v が 4'd8 とサイズを書いているのはこのため。
+  const amtUnsized = compile('module m(input [7:0] p, input [2:0] s, output [7:0] y); assign y = p >> (8 - s); endmodule');
+  const amtSized = compile("module m(input [7:0] p, input [2:0] s, output [7:0] y); assign y = p >> (4'd8 - s); endmodule");
+  eqs(amtUnsized.stats.pruned, 0, 'リテラル幅: シフト量の 32 ビット減算器は刈り取れない');
+  ok(amtUnsized.stats.gates > amtSized.stats.gates * 3,
+    'リテラル幅: シフト量にサイズを書かないと 3 倍以上高くつく',
+    `サイズ無し=${amtUnsized.stats.gates} サイズ付き=${amtSized.stats.gates}`);
+
   // 加算の桁上げも「代入先を 1 ビット広くする」で受けられる
   const carry = `module c(input [3:0] a, input [3:0] b, output [3:0] s4, output [4:0] s5);
     assign s4 = a + b;
@@ -717,7 +762,7 @@ async function testShift() {
   output [3:0] vl, output [3:0] vr,
   output [3:0] vlWide, output [3:0] vrWide,
   output [7:0] prec1, output prec2,
-  output [7:0] litAmt, output [7:0] sizedAmt
+  output [7:0] litAmt, output [7:0] sizedAmt, output [7:0] wrapAmt
 );
   assign l1 = a << 1;
   assign l2 = a << 2;
@@ -734,8 +779,9 @@ async function testShift() {
   assign vrWide = a >> wideAmt;
   assign prec1 = a + 1 << 2;           // 算術が先 → (a+1) << 2。8 ビット文脈で計算
   assign prec2 = a << 1 < amt;         // シフトが先 → (a<<1) < amt。比較の辺は自己決定
-  assign litAmt = a << (1 + 1);        // シフト量は自己決定。1 は 1 ビット幅なので 1+1 は 0
-  assign sizedAmt = a << (2'd1 + 2'd1);   // サイズ付きなら 2 ビットで 2
+  assign litAmt = a << (1 + 1);           // サイズ無しリテラルは 32 ビットなので 1+1 = 2
+  assign sizedAmt = a << (2'd1 + 2'd1);   // サイズ付きの 2 ビットでも 2
+  assign wrapAmt = a << (15 + 1);         // 15+1 = 16。4 ビットで折り返さないので全部押し出される
 endmodule`;
   const { wasm, ref } = await bothSims(src);
 
@@ -762,8 +808,9 @@ endmodule`;
           vrWide: wideAmt >= 4 ? 0 : (a >> wideAmt) & 15,
           prec1: ((a + 1) << 2) & 255,   // 8 ビット文脈が a+1 にも配られる
           prec2: ((a << 1) & 15) < amt ? 1 : 0,
-          litAmt: a & 255,               // 1 + 1 が 1 ビットで 0 になるのでシフトされない
+          litAmt: (a << 2) & 255,
           sizedAmt: (a << 2) & 255,
+          wrapAmt: 0,
         };
         for (const [port, want] of Object.entries(expect)) {
           for (const sim of [wasm, ref]) {
@@ -788,11 +835,11 @@ endmodule`;
   eq(wasm.get('vlWide'), 4, 'シフト: 信号の量でも同じ (4 ビット文脈)');
   eq(wasm.get('concatPack'), 0x55, 'シフト: 連接は文脈に関係なく 8 ビット');
 
-  // サイズ無し整数リテラルの幅は Verilog の 32 ビットではなく最小幅にしてある。
-  // 文脈が配られない位置 (シフト量) で足し算すると差が出る。意図した割り切りなので
-  // 固定しておく (README「サイズ無しリテラルの幅」参照)。
-  eq(wasm.get('litAmt'), 5, 'リテラル幅: a << (1 + 1) は 1+1 が 1 ビットなのでシフトされない');
-  eq(wasm.get('sizedAmt'), 20, 'リテラル幅: サイズ付きの 2\'d1 + 2\'d1 なら 2 になる');
+  // シフト量は文脈が配られない位置なので、リテラルの幅がそのまま効く。
+  // サイズ無しリテラルは 32 ビットなので 1 + 1 は折り返さず 2 になる。
+  eq(wasm.get('litAmt'), 20, 'リテラル幅: a << (1 + 1) は 5 << 2 = 20');
+  eq(wasm.get('sizedAmt'), 20, 'リテラル幅: サイズ付きの 2\'d1 + 2\'d1 も同じ');
+  eq(wasm.get('wrapAmt'), 0, 'リテラル幅: 15 + 1 は 4 ビットで折り返さず 16 になる');
 
   // バレルシフタの段数。定数シフト版との差が mux のぶんそのものになる
   const barrel = compile('module m(input [7:0] a, input [2:0] s, output [7:0] y); assign y = a << s; endmodule');
