@@ -1085,6 +1085,72 @@ endmodule`;
   eq(cw.get('s5'), 16, '文脈依存幅: 5 ビットなら桁上げが残って 16');
 }
 
+// ------------------------------------------------------------------ ALU
+//
+// case の書き方 (複数ラベル・default) と、単項マイナス・中置 XNOR をまとめて通す。
+async function testAlu() {
+  const { all } = await bothSims(example('alu4.v'));
+  for (const sim of all) {
+    const kind = sim.constructor.name;
+    let bad = null;
+    for (const [a, b] of [[9, 5], [0, 0], [15, 1], [7, 7], [3, 12]]) {
+      const want = [
+        (a + b) & 15, (a - b) & 15, a & b, a | b, (-a) & 15,
+        (~(a ^ b)) & 15, (~(a ^ b)) & 15, 0,
+      ];
+      for (let op = 0; op < 8; op++) {
+        sim.reset().setInput('a', a).setInput('b', b).setInput('op', op).step();
+        if (Number(sim.get('y')) !== want[op] && !bad) {
+          bad = `op=${op} a=${a} b=${b} 期待 ${want[op]} / 実際 ${sim.get('y')}`;
+        }
+        if (Number(sim.get('eq')) !== (a === b ? 1 : 0) && !bad) {
+          bad = `eq: a=${a} b=${b} 実際 ${sim.get('eq')}`;
+        }
+      }
+    }
+    ok(!bad, `${kind} alu4: 8 演算 × 5 組が一致`, bad ?? '');
+  }
+
+  // default に落ちるのは 3'd7 だけ、3'd5 と 3'd6 は同じ結果 (複数ラベル)
+  const sim = (await bothSims(example('alu4.v'))).all[0];
+  sim.reset().setInput('a', 9).setInput('b', 5).setInput('op', 5).step();
+  const at5 = sim.get('y');
+  sim.reset().setInput('a', 9).setInput('b', 5).setInput('op', 6).step();
+  eq(sim.get('y'), at5, 'alu4: 複数ラベルはどちらも同じ結果');
+  sim.reset().setInput('a', 9).setInput('b', 5).setInput('op', 7).step();
+  eq(sim.get('y'), 0, 'alu4: 残りは default に落ちる');
+}
+
+// ---------------------------------------------------- 非 ANSI と多入力ゲート
+async function testOnehot() {
+  const { compiled, all } = await bothSims(example('onehot.v'));
+  eqs(compiled.warnings.length, 0, 'onehot: 未駆動の警告なし', compiled.warnings.join(' / '));
+  for (const sim of all) {
+    const kind = sim.constructor.name;
+    let bad = null;
+    for (let v = 0; v < 8; v++) {
+      const a = v & 1;
+      const b = (v >> 1) & 1;
+      const c = (v >> 2) & 1;
+      sim.setInput('a', a).setInput('b', b).setInput('c', c).eval();
+      const n = a + b + c;
+      const expect = {
+        any: n > 0 ? 1 : 0,
+        all: n === 3 ? 1 : 0,
+        none: n === 0 ? 1 : 0,
+        exactly: n === 1 ? 1 : 0,
+        copy: a,
+      };
+      for (const [port, want] of Object.entries(expect)) {
+        if (Number(sim.get(port)) !== want && !bad) {
+          bad = `${port}: a=${a} b=${b} c=${c} 期待 ${want} / 実際 ${sim.get(port)}`;
+        }
+      }
+    }
+    ok(!bad, `${kind} onehot: 非 ANSI ポート + 3 入力ゲートが全 8 通り一致`, bad ?? '');
+  }
+}
+
 // ---------------------------------------------------------- リダクション演算子
 //
 // 全ビットを 1 個に畳むので、幅が奇数か偶数かで XNOR 系の答えが変わる。
@@ -2886,6 +2952,8 @@ const suites = [
   ['畳み込み / CSE', testFoldCse],
   ['刈り取り', testPrune],
   ['比較器', testCompare],
+  ['ALU (case の書き方)', testAlu],
+  ['非 ANSI と多入力ゲート', testOnehot],
   ['リダクション', testReduce],
   ['論理演算子', testLogical],
   ['範囲判定', testWindow],

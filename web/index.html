@@ -198,6 +198,41 @@ endmodule`,
     else if (en) q <= q + 1;
 endmodule`,
 
+  'alu4 — 4bit ALU (case の複数ラベルと default)': `module alu4(
+  input clk,
+  input [2:0] op,
+  input [3:0] a,
+  input [3:0] b,
+  output reg [3:0] y,
+  output reg eq
+);
+  always @(posedge clk) begin
+    eq <= (a == b);
+
+    case (op)
+      3'd0: y <= a + b;
+      3'd1: y <= a - b;
+      3'd2: y <= a & b;
+      3'd3: y <= a | b;
+      3'd4: y <= -a;
+      3'd5, 3'd6: y <= a ~^ b;
+      default: y <= 4'h0;
+    endcase
+  end
+endmodule`,
+
+  'onehot — 非 ANSI ポートと多入力ゲート': `module onehot(a, b, c, any, all, none, exactly, copy);
+  input a, b, c;
+  output any, all, none, exactly, copy;
+
+  or  g0(any,  a, b, c);
+  and g1(all,  a, b, c);
+  nor g2(none, a, b, c);
+  buf g3(copy, a);
+
+  assign exactly = (a && !b && !c) || (!a && b && !c) || (!a && !b && c);
+endmodule`,
+
   'seqdet — "1011" 検出 FSM (case + if)': `module seqdet(
   input clk,
   input din,
