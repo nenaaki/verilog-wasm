@@ -23,6 +23,12 @@ const UNSUPPORTED_ITEMS = new Set([
 ]);
 const DIRECTIONS = new Set(['input', 'output']);
 const NET_KINDS = new Set(['wire', 'reg']);
+// signed / unsigned は宣言の中で幅の前に来る (`wire signed [3:0] x;`)。予約語として
+// 知らないと識別子に見えてしまい、次の '[' で見当違いのエラーになる
+const SIGNEDNESS = {
+  signed: 'signed は未対応 (すべて符号なしとして扱う)',
+  unsigned: 'unsigned は既定なので、書かずに省いてください',
+};
 
 export function parse(src) {
   const toks = lex(src);
@@ -42,6 +48,11 @@ export function parse(src) {
     if (peek().type !== 'ident') throw err(`識別子が必要ですが '${peek().value}' がありました`);
     return next().value;
   };
+  /** 宣言に付いた signed / unsigned を名指しで断る。幅の前に呼ぶ */
+  function rejectSignedness() {
+    const t = peek();
+    if (t.type === 'ident' && SIGNEDNESS[t.value]) throw err(SIGNEDNESS[t.value]);
+  }
   // ---- [msb:lsb] / [n] ----------------------------------------------------
   // 添字は式で受ける。`[WIDTH-1:0]` のようにパラメータが入るので、数に落とすのは
   // elaborate 側 (パラメータの値が決まってから)。
@@ -158,6 +169,7 @@ export function parse(src) {
     if (DIRECTIONS.has(peek().value)) dir = next().value;
     if (NET_KINDS.has(peek().value)) kind = next().value;
     if (!dir && !kind) throw err('宣言が必要');
+    rejectSignedness();
     const range = parseRange();
     const names = [expectIdent()];
     while (eat(',')) names.push(expectIdent());
@@ -391,6 +403,7 @@ export function parse(src) {
             if (!DIRECTIONS.has(peek().value)) throw err('ANSI ポートリストでは input/output が必要');
             const dir = next().value;
             const kind = NET_KINDS.has(peek().value) ? next().value : null;
+            rejectSignedness();
             const range = parseRange();
             const pname = expectIdent();
             portDecls.push({ type: 'decl', dir, kind, range, names: [pname], line: pline });

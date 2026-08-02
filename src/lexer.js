@@ -4,7 +4,9 @@
 
 import { CompileError } from './errors.js';
 
-const RE_SIZED = /(\d+)?'([bodhBODH])([0-9a-fA-F_]+)/y;
+// 's は符号付きリテラル (4'sd5)。扱わないが、基数の前に来るので読めないと
+// 「解釈できない文字 '''」になってしまう。読んでから名指しで断る
+const RE_SIZED = /(\d+)?'([sS]?)([bodhBODH])([0-9a-fA-F_]+)/y;
 const RE_DEC = /\d[\d_]*/y;
 const RE_IDENT = /[A-Za-z_][A-Za-z0-9_$]*/y;
 
@@ -23,7 +25,7 @@ const PUNCT1 = ['?', ':', '(', ')', '[', ']', '{', '}', ',', ';', '=', '&', '|',
 const PUNCT3_REJECT = {
   '===': '=== は未対応 (x / z を扱わないので == と同じ意味になる)',
   '!==': '!== は未対応 (x / z を扱わないので != と同じ意味になる)',
-  '<<<': '<<< は未対応 (signed を扱わないので << と同じ意味になる)',
+  '<<<': '<<< は未対応 (算術左シフトは signed でも << と同じ結果になる)',
   '>>>': '>>> は未対応 (signed を扱わないので >> と同じ意味になる)',
 };
 
@@ -65,7 +67,12 @@ export function lex(src) {
     RE_SIZED.lastIndex = i;
     const sized = RE_SIZED.exec(src);
     if (sized) {
-      const [raw, widthStr, baseChar, digitsRaw] = sized;
+      const [raw, widthStr, signChar, baseChar, digitsRaw] = sized;
+      if (signChar) {
+        throw new CompileError(
+          `${raw} の 's は未対応 (signed を扱わないので `
+          + `${widthStr ?? ''}'${baseChar}${digitsRaw} と同じビット列になる)`, line);
+      }
       const radix = RADIX[baseChar.toLowerCase()];
       const digits = digitsRaw.replace(/_/g, '');
       let value = 0n;
@@ -105,6 +112,17 @@ export function lex(src) {
       tokens.push({ type: 'ident', value: id[0], line });
       i += id[0].length;
       continue;
+    }
+
+    // $signed / $display のようなシステム関数・タスク。'$' を素の記号として
+    // 弾くと理由が伝わらないので、名前まで読んでから断る
+    if (c === '$') {
+      RE_IDENT.lastIndex = i + 1;
+      const sys = RE_IDENT.exec(src);
+      const name = sys ? `$${sys[0]}` : '$';
+      throw new CompileError(name === '$signed' || name === '$unsigned'
+        ? `${name} は未対応 (signed を扱わないので符号の付け替えができない)`
+        : `${name} は未対応 (システム関数・タスクは扱わない)`, line);
     }
 
     const three = src.slice(i, i + 3);

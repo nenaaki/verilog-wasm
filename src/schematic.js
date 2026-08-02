@@ -452,10 +452,14 @@ function assignNames(nodes) {
 /**
  * グラフを Verilog に変換する。
  *
- * ゲートの出力は「内部 wire」ではなく **output ポート**として宣言する。
+ * 既定ではゲートの出力も「内部 wire」ではなく **output ポート**として宣言する。
  * 内部の組合せ配線は WASM の local に置かれてメモリに出ないため
  * (layout.js のコメント参照)、そのままでは GUI から値を読めない。
  * output にしておけば全ての配線を観測できて、線に値を色付けできる。
+ *
+ * `opts.probeAll = false` にすると「出力」部品だけがポートになり、残りは内部の
+ * wire / reg になる。読める Verilog が出る代わりに、組合せ配線の値は観測できない
+ * (メモリは状態なのでスロットを持ち、こちらは引き続き読める)。
  *
  * 入力端子が 1 つでも未配線のノードと、その下流は「未完成」として除外する。
  * 組合せループは除外しない ― 配線が全部埋まっている以上グラフとしては完成形で、
@@ -550,6 +554,9 @@ function inferWidths(nodes, driver) {
 
 export function toVerilog(graph, opts = {}) {
   const top = opts.top ?? 'sketch';
+  // 観測用にゲートの出力まで output ポートにするか (既定)。false にすると
+  // 「出力」部品だけがポートになり、残りは内部の wire / reg として宣言される。
+  const probeAll = opts.probeAll !== false;
   // 回路部品があれば先に中身を取り込んで平坦にする。以降はブロックを知らなくて済む
   const hasBlock = (graph.nodes ?? []).some((n) => n.type === 'block');
   const flat = hasBlock ? flattenGraph(graph) : { ...graph, outletOf: new Map() };
@@ -617,7 +624,7 @@ export function toVerilog(graph, opts = {}) {
     .sort();
   const plan = {
     signalOf, inputs, outputs, regs, incomplete, outletOf,
-    widthOf: widths, widthErrors,
+    widthOf: widths, widthErrors, probeAll,
   };
   if (inputs.length === 0 && outputs.length === 0) return { source: null, ...plan };
 
@@ -627,12 +634,21 @@ export function toVerilog(graph, opts = {}) {
     return w > 1 ? `[${w - 1}:0] ` : '';
   };
 
+  // ポートにするか内部信号にするか。probeAll のときは全部ポート (観測できる)
+  const isPort = (o) => probeAll || o.kind === 'out';
+
   // メモリを 1 個でも使うなら暗黙のクロックが生える。エッジは step() が打つので端子には出さない
   const ports = [
     ...(regs.length ? [`  input  ${CLOCK}`] : []),
     ...inputs.map((i) => `  input  ${range(i.node)}${i.name}`),
-    ...outputs.map((o) => `  output ${o.kind === 'reg' ? 'reg ' : ''}${range(o.node)}${o.name}`),
+    ...outputs.filter(isPort)
+      .map((o) => `  output ${o.kind === 'reg' ? 'reg ' : ''}${range(o.node)}${o.name}`),
   ];
+
+  // ポートにしなかったものは中で宣言する。メモリは状態なので reg、残りは wire
+  const internal = outputs.filter((o) => !isPort(o))
+    .map((o) => `  ${o.kind === 'reg' ? 'reg  ' : 'wire '}${range(o.node)}${o.name};`);
+  if (internal.length) internal.push('');
 
   const argsOf = (n) => {
     const args = [];
@@ -642,7 +658,7 @@ export function toVerilog(graph, opts = {}) {
     return args;
   };
 
-  const body = [];
+  const body = [...internal];
   for (const o of outputs) {
     if (o.kind === 'reg') continue;
     const n = byId.get(o.node);

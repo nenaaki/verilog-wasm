@@ -50,8 +50,8 @@ WebAssembly.instantiate → sim.js
 
 | ファイル | 役割 | 行数 |
 | --- | --- | --- |
-| [src/lexer.js](src/lexer.js) | 字句解析 | 114 |
-| [src/parser.js](src/parser.js) | 構文解析 → AST | 411 |
+| [src/lexer.js](src/lexer.js) | 字句解析 | 131 |
+| [src/parser.js](src/parser.js) | 構文解析 → AST | 424 |
 | [src/elaborate.js](src/elaborate.js) | AST → ネットリスト IR（bit-blast・階層の平坦化・定数式・定数畳み込み・CSE） | 983 |
 | [src/schedule.js](src/schedule.js) | トポロジカルソート・ループ検出・刈り取り | 91 |
 | [src/layout.js](src/layout.js) | メモリレイアウト | 80 |
@@ -59,10 +59,10 @@ WebAssembly.instantiate → sim.js
 | [src/leb128.js](src/leb128.js) | LEB128・セクションエンコーダ | 59 |
 | [src/wat.js](src/wat.js) | WAT 出力（デバッグ用バックエンド） | 85 |
 | [src/interp.js](src/interp.js) | JS 参照実装（差分テスト用） | 78 |
-| [src/schematic.js](src/schematic.js) | 回路グラフ → Verilog・保存形式・幅の推論・階層の平坦化（GUI エディタ用フロントエンド） | 600 |
+| [src/schematic.js](src/schematic.js) | 回路グラフ → Verilog・保存形式・幅の推論・階層の平坦化（GUI エディタ用フロントエンド） | 614 |
 | [src/samples.js](src/samples.js) | エディタのサンプル回路（データ） | 341 |
 | [src/sim.js](src/sim.js) / [src/signals.js](src/signals.js) / [src/compile.js](src/compile.js) | 実行時グルー・エントリ | 188 |
-| **合計（コメント込み）** | | **3,234** |
+| **合計（コメント込み）** | | **3,278** |
 
 エディタ側は [web/editor.html](web/editor.html) に状態と操作を置き、状態を持たない部分を分けてある。
 
@@ -100,7 +100,19 @@ endmodule
 - モジュール階層（インスタンス化とポート接続。順番指定・名前指定の両方）
 - `parameter` / `localparam` とパラメータ付きインスタンス化（`#(.WIDTH(4))`）、`[WIDTH-1:0]` のような定数式の範囲
 
-**未対応**：乗除算、`casez` / `casex`、`generate`、`initial`、`function` / `task`、複数クロック、負エッジのクロック、`x` / `z`（`===` / `!==` も）、signed（`<<<` / `>>>` も）。いずれも行番号付きのエラーになる。
+**未対応**：乗除算、`casez` / `casex`、`generate`、`initial`、`function` / `task`、複数クロック、負エッジのクロック、`x` / `z`（`===` / `!==` も）、システム関数・タスク（`$display` など）、signed。いずれも行番号付きのエラーになる。
+
+signed は書き方が 4 通りあるので、それぞれ名前を出して断る。素通りさせると `')' が必要` や `解釈できない文字 '''` のような見当違いのエラーになるため:
+
+| 書き方 | エラー |
+| --- | --- |
+| `wire signed [3:0] x;` / `input signed a` | `signed は未対応 (すべて符号なしとして扱う)` |
+| `wire unsigned [3:0] x;` | `unsigned は既定なので、書かずに省いてください` |
+| `4'sd5` | `4'sd5 の 's は未対応 (… 4'd5 と同じビット列になる)` |
+| `$signed(a)` / `$unsigned(a)` | `$signed は未対応 (… 符号の付け替えができない)` |
+| `a >>> 1` | `>>> は未対応 (signed を扱わないので >> と同じ意味になる)` |
+
+`<<<` は signed であっても `<<` と同じ結果になる（左シフトは常に 0 で埋める）ので、そう書いて断る。`a$b` のように `$` を含む識別子は Verilog の正しい名前なので、そのまま通る。
 
 `<=` はノンブロッキング代入と「以下」を兼ねる。`always` 文の代入は左辺を読んでから `<=` を食べるので、式の中に出てきた `<=` だけが比較になる（Verilog 本来の解き方と同じ）。つまり `q <= a <= b;` は「`a <= b` の結果を `q` に代入」と読める。
 
@@ -487,7 +499,7 @@ sim.snapshot();              // 観測可能な全信号
 
 ```text
 $ node test/run.js
-1733 件成功, 0 件失敗
+1743 件成功, 0 件失敗
 ```
 
 中核は **WASM バックエンド vs JS 参照実装の差分テスト**。ランダムに生成した Verilog 25 回路 × ランダム入力 12 ベクタで、両者の出力が完全一致することを確認する。生成器は `+` `-`・比較 6 種・`<<` `>>`・`&&` `||` `!`・リダクション 6 種・`if` / `case`・非同期リセット・子モジュールのインスタンス化を混ぜる。25 回路の中に各構文が現れること自体もテストしている。
@@ -518,7 +530,7 @@ $ node test/run.js
 
 ```text
 $ node test/ui.js
-372 件成功, 0 件失敗
+390 件成功, 0 件失敗
 ```
 
 ここも依存パッケージは足していない。Node 22 以降のグローバル `WebSocket` で CDP（Chrome DevTools Protocol）を直接話し、ブラウザはシステムに入っている Chrome を使う。静的サーバの起動から後片付けまで自前でやるので `node test/ui.js` だけで完結する。Chrome が見つからない環境ではスキップして正常終了する（`CHROME=/path/to/chrome` で場所を指定できる）。
@@ -758,7 +770,30 @@ endmodule
 
 メモリがある回路では「入力 + 現在の Q」を軸にした状態遷移表になる。こちらも 1 回で済むが順番が要る ―― 出力は `commit` の前、次状態の Q は `commit` の後に読む。合計 6 ビット（= 64 レーン）まで。今の入力とメモリの値に当たる行には印が付く。
 
-ゲートの出力は内部 wire ではなく **output ポートとして宣言している**。内部の組合せ配線は WASM の local に置かれてメモリに出ないので、そのままでは線の値を読めない。output にすれば全ての配線が観測できる。
+### 「開発中」トグル
+
+内部の組合せ配線は WASM の local に置かれてメモリに出ないので、そのままでは線の値を読めない。そこで既定では**ゲートの出力も `output` ポートとして宣言している**。全ての配線が観測できて、線に値の色が付く。
+
+代わりに Verilog が読みにくくなるので、Verilog パネルの見出しに「開発中」トグルを置いた。**既定は ON**（押下）で、OFF にすると「出力」部品だけがポートになり、残りは内部の `wire` / `reg` になる。
+
+```verilog
+// ON (既定) — 観測用に全部 output          // OFF — 素直な Verilog
+module sketch(                              module sketch(
+  input  a,                                   input  a,
+  input  b,                                   input  b,
+  output n3,                                  output sum,
+  output n4,                                  output carry
+  output sum,                               );
+  output carry                                wire n3;
+);                                            wire n4;
+  assign n3 = a ^ b;
+  …                                           assign n3 = a ^ b;
+                                              …
+```
+
+観測できなくなるのは**組合せ配線だけ**。入力・「出力」部品・メモリは引き続き読める（メモリは状態なので、内部の `reg` になってもスロットを持つ）。読めない線は値が不明なので破線になり、「内部の配線も出す」は押せなくなる。観測用のスロットが減るぶん WASM も小さくなる（4 ビット加算器と比較で 514 → 477 バイト）。
+
+**「出力」部品が 1 個も無い回路を OFF にすると、外に出る信号が無くなって[刈り取り](#到達不能ゲートの刈り取り)がゲートを全部消す。** ゲート数 0 の理由が分からないので、そのときはメッセージで伝える。
 
 ## 次にやること
 

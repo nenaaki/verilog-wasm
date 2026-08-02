@@ -1524,6 +1524,62 @@ ok(await js('__renameBoxOpen()') === false, '下段: ゲートでは上段が出
 ok(await js('__widthRowOpen()') === false, '下段: ゲートでは下段も出ない');
 ok((await js('__msg()')).includes('繋いだ先から決まります'), '下段: ゲートには理由を出す', await js('__msg()'));
 
+// ==================================================== 「開発中」トグル
+// ON (既定) は観測用にゲートの出力も output にする。OFF は「出力」部品だけ
+await js('__preset("4 ビット加算器と比較")');
+await sleep(700);
+const probe = () => js(`document.getElementById('probeAll').getAttribute('aria-pressed')`);
+const decls = () => js(`__verilog().split('\\n').filter(l => /^\\s+(wire|reg)\\s/.test(l)).join('/')`);
+const ports = () => js(`__verilog().split('\\n').filter(l => /^\\s+output/.test(l)).join('/')`);
+
+ok(await probe() === 'true', '開発中: 既定は押されている', String(await probe()));
+ok((await ports()).includes('n3'), '開発中: ON ならゲートの出力も output', await ports());
+ok(await decls() === '', '開発中: ON なら内部宣言は出ない', await decls());
+ok(await js('__nodeText("sum")') === 'sumE', '開発中: 9 + 5 = E', await js('__nodeText("sum")'));
+
+// OFF にすると「出力」部品だけがポートになり、残りは wire になる
+await click(await js('__btn("probeAll")'));
+await sleep(700);
+ok(await probe() === 'false', '開発中: 押すと解除される', String(await probe()));
+ok(!(await ports()).includes('n3'), '開発中: OFF ならゲートは output に出ない', await ports());
+ok((await ports()).includes('sum') && (await ports()).includes('less'),
+  '開発中: OFF でも「出力」部品はポートに残る', await ports());
+ok((await decls()).includes('wire [3:0] n3'), '開発中: OFF ならゲートは wire で宣言される', await decls());
+// 出力の値は引き続き読める。組合せ配線は読めなくなる (= 値が不明なので破線になる)
+ok(await js('__nodeText("sum")') === 'sumE', '開発中: OFF でも出力の値は出る', await js('__nodeText("sum")'));
+const deadWires = () => js(`[...document.querySelectorAll('#gWires .wire')]
+  .filter(p => p.classList.contains('dead')).length`);
+ok(await deadWires() === 2, '開発中: OFF ではゲートが駆動する線が不明 (破線) になる',
+  String(await deadWires()));
+ok(await js('__disabled("waveGates")'), '開発中: OFF では「内部の配線も出す」を止める');
+// 観測用のスロットが減るので WASM も小さくなる
+const smaller = await js(`document.getElementById('stats').textContent`);
+ok(/wasm=477B/.test(smaller), '開発中: OFF は観測用のスロットが減って小さくなる', smaller);
+
+// メモリは状態なのでスロットを持つ = OFF でも値が見える
+await js('__preset("クロックで反転する 1 ビットメモリ")');
+await sleep(700);
+ok((await decls()).includes('reg  q'), '開発中: OFF ならメモリは reg で宣言される', await decls());
+ok(await js('__memText()') === 'q0', '開発中: OFF でもメモリの値は読める', String(await js('__memText()')));
+await click(await js('__btn("clock")'));
+await sleep(400);
+ok(await js('__memText()') === 'q1', '開発中: OFF でもクロックが打てる', String(await js('__memText()')));
+
+// 「出力」部品が無い回路は外に出る信号が無くなるので、その旨を出す
+await js(`(() => { __setName(''); document.getElementById('clear').click(); })()`);
+await sleep(400);
+await click(await js('__button("入力")'));
+await click(await js('__button("NOT")'));
+await sleep(500);
+ok((await js('__msg()')).includes('外に出る信号がありません'),
+  '開発中: OFF で出力部品が無いと理由を出す', await js('__msg()'));
+
+// ON に戻すと元どおり
+await click(await js('__btn("probeAll")'));
+await sleep(700);
+ok(await probe() === 'true', '開発中: もう一度押すと戻る', String(await probe()));
+ok(!(await js('__disabled("waveGates")')), '開発中: ON に戻すと波形の欄も戻る');
+
 // ------------------------------------------------------------------ 結果
 console.log(`${passed} 件成功, ${failures.length} 件失敗`);
 for (const f of failures) console.log(`  × ${f}`);

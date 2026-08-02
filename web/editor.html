@@ -90,9 +90,18 @@
   .split.h { cursor: row-resize; }
 
   aside { display: grid; grid-template-rows: auto 1fr 7px auto 1fr; min-height: 0; min-width: 0; }
-  aside .head { padding: 5px 12px; background: var(--panel2); border-bottom: 1px solid var(--line);
+  aside .head { display: flex; align-items: center; gap: 8px;
+    padding: 5px 12px; background: var(--panel2); border-bottom: 1px solid var(--line);
     color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    white-space: nowrap; overflow: hidden; }
+  aside .head > span { overflow: hidden; text-overflow: ellipsis; }
+  /* 観測用の output を全部出すかどうかのトグル。押されている = ON */
+  #probeAll {
+    margin-left: auto; flex: none; padding: 1px 8px; border-radius: 4px;
+    font-size: 10.5px; letter-spacing: 0; text-transform: none;
+  }
+  #probeAll[aria-pressed="true"] { background: #1d3a63; border-color: #2f5d9e; color: var(--fg); }
+  #probeAll[aria-pressed="false"] { background: #232833; border-color: var(--line); color: var(--dim); }
   aside .scroll { overflow: auto; min-height: 0; background: #0c0e12; }
   pre#verilog { margin: 0; padding: 10px 12px; font-family: var(--mono); font-size: 11.5px; color: #a9b3c4; }
 
@@ -293,7 +302,11 @@
   </div>
   <div class="split v" id="splitV" title="ドラッグで幅を変える"></div>
   <aside id="aside">
-    <div class="head">生成された Verilog</div>
+    <div class="head">
+      <span>生成された Verilog</span>
+      <button id="probeAll" aria-pressed="true"
+        title="ON: ゲートの出力も output にして、すべての配線の値を画面で見られるようにする（開発中の既定）&#10;OFF: 「出力」部品だけを output にする。読める Verilog になる代わりに、組合せ配線の値は見えなくなる（メモリは見える）">開発中</button>
+    </div>
     <div class="scroll"><pre id="verilog"></pre></div>
     <div class="split h" id="splitH" title="ドラッグで高さを変える"></div>
     <div class="head" id="tableHead">真理値表</div>
@@ -357,6 +370,9 @@ let plan = null;                   // toVerilog の結果
 let values = new Map();            // ノード id → 0 | 1 | null(不明)
 let pinVals = new Map();           // `${回路部品の id}:${出力端子}` → 0 | 1 | null
 let seq = 0;                       // 非同期コンパイルの世代番号
+// 「開発中」トグル。ON のあいだはゲートの出力も output ポートにして、すべての配線の
+// 値を読めるようにする。OFF にすると「出力」部品だけがポートになる (読める Verilog)
+let probeAll = true;
 let cycles = 0;                    // 打ったクロックの回数
 let frames = [];                  // 波形の列 [{label, v:{信号名: 0|1|null}}]
 
@@ -809,7 +825,7 @@ function selectAll() {
 
 // ------------------------------------------------- コンパイル & 評価
 async function rebuild() {
-  plan = toVerilog(graph);
+  plan = toVerilog(graph, { probeAll });
   $('verilog').textContent = plan.source ?? '// 部品がありません';
   const my = ++seq;
 
@@ -836,12 +852,16 @@ async function rebuild() {
     const dead = deadCount();
     // 幅の合わない所は未配線と同じく除外されるので、理由を分けて伝える
     const wErr = plan.widthErrors ?? [];
+    // 「開発中」を切ると出力部品だけがポートになる。1 個も無いと外に出る信号が
+    // 無くなり、刈り取りでゲートが全部消える。0 ゲートの理由が分からないので言う
+    const noOut = !probeAll && !plan.outputs.some((o) => o.kind === 'out');
     setMsg(`コンパイル成功 — ${st.gates} ゲート`
       + (st.regs ? ` / ${st.regs} ビットのメモリ` : '')
       + `を ${st.wasmBytes} バイトの WASM に変換`
       + (wErr.length ? ` / 幅が合わない部品 (${wErr.join(', ')}) は回路から除外しました` : '')
-      + (dead ? ` / 未配線の部品が ${dead} 個あるので回路から除外しました` : ''),
-      dead || wErr.length ? 'warn' : 'ok');
+      + (dead ? ` / 未配線の部品が ${dead} 個あるので回路から除外しました` : '')
+      + (noOut ? ' / 「出力」部品が無いので外に出る信号がありません' : ''),
+      dead || wErr.length || noOut ? 'warn' : 'ok');
   } catch (e) {
     if (my !== seq) return;
     sim = compiled = null;
@@ -1920,6 +1940,21 @@ $('bitWidth').onchange = () => {
   // 何も変わらないとき (連接に 1 を入れた等) は、欄を実際の値に戻して終わり
   if (!applyWidth(sized, w)) { updateEditUI(); return; }
   setMsg(widthMsg(sized, w), 'ok');
+};
+
+// 「開発中」の切り替え。回路は変わらないので Undo には積まない (見せ方の設定)
+$('probeAll').onclick = () => {
+  probeAll = !probeAll;
+  $('probeAll').setAttribute('aria-pressed', String(probeAll));
+  // OFF のあいだは組合せ配線が観測できないので、波形に足す意味が無くなる
+  $('waveGates').disabled = !probeAll;
+  $('waveGates').parentElement.title = probeAll ? ''
+    : '「開発中」が OFF のあいだは組合せ配線の値が読めません';
+  if (!probeAll) $('waveGates').checked = false;
+  rebuild();
+  setMsg(probeAll
+    ? '開発中: ON — ゲートの出力も output にして、すべての配線の値を見せます'
+    : '開発中: OFF — 「出力」部品だけが output になります (組合せ配線の値は見えません)', 'ok');
 };
 
 $('openBlock').onclick = () => enterBlock();
