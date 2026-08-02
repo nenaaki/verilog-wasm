@@ -142,6 +142,8 @@
   .node text.konst.wide { font-family: var(--mono); font-size: 12px; }
   /* ビット取り出しの添字。クリックで変えられるので定数と同じ色にする */
   .node text.idx { font-family: var(--mono); font-size: 14px; font-weight: 700; fill: var(--amber); }
+  /* 1 ビットでない部品の右上に出す幅の札。値と紛れないよう小さく別の色にする */
+  .node text.bw { font-size: 8.5px; fill: #7fd6b8; text-anchor: end; }
   .node.reg rect.body { fill: #1f2836; stroke: #3d5f8f; }
   .node.reg text.name { fill: var(--blue); }
   .node.konst rect.body { fill: #2a2519; stroke: #6b5a2a; }
@@ -1003,6 +1005,10 @@ function render() {
     } else {
       el('text', { x: size.w / 2, y: size.h / 2 }, g).textContent = spec(n).glyph;
     }
+
+    // バスは一目で分かったほうがいいので、1 ビットでない部品は右上に幅を出す。
+    // 「4b」にしてあるのは、ビット取り出しの `[3:0]` (どのビットか) と読み違えないため。
+    if (wOf > 1) el('text', { class: 'bw', x: size.w - 5, y: 8 }, g).textContent = `${wOf}b`;
 
     for (let p = 0; p < insOf(n); p++) {
       const q = inPin(n, p);

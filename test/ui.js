@@ -181,8 +181,12 @@ const type = async (text) => { await send('Input.insertText', { text }); await s
 // -------------------------------------------------- ページ内のヘルパ関数
 // 部品や配線の位置は SVG の中にあるので、client 座標への変換はページ側でやる。
 const HELPERS = `
+  // 右上の幅の札 (「4b」) は飾りなので、部品の文字としては読まない
+  window.__partText = (g) => [...g.querySelectorAll('text')]
+    .filter((t) => !t.classList.contains('bw')).map((t) => t.textContent).join('').trim();
+  window.__bwOf = (prefix) => __nodeAt(prefix)?.querySelector('text.bw')?.textContent ?? null;
   window.__nodeAt = (prefix) => [...document.querySelectorAll('#gNodes .node')]
-    .find((g) => g.textContent.trim().startsWith(prefix));
+    .find((g) => __partText(g).startsWith(prefix));
   window.__center = (elm) => { const r = elm.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; };
   window.__btn = (id) => __center(document.getElementById(id));
   window.__nodeCenter = (prefix) => __center(__nodeAt(prefix));
@@ -219,8 +223,8 @@ const HELPERS = `
   window.__disabled = (id) => document.getElementById(id).disabled;
   window.__cyc = () => document.getElementById('cyc').textContent;
   window.__memText = () => [...document.querySelectorAll('#gNodes .node.reg')]
-    .map((g) => g.textContent.trim())[0] ?? null;
-  window.__nodeText = (prefix) => __nodeAt(prefix)?.textContent.trim() ?? null;
+    .map(__partText)[0] ?? null;
+  window.__nodeText = (prefix) => { const g = __nodeAt(prefix); return g ? __partText(g) : null; };
   // 幅 (バス)
   window.__widthBox = () => {
     const w = document.getElementById('bitWidth');
@@ -246,7 +250,7 @@ const HELPERS = `
   window.__selCount = () => document.querySelectorAll('#gNodes .node.sel').length;
   window.__transform = (prefix) => __nodeAt(prefix).getAttribute('transform');
   window.__types = () => [...document.querySelectorAll('#gNodes .node')]
-    .map((g) => g.textContent.trim()).sort().join(',');
+    .map(__partText).sort().join(',');
   // 表
   window.__tableHead = () => document.getElementById('tableHead').textContent;
   window.__rows = () => [...document.querySelectorAll('#truth tr')];
@@ -1194,11 +1198,11 @@ for (const label of ['ビット', '連接', '加算', '減算', '一致', '小�
 await js('__preset("上下に割って")');
 await sleep(600);
 await js(`(() => {
-  const g = [...document.querySelectorAll('#gNodes .node')].find(x => x.textContent.trim() === '{ }');
+  const g = [...document.querySelectorAll('#gNodes .node')].find(x => __partText(x) === '{ }');
   const r = g.getBoundingClientRect();
   window.__catPoint = [r.x + r.width / 2, r.y + r.height / 2];
   window.__catH = () => {
-    const n = [...document.querySelectorAll('#gNodes .node')].find(x => x.textContent.trim() === '{ }');
+    const n = [...document.querySelectorAll('#gNodes .node')].find(x => __partText(x) === '{ }');
     return Math.round(n.querySelector('rect.body').getAttribute('height'));
   };
   return 1;
@@ -1228,6 +1232,31 @@ await click(await js('__catPoint'));
 await js('__setWidth(1)');
 await sleep(600);
 ok(await js('__widthBox()') === '2', '連接: 本数 1 は 2 に上がる', String(await js('__widthBox()')));
+
+// ==================================================== 幅の札
+// 1 ビットでない部品は右上に幅を出す。1 ビットのものには何も出ない
+await js('__preset("上下に割って")');
+await sleep(600);
+ok(await js('__bwOf("a")') === '8b', '幅の札: 8 ビットの入力に 8b が出る', String(await js('__bwOf("a")')));
+ok(await js('__bwOf("sw")') === '8b', '幅の札: 出力にも伝わった幅が出る', String(await js('__bwOf("sw")')));
+const slicebw = await js(`[...document.querySelectorAll('#gNodes .node')]
+  .filter(g => g.querySelector('text.idx')).map(g => g.querySelector('text.bw')?.textContent).join(',')`);
+ok(slicebw === '4b,4b', '幅の札: 部分選択は取り出したビット数を出す', slicebw);
+
+// 1 ビットだけの回路には札が 1 枚も出ない
+await js('__preset("AND")');
+await sleep(600);
+const bwCount = await js(`document.querySelectorAll('#gNodes text.bw').length`);
+ok(bwCount === 0, '幅の札: 1 ビットの回路には出ない', String(bwCount));
+
+// 幅を変えると札も変わる
+await click(await js('__nodeCenter("a")'));
+await js('__setWidth(4)');
+await sleep(600);
+ok(await js('__bwOf("a")') === '4b', '幅の札: 幅を変えると札も変わる', String(await js('__bwOf("a")')));
+await js('__setWidth(1)');
+await sleep(600);
+ok(await js('__bwOf("a")') === null, '幅の札: 1 ビットに戻すと札も消える', String(await js('__bwOf("a")')));
 
 // ------------------------------------------------------------------ 結果
 console.log(`${passed} 件成功, ${failures.length} 件失敗`);
