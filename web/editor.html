@@ -19,6 +19,8 @@
     --mono: ui-monospace, "Cascadia Mono", Consolas, "Courier New", monospace;
   }
   * { box-sizing: border-box; }
+  /* hidden 属性は UA の [hidden]{display:none} が .bar{display:flex} に負けるので明示する */
+  [hidden] { display: none !important; }
   html, body { height: 100%; margin: 0; }
   body {
     background: var(--bg); color: var(--fg);
@@ -183,6 +185,7 @@
   <button id="pasteBtn" title="貼り付け (Ctrl+V)">貼り付け</button>
   <button id="del">削除 (Del)</button>
   <button id="renameBtn">名前 (F2)</button>
+  <button id="openBlock" title="選んだ回路部品の中身を開いて編集する (ダブルクリックでも開く)">部品の中へ</button>
   <button id="clear">全部消す</button>
   <button id="fit">表示リセット</button>
   <span class="sep"></span>
@@ -190,6 +193,13 @@
   <button id="clock" class="primary">▷ 1 クロック</button>
   <button id="zero">メモリを 0 に</button>
   <span class="cyc" id="cyc"></span>
+</div>
+
+<div class="bar" id="blockBar" hidden>
+  <span class="label">部品の中</span>
+  <span class="cyc" id="crumb"></span>
+  <button id="blockDone" class="primary">確定して戻る</button>
+  <button id="blockCancel">取消して戻る</button>
 </div>
 
 <div class="bar">
@@ -295,8 +305,33 @@ const view = { x: 0, y: 0, w: CANVAS.w, h: CANVAS.h };
 // localStorage への出入りは web/storage.js 側にある。
 // 保存した回路もサンプルと同じ圧縮形式なので、読み込み経路は 1 本で足りる。
 
+// ---- 回路部品の中に入って編集する ------------------------------------------
+//
+// 「入る」= 部品の中身をそのまま canvas に開き、親の回路をスタックに積んでおく。
+// 「確定して戻る」で、編集した中身を親の部品ノードに書き戻す。
+// 各フレームには親を復元するのに必要なものを全部入れておく (親の回路・書き戻す
+// ノードの id・パンくずの表示名・名前欄とリストの選択)。
+let blockStack = [];
+
+/**
+ * いまの中身を親に畳み込んで、一番外側の回路の保存形式を返す。
+ * 自動保存は常にこれを書く — 部品の中にいるあいだも、外側ごと残しておかないと
+ * 「開き直したら部品の中身が回路全体になっていた」ことになる。
+ */
+function rootPacked() {
+  let packed = packCircuit(graph);
+  for (let i = blockStack.length - 1; i >= 0; i--) {
+    const frame = blockStack[i];
+    const outer = expandCircuit(frame.packed);
+    const node = outer.nodes.find((n) => n.id === frame.blockId);
+    if (node) { node.def = packed; node.ref = null; }
+    packed = packCircuit(outer);
+  }
+  return packed;
+}
+
 /** 編集中の回路を黙って残す。次に開いたとき続きから始められる */
-const autoSave = () => writeWork(packCircuit(graph));
+const autoSave = () => writeWork(rootPacked());
 
 function loadGraph(compact, listValue = '', name = '') {
   graph = expandCircuit(compact);
@@ -439,7 +474,22 @@ function updateEditUI() {
   $('del').disabled = selection.size === 0;
   $('renameBtn').disabled = selection.size !== 1;
   $('dlWasm').disabled = compiled === null;
-  $('dlJson').disabled = graph.nodes.length === 0;
+
+  const one = selection.size === 1 ? byId([...selection][0]) : null;
+  $('openBlock').disabled = one?.type !== 'block';
+
+  // 部品の中にいるあいだは「回路そのもの」を相手にする操作を止める。
+  // 中身に別の部品を置くのは階層として筋が通るので、そちらは触らない。
+  const inBlock = blockStack.length > 0;
+  if ($('blockBar').hidden === inBlock) {     // 表示が変わるときだけ行数を組み直す
+    $('blockBar').hidden = !inBlock;
+    applyPanes();
+  }
+  $('crumb').textContent = blockStack.map((f) => f.label).join(' › ');
+  for (const id of ['presets', 'cname', 'save', 'delSave', 'share', 'dlJson', 'loadJson']) {
+    $(id).disabled = inBlock;
+  }
+  if (!inBlock) $('dlJson').disabled = graph.nodes.length === 0;
 }
 
 // ------------------------------------------------------------ 編集操作
@@ -584,6 +634,74 @@ async function placeBlock(name) {
   selection = new Set([node.id]);
   await rebuild();          // rebuild もメッセージを出すので、待ってから上書きする
   setMsg(`「${name}」を部品として置きました（入力 ${ports.inputs.length} / 出力 ${ports.outputs.length}）`, 'ok');
+}
+
+/** 選んだ回路部品の中身を開く */
+async function enterBlock(id = selection.size === 1 ? [...selection][0] : null) {
+  const node = id === null ? null : byId(id);
+  if (!node || node.type !== 'block') {
+    setMsg('回路部品を 1 個だけ選んでください', 'warn');
+    return;
+  }
+  blockStack.push({
+    packed: packCircuit(graph),
+    blockId: id,
+    label: node.name || node.ref || '部品',
+    cname: $('cname').value,
+    preset: $('presets').value,
+    // loadGraph が履歴を捨てるので、親のぶんは預かって戻るときに返す
+    undo: undoStack,
+    redo: redoStack,
+  });
+  await loadGraph(node.def, '', '');
+  setMsg(`「${blockStack[blockStack.length - 1].label}」の中を開きました。`
+    + '編集したら「確定して戻る」を押してください', 'ok');
+}
+
+/**
+ * 部品の中から出る。commit なら編集した中身を親のノードに書き戻す。
+ *
+ * 書き戻すときに ref を切るのが要点。中身がローカルになったのに保存された回路への
+ * 参照が残っていると、あとで「部品を更新」がこの編集を黙って上書きしてしまう。
+ */
+async function leaveBlock(commit) {
+  const frame = blockStack[blockStack.length - 1];
+  if (!frame) return;
+
+  let edited = null;
+  if (commit) {
+    edited = packCircuit(graph);
+    let ports;
+    try {
+      ports = blockPorts(edited);
+    } catch (e) {
+      setMsg(`この中身は部品にできません: ${e.message}`, 'err');
+      return;                                   // 直せるように中に留まる
+    }
+    if (ports.inputs.length === 0 && ports.outputs.length === 0) {
+      setMsg('入力も出力も無いので部品になりません (in / out を置いてください)', 'warn');
+      return;
+    }
+  }
+
+  blockStack.pop();
+  const parent = expandCircuit(frame.packed);
+  if (edited) {
+    const node = parent.nodes.find((n) => n.id === frame.blockId);
+    if (node) { node.def = edited; node.ref = null; }
+  }
+  // loadGraph → expandCircuit が端子を作り直し、筋の通らなくなった配線を落とす
+  await loadGraph(packCircuit(parent), frame.preset, frame.cname);
+  selection = new Set([frame.blockId]);
+  // 親の履歴を返す。書き戻したときは「中身の編集」を 1 手として積む
+  undoStack = edited ? [...frame.undo, frame.packed] : frame.undo;
+  if (undoStack.length > MAX_UNDO) undoStack = undoStack.slice(-MAX_UNDO);
+  redoStack = edited ? [] : frame.redo;
+  render();
+  updateEditUI();
+  setMsg(commit
+    ? `「${frame.label}」の中身を書き戻しました (この部品は保存した回路とは切り離されました)`
+    : `「${frame.label}」の編集を取り消しました`, commit ? 'ok' : 'warn');
 }
 
 /** 置いてある部品の中身を、保存されている最新の内容に入れ替える */
@@ -1105,6 +1223,17 @@ svg.addEventListener('pointerup', (e) => {
   if (band) { band = null; renderBand(); }
 });
 
+// 回路部品はダブルクリックで中を開く (フォルダを開く感覚に寄せる)
+svg.addEventListener('dblclick', (e) => {
+  const g = e.target.closest?.('.node');
+  if (!g) return;
+  const id = Number(g.dataset.id);
+  if (byId(id)?.type !== 'block') return;
+  e.preventDefault();
+  selection = new Set([id]);
+  enterBlock(id);
+});
+
 // ------------------------------------------------------ ペインの区切り
 const main = $('main'), aside = $('aside');
 let asideW = null, verilogH = null;   // null = CSS の初期比率のまま
@@ -1113,7 +1242,12 @@ let waveH = 150;                      // 波形パネルの高さ (px)
 function applyPanes() {
   main.style.gridTemplateColumns = `1fr 7px ${asideW === null ? 'minmax(240px, 30%)' : `${asideW}px`}`;
   aside.style.gridTemplateRows = `auto ${verilogH === null ? '1fr' : `${verilogH}px`} 7px auto 1fr`;
-  document.body.style.gridTemplateRows = `auto auto auto 1fr 7px ${waveH}px auto`;
+  // header / 部品バー / [部品の中バー] / 回路バー / canvas / 区切り / 波形 / メッセージ。
+  // 部品の中バーは hidden のあいだグリッドに入らないので、行もそのぶん減らす
+  const rows = ['auto', 'auto'];
+  if (!$('blockBar').hidden) rows.push('auto');
+  rows.push('auto', '1fr', '7px', `${waveH}px`, 'auto');
+  document.body.style.gridTemplateRows = rows.join(' ');
 }
 
 /** 区切りを押している間だけ onMove を呼ぶ */
@@ -1300,6 +1434,9 @@ $('pasteBtn').onclick = paste;
 $('fit').onclick = resetView;
 $('placeBlock').onclick = () => placeBlock($('blockPick').value);
 $('syncBlocks').onclick = syncBlocks;
+$('openBlock').onclick = () => enterBlock();
+$('blockDone').onclick = () => leaveBlock(true);
+$('blockCancel').onclick = () => leaveBlock(false);
 $('renameBtn').onclick = () => {
   if (selection.size !== 1) setMsg('名前を変える部品を 1 個だけ選んでください', 'warn');
   else startRename([...selection][0]);
