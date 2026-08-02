@@ -266,6 +266,15 @@ const HELPERS = `
     b.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     return document.getElementById('msg').textContent;
   };
+  // 押せないものには ! を付けて返す ("- +!" なら + が押せない)
+  window.__widthBtns = () => [...(__widthRow()?.querySelectorAll('button') ?? [])]
+    .map((b) => b.textContent + (b.disabled ? '!' : '')).join(' ');
+  /** 下段の - / + を押す (d は -1 か +1)。返り値はその場のメッセージ */
+  window.__widthStep = (d) => {
+    const b = [...__widthRow().querySelectorAll('button')].find((x) => Number(x.dataset.step) === d);
+    b.click();
+    return document.getElementById('msg').textContent;
+  };
   window.__rightClick = (prefix) => {
     const g = __nodeAt(prefix);
     const r = g.getBoundingClientRect();
@@ -1357,6 +1366,13 @@ ok(await js('__widthRowOpen()') === true, '下段: 幅の欄が一緒に出る')
 ok(await js('__widthRowValue()') === '8', '下段: いまの幅が入っている', String(await js('__widthRowValue()')));
 ok(await js('__widthRowLabel()') === '幅', '下段: 見出しは「幅」', String(await js('__widthRowLabel()')));
 ok(await js('__widthRowBelow("a")'), '下段: 部品の本体の真下に出る');
+// 上段は部品の本体にぴったり重なる (置く前に focus するとスクロールしてずれていた)
+const fit = await js(`(() => {
+  const r = document.getElementById('renameBox').getBoundingClientRect();
+  const b = __nodeAt('a').querySelector('rect.body').getBoundingClientRect();
+  return [Math.round(r.x - b.x), Math.round(r.y - b.y), Math.round(r.height - b.height)].join(',');
+})()`);
+ok(fit === '0,0,0', '下段: 上段は部品の本体にぴったり重なる', fit);
 ok(await js('__focusId()') === 'renameBox', '下段: 焦点は上段 (名前) にある', String(await js('__focusId()')));
 
 // Escape で 2 段まとめて消える
@@ -1382,8 +1398,7 @@ await sleep(600);
 // (下段が自分で焦点を取る作りだと、上段に奪われた瞬間に blur → 確定 → 消滅していた)
 await js('__rightClick("a")');
 await sleep(200);
-await click(await js('(() => { const r = __widthRow().getBoundingClientRect();'
-  + ' return [r.x + r.width - 12, r.y + r.height / 2]; })()'));
+await click(await js('__center(document.getElementById("partWidthBox"))'));
 await sleep(150);
 ok(await js('__renameBoxOpen()') === false, '下段: 下段を触ると上段は確定して閉じる');
 ok(await js('__widthRowOpen()') === true, '下段: 下段は残る');
@@ -1412,6 +1427,73 @@ ok(await js('__widthRowLabel()') === '本数', '下段: 連接の見出しは「
 const pMsg = await js('__typeWidth("3")');
 ok(pMsg.includes('3 入力'), '下段: 連接は入力の本数として扱う', pMsg);
 await sleep(600);
+
+// ---- 欄の外を押したら閉じる (焦点を持っていない下段が残る不具合があった) ----
+await js('__preset("上下に割って")');
+await sleep(600);
+await js('__rightClick("a")');
+await sleep(200);
+ok(await js('__widthRowOpen()') === true, '外を押す: まず 2 段出ている');
+await click(await js('__emptySpot()'));
+await sleep(250);
+ok(await js('__renameBoxOpen()') === false, '外を押す: 上段が消える');
+ok(await js('__widthRowOpen()') === false, '外を押す: 焦点の無い下段も消える');
+
+// 別の回路に切り替えても残らない
+await js('__rightClick("a")');
+await sleep(200);
+await js('__preset("AND")');
+await sleep(600);
+ok(await js('__widthRowOpen()') === false, '外を押す: 回路を切り替えたら消える');
+ok(await js('__renameBoxOpen()') === false, '外を押す: 上段も消える');
+
+// ---- 左の - と右の + ----
+await js('__preset("上下に割って")');
+await sleep(600);
+await js('__rightClick("a")');
+await sleep(200);
+ok(await js('__widthBtns()') === '- +', '増減: 左が - 、右が + の順に並ぶ', String(await js('__widthBtns()')));
+const upMsg = await js('__widthStep(1)');
+ok(upMsg.includes('9 ビット'), '増減: + で 1 増える', upMsg);
+await sleep(600);
+ok(await js('__widthRowValue()') === '9', '増減: 欄の数字も追いつく', String(await js('__widthRowValue()')));
+ok(await js('__bwOf("a")') === '9', '増減: 回路にも効く', String(await js('__bwOf("a")')));
+ok(await js('__widthRowOpen()') === true, '増減: 押しても欄は開いたまま');
+ok(await js('__widthRowBelow("a")'), '増減: 部品に付いたまま');
+await js('__widthStep(-1)');
+await sleep(600);
+ok(await js('__bwOf("a")') === '8', '増減: - で 1 減る', String(await js('__bwOf("a")')));
+
+// 上限・下限では押せなくなる
+await js('__typeWidth("32")');
+await sleep(600);
+await js('__rightClick("a")');
+await sleep(200);
+ok(await js('__widthBtns()') === '- +!', '増減: 32 では + が押せない', String(await js('__widthBtns()')));
+await js('__typeWidth("1")');
+await sleep(600);
+await js('__rightClick("a")');
+await sleep(200);
+ok(await js('__widthBtns()') === '-! +', '増減: 1 では - が押せない', String(await js('__widthBtns()')));
+await js('__typeWidth("8")');
+await sleep(600);
+
+// 連接は下限が 2 (1 本の連接は無い)
+await js('__rightClick("{ }")');
+await sleep(200);
+await js('__widthStep(-1)');
+await sleep(600);
+await js('__widthStep(-1)');
+await sleep(600);
+ok(await js('__widthRowValue()') === '2', '増減: 連接は 2 より下がらない', String(await js('__widthRowValue()')));
+
+// Escape は打ちかけを捨てる (焦点を外すと確定してしまうので印を先に立てている)
+await js('__rightClick("a")');
+await sleep(200);
+await js(`document.getElementById('partWidthBox').value = '16'`);
+await key('Escape', 'Escape', 27);
+await sleep(400);
+ok(await js('__bwOf("a")') === '8', 'Escape: 打ちかけの幅は捨てる', String(await js('__bwOf("a")')));
 
 // 幅も名前も無い部品 (ゲート) は理由を出して何も出さない
 await js('__preset("AND")');

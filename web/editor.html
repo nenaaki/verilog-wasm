@@ -172,10 +172,18 @@
     font-family: var(--mono); font-size: 10px; color: #7fd6b8;
   }
   #partWidthRow input {
-    flex: 1; min-width: 26px; width: 100%; padding: 0; border: none; outline: none;
+    flex: 1; min-width: 24px; width: 100%; padding: 0; border: none; outline: none;
     background: transparent; text-align: center;
     font-family: var(--mono); font-size: 12px; color: var(--fg);
   }
+  /* 左が - 、右が + 。1 ずつ増減させる */
+  #partWidthRow button {
+    flex: 0 0 auto; width: 17px; height: 15px; padding: 0; line-height: 1;
+    background: #16281f; color: #9ae3c4; border: 1px solid #4f9c80; border-radius: 4px;
+    font-family: var(--mono); font-size: 12px; cursor: pointer;
+  }
+  #partWidthRow button:hover:not(:disabled) { background: #1e3a2c; color: #cdf3e1; }
+  #partWidthRow button:disabled { opacity: 0.3; cursor: default; }
   .node.dead rect.body { stroke-dasharray: 4 3; }
   .node.dead text { fill: #5b626f; }
   .node { cursor: grab; }
@@ -371,6 +379,7 @@ function rootPacked() {
 const autoSave = () => writeWork(rootPacked());
 
 function loadGraph(compact, listValue = '', name = '') {
+  closePartInputs();           // 別の回路になるので、部品に重ねた欄は指す先が無くなる
   graph = expandCircuit(compact);
   nextId = Math.max(0, ...graph.nodes.map((n) => n.id)) + 1;
   selection.clear();
@@ -483,6 +492,7 @@ function pushUndo(snap = packCircuit(graph)) {
 }
 
 function applySnapshot(snap) {
+  closePartInputs();           // 回路が下から入れ替わるので、開いている欄は捨てる
   graph = expandCircuit(snap);
   nextId = Math.max(0, ...graph.nodes.map((n) => n.id)) + 1;
   selection.clear();
@@ -1141,6 +1151,7 @@ function render() {
   }
   $('rubber').setAttribute('d', '');
   renderBand();
+  placePartInputs();      // 開いている欄を部品に追従させる (移動・拡大縮小・幅の変更)
 }
 
 /** 範囲選択の矩形 */
@@ -1227,10 +1238,61 @@ function renderTable() {
 // 上段 (部品の本体にぴったり重なる) が名前と値、下段 (すぐ下) が幅。
 // Enter で確定して閉じ、Escape で取り消し、フォーカスを外しても確定する。
 
-/** 部品に重ねている欄を片付ける */
+/** 開いている欄。部品が動いたら追従させたいので覚えておく */
+let partInputs = [];
+
+/**
+ * 欄を 1 個ぶん登録する。place は部品の本体の矩形を受けて位置を決め、
+ * commit は中身を確定する (2 度呼ばれても効かないよう各自で守る)。
+ */
+function addPartInput(el, id, place, commit) {
+  partInputs.push({ el, id, place, commit });
+  place(bodyRect(id));
+  // 焦点を持っていない欄には blur が来ないので、外を押したことを自分で拾う必要がある
+  if (partInputs.length === 1) document.addEventListener('pointerdown', outsidePartInput, true);
+}
+
+/** 部品が動いた・大きさが変わったときに欄を追従させる (render から呼ぶ) */
+function placePartInputs() {
+  for (const p of [...partInputs]) {
+    const r = bodyRect(p.id);
+    if (r) p.place(r); else drop(p.el);          // 部品が消えたら欄も消す
+  }
+  partInputs = partInputs.filter((p) => p.el.isConnected);
+  if (partInputs.length === 0) document.removeEventListener('pointerdown', outsidePartInput, true);
+}
+
+/** 欄の外を押したら確定して閉じる */
+function outsidePartInput(e) {
+  if (e.target?.closest?.('#renameBox, #partWidthRow')) return;
+  commitPartInputs();
+}
+
+/**
+ * 欄を DOM から外す。
+ *
+ * remove() は焦点を持った要素を外すとその途中で blur を飛ばすので、確定処理が
+ * 先に自分で外してしまい remove() 自体が NotFoundError になる。**先に焦点を外して
+ * 確定を走らせ切ってから**外すことで、どちらの順でも 1 回で片付く。
+ */
+function drop(el) {
+  if (!el.isConnected) return;
+  if (el.contains(document.activeElement)) document.activeElement.blur();
+  if (el.isConnected) el.remove();
+}
+
+/** 開いている欄を確定して片付ける */
+function commitPartInputs() {
+  for (const p of [...partInputs]) p.commit();
+  closePartInputs();
+}
+
+/** 開いている欄を確定せずに片付ける */
 function closePartInputs() {
-  document.getElementById('renameBox')?.remove();
-  document.getElementById('partWidthRow')?.remove();
+  const open = partInputs;
+  partInputs = [];              // 先に空にする — blur から回り込んでも同じ列を触らせない
+  document.removeEventListener('pointerdown', outsidePartInput, true);
+  for (const p of open) drop(p.el);
 }
 
 /** 部品の本体の矩形。箱の外に出ている飾り (端子・幅の数字) は含めない */
@@ -1270,12 +1332,13 @@ function startPartEdit(id) {
 /**
  * 下段の幅の欄。ツールバーの「幅」と同じことを部品のそばでできるようにする。
  * 連接だけは中身が「入力の本数」なので見出しも変える。
+ * 左の `-` と右の `+` は押した時点で 1 ずつ効かせる (打ち直すより速い)。
  */
 function startWidthEdit(id) {
   const n = byId(id);
-  const r = bodyRect(id);
-  if (!n || !r) return;
+  if (!n || !bodyRect(id)) return;
   const isPins = spec(n).pins;
+  const min = isPins ? MIN_PINS : 1;
 
   const row = document.createElement('div');
   row.id = 'partWidthRow';
@@ -1289,11 +1352,43 @@ function startWidthEdit(id) {
   inp.title = isPins
     ? `連接の入力の本数 (${MIN_PINS}〜${MAX_WIDTH})`
     : `${spec(n).label}のビット幅 (1〜${MAX_WIDTH})`;
-  row.append(lab, inp);
-  Object.assign(row.style, {
-    left: `${r.x}px`, top: `${r.y + r.height + 4}px`, width: `${Math.max(r.width, 84)}px`,
-  });
+
+  const unit = isPins ? '本数' : '幅';
+  const btn = (text, d) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = text;
+    b.dataset.step = String(d);
+    b.title = `${unit}を 1 ${d < 0 ? '減らす' : '増やす'}`;
+    // 焦点を動かさない。動かすと入力欄が blur して確定・消滅してしまう
+    b.addEventListener('mousedown', (e) => e.preventDefault());
+    b.addEventListener('click', (e) => { e.preventDefault(); step(d); });
+    return b;
+  };
+  const minus = btn('-', -1);
+  const plus = btn('+', +1);
+  row.append(lab, minus, inp, plus);          // 左が - 、右が +
   $('canvasWrap').appendChild(row);
+
+  /** いまの欄の値。読めなければ部品の実際の値に落とす */
+  const current = () => {
+    const v = Number.parseInt(inp.value.trim(), 10);
+    return Number.isInteger(v) ? Math.max(min, Math.min(MAX_WIDTH, v)) : sizeOfPart(n);
+  };
+  const sync = () => {
+    minus.disabled = current() <= min;
+    plus.disabled = current() >= MAX_WIDTH;
+  };
+  function step(d) {
+    const w = Math.max(min, Math.min(MAX_WIDTH, current() + d));
+    inp.value = String(w);
+    sync();
+    // 押すたびに効かせる。部品の大きさが変わることがある (連接の端子) が、
+    // 位置合わせは render → placePartInputs が引き受ける
+    if (applyWidth([n], w)) setMsg(widthMsg([n], w), 'ok');
+  }
+  inp.addEventListener('input', sync);
+  sync();
 
   let done = false;
   const close = () => { done = true; row.remove(); };
@@ -1302,7 +1397,7 @@ function startWidthEdit(id) {
     const text = inp.value.trim();
     close();
     if (text === '') return;
-    if (!/^[0-9]+$/.test(text)) { setMsg(`幅として読めません: ${text}`, 'err'); return; }
+    if (!/^[0-9]+$/.test(text)) { setMsg(`${unit}として読めません: ${text}`, 'err'); return; }
     const w = Math.max(1, Math.min(MAX_WIDTH, Number.parseInt(text, 10)));
     if (applyWidth([n], w)) setMsg(widthMsg([n], w), 'ok');
     else updateEditUI();          // 連接に 1 を入れた等、変わらなかったとき
@@ -1310,9 +1405,18 @@ function startWidthEdit(id) {
   inp.addEventListener('keydown', (e) => {
     e.stopPropagation();                                 // Space / Del を回路側に流さない
     if (e.key === 'Enter') { commit(); closePartInputs(); }
-    if (e.key === 'Escape') closePartInputs();
+    // close() を先に呼ぶのが要点。焦点を外すと blur → commit が走ってしまうので、
+    // 「確定しない」印 (done) を立ててから閉じる
+    if (e.key === 'Escape') { close(); closePartInputs(); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); step(+1); }
+    if (e.key === 'ArrowDown') { e.preventDefault(); step(-1); }
   });
   inp.addEventListener('blur', commit);
+
+  addPartInput(row, id, (r) => {
+    Object.assign(row.style,
+      { left: `${r.x}px`, top: `${r.y + r.height + 4}px`, width: `${Math.max(r.width, 112)}px` });
+  }, commit);
 }
 
 // 部品の上に input を重ねて出す。Enter で確定・Escape で取り消し・空にすると自動名に戻る。
@@ -1325,20 +1429,13 @@ function startRename(id) {
   }
   document.getElementById('renameBox')?.remove();
 
-  const r = bodyRect(id);
-  if (!r) return;
+  if (!bodyRect(id)) return;
   const inp = document.createElement('input');
   inp.id = 'renameBox';
   inp.type = 'text';
   inp.spellcheck = false;
   inp.value = n.name ?? plan?.signalOf.get(id) ?? '';
-  Object.assign(inp.style, {
-    left: `${r.x}px`, top: `${r.y}px`,
-    width: `${Math.max(r.width, 84)}px`, height: `${r.height}px`,
-  });
   $('canvasWrap').appendChild(inp);
-  inp.focus();
-  inp.select();
 
   let done = false;
   const close = () => { done = true; inp.remove(); };
@@ -1362,6 +1459,16 @@ function startRename(id) {
     if (e.key === 'Escape') { close(); closePartInputs(); }
   });
   inp.addEventListener('blur', commit);
+  addPartInput(inp, id, (r) => {
+    Object.assign(inp.style, {
+      left: `${r.x}px`, top: `${r.y}px`,
+      width: `${Math.max(r.width, 84)}px`, height: `${r.height}px`,
+    });
+  }, commit);
+  // 場所を決めてから焦点を当てる。置く前に focus すると (まだ左上にいるので)
+  // canvasWrap がそこまでスクロールしてしまい、欄が部品からずれる
+  inp.focus();
+  inp.select();
 }
 
 /**
@@ -1376,23 +1483,16 @@ function startValueEdit(id) {
   const w = widthOf(n);
   closePartInputs();
 
-  const r = bodyRect(id);
-  if (!r) return;
+  if (!bodyRect(id)) return;
   const inp = document.createElement('input');
   inp.id = 'renameBox';                     // CSS と後片付けを名前の箱と共用する
   inp.type = 'text';
   inp.spellcheck = false;
   inp.value = isIndex ? String(bitIndex(n)) : fmtValue(n.value ?? 0, w);
   inp.title = isIndex
-    ? `取り出す範囲のいちばん下のビット番号 (10 進)。幅は「幅」の欄で決める`
+    ? `取り出す範囲のいちばん下のビット番号 (10 進)。幅は右クリックの「幅」で決める`
     : `${w} ビットの値を 16 進で入れる (0x を付けても可)`;
-  Object.assign(inp.style, {
-    left: `${r.x}px`, top: `${r.y}px`,
-    width: `${Math.max(r.width, 84)}px`, height: `${r.height}px`,
-  });
   $('canvasWrap').appendChild(inp);
-  inp.focus();
-  inp.select();
 
   let done = false;
   const close = () => { done = true; inp.remove(); };
@@ -1424,9 +1524,17 @@ function startValueEdit(id) {
   inp.addEventListener('keydown', (e) => {
     e.stopPropagation();
     if (e.key === 'Enter') commit();
-    if (e.key === 'Escape') close();
+    if (e.key === 'Escape') { close(); closePartInputs(); }
   });
   inp.addEventListener('blur', commit);
+  addPartInput(inp, id, (r) => {
+    Object.assign(inp.style, {
+      left: `${r.x}px`, top: `${r.y}px`,
+      width: `${Math.max(r.width, 84)}px`, height: `${r.height}px`,
+    });
+  }, commit);
+  inp.focus();          // 置いてから焦点を当てる (startRename と同じ理由)
+  inp.select();
 }
 
 // -------------------------------------------------- 表示範囲 (拡大縮小 / スクロール)
@@ -1767,6 +1875,7 @@ $('syncBlocks').onclick = syncBlocks;
 $('bitWidth').onchange = () => {
   const sized = sizedSelection();
   if (sized.length === 0) return;
+  closePartInputs();      // 幅が変わると値も丸まるので、開いている値の欄は捨てる
   const w = Math.max(1, Math.min(MAX_WIDTH, Math.round(Number($('bitWidth').value) || 1)));
   // 何も変わらないとき (連接に 1 を入れた等) は、欄を実際の値に戻して終わり
   if (!applyWidth(sized, w)) { updateEditUI(); return; }
