@@ -237,6 +237,18 @@ const HELPERS = `
   window.__wave = (sig) => document.querySelector('#waveSvg path[data-sig="' + sig + '"]')?.dataset.bits ?? null;
   window.__waveSigs = () => [...document.querySelectorAll('#waveSvg path.sig')].map((p) => p.dataset.sig).join(',');
   window.__waveInfo = () => document.getElementById('waveInfo').textContent;
+  // カーソル: 指している列と、そのとき名前の右に出る値
+  window.__waveCursor = () => {
+    const r = document.querySelector('#waveSvg rect.cursor');
+    return r ? Number(r.dataset.col) : -1;
+  };
+  window.__waveVals = () => [...document.querySelectorAll('#waveNames text.val')]
+    .map((t) => t.dataset.sig + '=' + t.dataset.val).join(',');
+  /** 波形の c 列目の中心の client 座標 */
+  window.__waveColPoint = (c) => {
+    const r = document.getElementById('waveSvg').getBoundingClientRect();
+    return [r.x + c * 26 + 13, r.y + r.height / 2];
+  };
   window.__waveH = () => document.getElementById('wavePanel').getBoundingClientRect().height;
   // 表示範囲とパネル
   window.__viewBox = () => document.getElementById('svg').getAttribute('viewBox');
@@ -530,8 +542,50 @@ await click(await js('__btn("clockN")'));
 ok(await js('__wave("q")') === '010101010101', '波形: まとめて 8 クロック打てる', await js('__wave("q")'));
 ok(await js('__cyc()') === 'cyc=11', '波形: カウンタも 8 進む', await js('__cyc()'));
 
+// ---- カーソル (クリックした列の値を読む) ----
+ok(await js('__waveCursor()') === -1, 'カーソル: 最初は出ていない');
+ok(await js('__waveVals()') === '', 'カーソル: 値の列も空');
+
+await click(await js('__waveColPoint(3)'));
+ok(await js('__waveCursor()') === 3, 'カーソル: クリックした列に付く', String(await js('__waveCursor()')));
+// q は 010101… なので 3 列目 (0 起点) は 1
+ok(await js('__waveVals()') === 'q=1,out=1', 'カーソル: その列の値が出る', await js('__waveVals()'));
+ok((await js('__waveInfo()')).includes('カーソル'), 'カーソル: 情報欄に列が出る', await js('__waveInfo()'));
+
+await click(await js('__waveColPoint(4)'));
+ok(await js('__waveCursor()') === 4, 'カーソル: 別の列に移せる', String(await js('__waveCursor()')));
+ok(await js('__waveVals()') === 'q=0,out=0', 'カーソル: 値も追従する', await js('__waveVals()'));
+
+await key('ArrowLeft', 'ArrowLeft', 37);
+ok(await js('__waveCursor()') === 3, 'カーソル: ← で 1 列戻る', String(await js('__waveCursor()')));
+ok(await js('__waveVals()') === 'q=1,out=1', 'カーソル: ← のあとの値', await js('__waveVals()'));
+await key('ArrowRight', 'ArrowRight', 39);
+ok(await js('__waveCursor()') === 4, 'カーソル: → で 1 列進む', String(await js('__waveCursor()')));
+
+await key('ArrowLeft', 'ArrowLeft', 37);
+await key('ArrowLeft', 'ArrowLeft', 37);
+await key('ArrowLeft', 'ArrowLeft', 37);
+await key('ArrowLeft', 'ArrowLeft', 37);
+ok(await js('__waveCursor()') === 0, 'カーソル: 左端で止まる', String(await js('__waveCursor()')));
+
+await click(await js('__waveColPoint(0)'));
+ok(await js('__waveCursor()') === -1, 'カーソル: 同じ列をもう一度押すと外れる', String(await js('__waveCursor()')));
+
+await click(await js('__waveColPoint(2)'));
+await key('Escape', 'Escape', 27);
+ok(await js('__waveCursor()') === -1, 'カーソル: Escape でも外れる', String(await js('__waveCursor()')));
+
+// 内部の配線を出すと、その値もカーソルで読める
+await js('document.getElementById("waveGates").click()');
+await sleep(200);
+await click(await js('__waveColPoint(3)'));
+ok(await js('__waveVals()') === 'q=1,out=1,n2=0', 'カーソル: 内部の配線の値も読める', await js('__waveVals()'));
+await js('document.getElementById("waveGates").click()');
+await sleep(200);
+
 await click(await js('__btn("waveClear")'));
 ok(await js('__wave("q")') === '1', '波形: クリアすると今の値だけになる', await js('__wave("q")'));
+ok(await js('__waveCursor()') === -1, 'カーソル: 波形をクリアすると外れる', String(await js('__waveCursor()')));
 
 const wh0 = await js('__waveH()');
 const splitW = await js('__btn("splitW")');

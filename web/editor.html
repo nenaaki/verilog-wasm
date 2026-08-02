@@ -105,6 +105,10 @@
   #waveNames text.reg { fill: var(--blue); }
   #waveNames text.out { fill: var(--amber); }
   #waveNames text.block { fill: #7fd6b8; }
+  /* カーソル位置の値。名前より目立たせる */
+  #waveNames text.val { fill: var(--fg); text-anchor: end; font-size: 11.5px; }
+  #waveSvg .cursor { fill: #5aa2ff; fill-opacity: .14; stroke: var(--blue); stroke-width: 1; }
+  #waveSvg { cursor: crosshair; }
   #waveSvg .lane { stroke: #262b36; stroke-width: 1; }
   #waveSvg .cyc { font-family: var(--mono); font-size: 9.5px; fill: #6b7382; text-anchor: middle; }
   #waveSvg .edge { stroke: #232833; stroke-width: 1; }
@@ -1051,8 +1055,24 @@ function waveRows() {
   return rows;
 }
 
+// 波形のカーソル。列番号 (frames の添字) か null。
+// クロックを打つと列が増え、上限を超えると frames が前から落ちるので、
+// 範囲外になったら末尾に寄せる (何も無くなったら外す)。
+let waveCursor = null;
+
 function renderWave() {
-  drawWave(frames, waveRows(), { perClock: hasRegs(), ready: !!sim });
+  if (waveCursor !== null && waveCursor >= frames.length) {
+    waveCursor = frames.length ? frames.length - 1 : null;
+  }
+  drawWave(frames, waveRows(), { perClock: hasRegs(), ready: !!sim, cursor: waveCursor });
+}
+
+/** 波形の列を指す。範囲外なら何もしない。同じ列をもう一度指すと外す */
+function setWaveCursor(col, toggle = false) {
+  if (frames.length === 0) return;
+  const c = Math.max(0, Math.min(frames.length - 1, col));
+  waveCursor = toggle && waveCursor === c ? null : c;
+  renderWave();
 }
 
 // ------------------------------------------------ 真理値表 / 状態遷移表
@@ -1304,7 +1324,17 @@ window.addEventListener('keydown', (e) => {
     return;                                                   // 他の Ctrl 系はブラウザに任せる
   }
 
-  if (e.key === 'Escape') { armed = null; selection.clear(); render(); updateEditUI(); }
+  // カーソルを置いているあいだは矢印で列を送る (置いていないときは何もしない)
+  if (waveCursor !== null && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+    e.preventDefault();
+    setWaveCursor(waveCursor + (e.key === 'ArrowRight' ? 1 : -1));
+    return;
+  }
+
+  if (e.key === 'Escape') {
+    if (waveCursor !== null) { waveCursor = null; renderWave(); }
+    armed = null; selection.clear(); render(); updateEditUI();
+  }
   if (e.key === ' ') { e.preventDefault(); clockOnce(); }     // スペースでクロック
   if (e.key === 'F2' && selection.size === 1) { e.preventDefault(); startRename([...selection][0]); }
   if (e.key === 'Delete' || e.key === 'Backspace') {
@@ -1443,7 +1473,13 @@ $('renameBtn').onclick = () => {
 };
 $('clock').onclick = () => clockOnce(1);
 $('clockN').onclick = () => clockOnce(clamp(Number($('nclk').value) || 1, 1, 256));
-$('waveClear').onclick = () => { frames = []; evaluate('append'); };
+$('waveClear').onclick = () => { frames = []; waveCursor = null; evaluate('append'); };
+
+// 波形をクリックした列の値を読む。もう一度同じ列を押すとカーソルを外す
+$('waveSvg').addEventListener('pointerdown', (e) => {
+  const r = $('waveSvg').getBoundingClientRect();
+  setWaveCursor(Math.floor((e.clientX - r.left) / WAVE.colW), true);
+});
 $('waveGates').onchange = renderWave;
 $('zero').onclick = () => {
   if (!sim) return;
