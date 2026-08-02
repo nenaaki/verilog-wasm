@@ -226,10 +226,12 @@ const HELPERS = `
     const w = document.getElementById('bitWidth');
     return w.disabled ? null : w.value;
   };
-  window.__setWidth = async (v) => {
+  // 返り値は「その場のメッセージ」。この後のコンパイル結果に上書きされるので先に取る
+  window.__setWidth = (v) => {
     const w = document.getElementById('bitWidth');
     w.value = String(v);
-    await w.onchange();
+    w.onchange();
+    return document.getElementById('msg').textContent;
   };
   window.__valueBoxOpen = () => !!document.getElementById('renameBox');
   window.__typeValue = (text) => {
@@ -1186,6 +1188,46 @@ const btns = await js(`[...document.querySelectorAll('#palette button')].map(b =
 for (const label of ['ビット', '連接', '加算', '減算', '一致', '小なり', '選択']) {
   ok(btns.includes(label), `部品: パレットに「${label}」がある`, btns);
 }
+
+// ==================================================== 連接の入力の本数
+// 「幅」の欄は連接だけ意味が違って、入力端子の本数になる
+await js('__preset("上下に割って")');
+await sleep(600);
+await js(`(() => {
+  const g = [...document.querySelectorAll('#gNodes .node')].find(x => x.textContent.trim() === '{ }');
+  const r = g.getBoundingClientRect();
+  window.__catPoint = [r.x + r.width / 2, r.y + r.height / 2];
+  window.__catH = () => {
+    const n = [...document.querySelectorAll('#gNodes .node')].find(x => x.textContent.trim() === '{ }');
+    return Math.round(n.querySelector('rect.body').getAttribute('height'));
+  };
+  return 1;
+})()`);
+const catH2 = await js('__catH()');
+await click(await js('__catPoint'));
+ok(await js('__widthBox()') === '2', '連接: 幅の欄に入力の本数 (2) が出る', String(await js('__widthBox()')));
+
+// 3 本にすると端子が 1 本増える。増えた端子は未配線なので回路からは落ちる
+const catMsg = await js('__setWidth(3)');
+ok(catMsg.includes('3 入力'), '連接: 本数を変えたと言ってくる', catMsg);
+await sleep(600);
+ok(await js('__catH()') > catH2, '連接: 端子が増えると箱が伸びる',
+  `${await js('__catH()')} <= ${catH2}`);
+ok(!(await js('__verilog()')).includes('{'), '連接: 未配線の端子があると回路に出ない', await js('__verilog()'));
+
+// 2 本に戻すと元どおり
+await click(await js('__catPoint'));
+await js('__setWidth(2)');
+await sleep(600);
+ok((await js('__verilog()')).includes('output [7:0] sw'), '連接: 2 本に戻すと元どおり',
+  await js('__verilog()'));
+ok(await js('__catH()') === catH2, '連接: 箱の高さも戻る', String(await js('__catH()')));
+
+// 1 は連接にならないので 2 に上がる
+await click(await js('__catPoint'));
+await js('__setWidth(1)');
+await sleep(600);
+ok(await js('__widthBox()') === '2', '連接: 本数 1 は 2 に上がる', String(await js('__widthBox()')));
 
 // ------------------------------------------------------------------ 結果
 console.log(`${passed} 件成功, ${failures.length} 件失敗`);

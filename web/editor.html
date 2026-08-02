@@ -203,7 +203,7 @@
   <button id="renameBtn">名前 (F2)</button>
   <span class="label">幅</span>
   <input type="number" id="bitWidth" value="1" min="1" max="32"
-    title="選んだ 入力 / 定数 / メモリ のビット幅（ビット取り出しでは取り出すビット数）。ゲートと出力は繋いだ先から決まる">
+    title="選んだ 入力 / 定数 / メモリ のビット幅（ビット取り出しでは取り出すビット数、連接では入力の本数）。ゲートと出力は繋いだ先から決まる">
   <button id="openBlock" title="選んだ回路部品の中身を開いて編集する (ダブルクリックでも開く)">部品の中へ</button>
   <button id="clear">全部消す</button>
   <button id="fit">表示リセット</button>
@@ -284,8 +284,9 @@
 import { compile, CompileError } from '../src/compile.js';
 import { WasmSimulator } from '../src/sim.js';
 import {
-  CLOCK, MAX_WIDTH, PARTS, bitIndex, blockPorts, checkName, clampValue, decodeCircuit,
-  encodeCircuit, expandCircuit, insOf, outsOf, packCircuit, sliceOf, toVerilog, widthOf,
+  CLOCK, MAX_WIDTH, MIN_PINS, PARTS, bitIndex, blockPorts, checkName, clampValue, decodeCircuit,
+  encodeCircuit, expandCircuit, insOf, outsOf, packCircuit, sizeOfPart, sliceOf, toVerilog,
+  widthOf,
 } from '../src/schematic.js';
 import { SAMPLE_CIRCUITS } from '../src/samples.js';
 import { el, hel, $ } from './dom.js';
@@ -497,11 +498,11 @@ function updateEditUI() {
   const one = selection.size === 1 ? byId([...selection][0]) : null;
   $('openBlock').disabled = one?.type !== 'block';
 
-  // 幅の欄は、幅を持てる部品を選んでいるときだけ触れる
+  // 幅の欄は、幅 (連接なら本数) を持てる部品を選んでいるときだけ触れる
   const sized = sizedSelection();
   $('bitWidth').disabled = sized.length === 0;
   if (sized.length > 0) {
-    const ws = new Set(sized.map((n) => widthOf(n)));
+    const ws = new Set(sized.map((n) => sizeOfPart(n)));
     $('bitWidth').value = ws.size === 1 ? [...ws][0] : '';
   }
 
@@ -917,8 +918,9 @@ function fmtValue(v, w) {
   return Number(v).toString(16).toUpperCase().padStart(Math.ceil(w / 4), '0');
 }
 
-/** 選んでいる部品のうち幅を持てるもの */
-const sizedSelection = () => [...selection].map(byId).filter((n) => n && spec(n).sized);
+/** 選んでいる部品のうち「幅」の欄が効くもの。連接だけは中身が本数になる */
+const sizedSelection = () =>
+  [...selection].map(byId).filter((n) => n && (spec(n).sized || spec(n).pins));
 
 // ---------------------------------------------------------------- 描画
 function render() {
@@ -1598,14 +1600,25 @@ $('bitWidth').onchange = () => {
   const sized = sizedSelection();
   if (sized.length === 0) return;
   const w = Math.max(1, Math.min(MAX_WIDTH, Math.round(Number($('bitWidth').value) || 1)));
-  if (sized.every((n) => widthOf(n) === w)) return;
+  // 連接だけは「幅」ではなく入力の本数なので、下限が違う
+  const sizeFor = (n) => (spec(n).pins ? Math.max(MIN_PINS, w) : w);
+  // 何も変わらないとき (連接に 1 を入れた等) は、欄を実際の値に戻して終わり
+  if (sized.every((n) => sizeOfPart(n) === sizeFor(n))) { updateEditUI(); return; }
   pushUndo();
   for (const n of sized) {
-    n.w = w;
-    n.value = clampValue(n.value ?? 0, w);   // 幅を狭めたら値も収める
+    n.w = sizeFor(n);
+    n.value = clampValue(n.value ?? 0, widthOf(n));   // 幅を狭めたら値も収める
   }
+  // 端子が減ったら、その先に繋がっていた配線は行き場が無くなる
+  graph.wires = graph.wires.filter((wire) => {
+    const to = byId(wire.to.node);
+    return !to || wire.to.port < insOf(to);
+  });
   rebuild();
-  setMsg(`${sized.length} 個の部品を ${w} ビットにしました`, 'ok');
+  const pins = sized.filter((n) => spec(n).pins).length;
+  if (pins === sized.length) setMsg(`${pins} 個の連接を ${Math.max(MIN_PINS, w)} 入力にしました`, 'ok');
+  else if (pins === 0) setMsg(`${sized.length} 個の部品を ${w} ビットにしました`, 'ok');
+  else setMsg(`${sized.length} 個の部品を ${w} にしました (連接は入力の本数)`, 'ok');
 };
 
 $('openBlock').onclick = () => enterBlock();

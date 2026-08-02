@@ -2744,6 +2744,54 @@ async function testSaveFormat() {
     wires: [[1, 0, 3, 0], [2, 0, 3, 1], [3, 0, 4, 0]],
   }, [[{ hi: 1, lo: 5 }, { y: 21 }], [{ hi: 0, lo: 15 }, { y: 15 }]]);
   ok(catP.source.includes('output [4:0]'), '連接: 幅が足し算になる (1 + 4 = 5)', catP.source);
+  eq(insOf(expandCircuit({ nodes: [[1, 'cat', 0, 0]], wires: [] }).nodes[0]), 2,
+    '連接: 本数を書いていない古い保存は 2 入力のまま');
+
+  // 入力の本数は w の枠で決める。1 本の連接は無いので下限は 2
+  eq(insOf(expandCircuit({ nodes: [[1, 'cat', 0, 0, 0, null, null, 4]], wires: [] }).nodes[0]), 4,
+    '連接: 本数を 4 にすると入力端子が 4 本になる');
+  eq(insOf(expandCircuit({ nodes: [[1, 'cat', 0, 0, 0, null, null, 1]], wires: [] }).nodes[0]), 2,
+    '連接: 本数 1 は 2 に上がる');
+  eq(insOf(expandCircuit({ nodes: [[1, 'cat', 0, 0, 0, null, null, 99]], wires: [] }).nodes[0]), 2,
+    '連接: 範囲外の本数は 2 に落ちる');
+  eq(expandCircuit(packCircuit(expandCircuit({
+    nodes: [[1, 'cat', 0, 0, 0, null, null, 5]], wires: [],
+  }))).nodes[0].w, 5, '連接: 本数が往復して残る');
+
+  // 4 本を束ねる。上の端子が上位ビットになる
+  const cat4 = await build('4 入力の連接', {
+    nodes: [[1, 'in', 0, 0, 1, 'a'], [2, 'in', 0, 60, 0, 'b'],
+      [3, 'in', 0, 120, 0, 'c', null, 2], [4, 'in', 0, 180, 0, 'd', null, 4],
+      [5, 'cat', 220, 60, 0, null, null, 4], [6, 'out', 430, 90, 0, 'y']],
+    wires: [[1, 0, 5, 0], [2, 0, 5, 1], [3, 0, 5, 2], [4, 0, 5, 3], [5, 0, 6, 0]],
+  }, [
+    [{ a: 1, b: 0, c: 0, d: 0 }, { y: 0x80 }],   // 1 + 1 + 2 + 4 = 8 ビット
+    [{ a: 0, b: 1, c: 0, d: 0 }, { y: 0x40 }],
+    [{ a: 0, b: 0, c: 3, d: 0 }, { y: 0x30 }],
+    [{ a: 0, b: 0, c: 0, d: 15 }, { y: 0x0F }],
+    [{ a: 1, b: 1, c: 2, d: 10 }, { y: 0xEA }],
+  ]);
+  ok(cat4.source.includes('{a, b, c, d}'), '連接: 4 本が 1 個の {} になる', cat4.source);
+  ok(cat4.source.includes('output [7:0] y'), '連接: 出力は 4 本の合計 (8 ビット)', cat4.source);
+
+  // 1 ビットを 8 本束ねてバスにする — 2 入力しか無かった頃は 7 個つないでいた
+  const cat8 = await build('8 入力の連接', {
+    nodes: [...Array.from({ length: 8 }, (_, i) => [i + 1, 'in', 0, i * 40, 0, `p${i}`]),
+      [9, 'cat', 220, 140, 0, null, null, 8], [10, 'out', 430, 140, 0, 'y']],
+    wires: [...Array.from({ length: 8 }, (_, i) => [i + 1, 0, 9, i]), [9, 0, 10, 0]],
+  }, [
+    [{ p0: 1, p1: 0, p2: 1, p3: 0, p4: 1, p5: 0, p6: 1, p7: 0 }, { y: 0xAA }],
+    [{ p0: 0, p1: 1, p2: 1, p3: 1, p4: 1, p5: 1, p6: 1, p7: 1 }, { y: 0x7F }],
+  ]);
+  ok(cat8.source.includes('output [7:0] y'), '連接: 1 ビット 8 本で 8 ビットになる', cat8.source);
+
+  // 途中の 1 本が未配線だと幅が決まらない。未配線の部品と同じ扱いで落ちる
+  const catHole = toVerilog(expandCircuit({
+    nodes: [[1, 'in', 0, 0, 0, 'a'], [2, 'in', 0, 60, 0, 'b'],
+      [3, 'cat', 220, 30, 0, null, null, 3], [4, 'out', 430, 30, 0, 'y']],
+    wires: [[1, 0, 3, 0], [2, 0, 3, 2], [3, 0, 4, 0]],
+  }));
+  ok(!catHole.source.includes('{'), '連接: 1 本でも未配線なら回路に出ない', catHole.source);
 
   const twoIn = (t) => ({
     nodes: [[1, 'in', 0, 0, 0, 'a', null, 4], [2, 'in', 0, 100, 0, 'b', null, 4],

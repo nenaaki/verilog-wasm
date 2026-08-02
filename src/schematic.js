@@ -31,8 +31,9 @@ export const PARTS = {
   // w = 取り出すビット数 (= 出力の幅)。w が 1 なら a[2]、2 以上なら a[3:1] になる
   bit:   { label: 'ビット取り出し', glyph: '[i]', btn: 'ビット', ins: 1, outs: 1,
     indexed: true, sized: true },
-  // 2 本を繋げて太いバスにする。上が上位ビット
-  cat:   { label: '連接', glyph: '{ }', btn: '連接', ins: 2, outs: 1, wrule: 'sum' },
+  // 何本かを繋げて太いバスにする。上が上位ビット。
+  // 入力の本数は w の枠に入れる (pins)。各入力の幅は配線から決まり、出力はその合計。
+  cat:   { label: '連接', glyph: '{ }', btn: '連接', ins: 2, outs: 1, wrule: 'sum', pins: true },
 
   // ---- 算術・比較・選択 ----
   add:   { label: '加算', glyph: 'A+B', btn: '加算', ins: 2, outs: 1 },
@@ -47,9 +48,12 @@ export const PARTS = {
   alias: { label: '中継', glyph: '', ins: 1, outs: 1, internal: true },
 };
 
-/** その部品の入力端子の数。ブロックだけ中身で変わる */
-export const insOf = (node) =>
-  (node.type === 'block' ? (node._ports?.inputs.length ?? 0) : PARTS[node.type].ins);
+/** その部品の入力端子の数。ブロックは中身で、連接は設定した本数で変わる */
+export const insOf = (node) => {
+  if (node.type === 'block') return node._ports?.inputs.length ?? 0;
+  if (PARTS[node.type].pins) return pinsOf(node);
+  return PARTS[node.type].ins;
+};
 
 /** その部品の出力端子の数 */
 export const outsOf = (node) =>
@@ -61,15 +65,30 @@ export const CLOCK = 'clk';
 /** 幅を持てる部品の上限。値の表示が長くなりすぎないところで切る */
 export const MAX_WIDTH = 32;
 
-/**
- * その部品の出力の幅。幅を自分で決められるのは in / const / dff だけで、
- * ゲートと out は駆動元から伝播させる (inferWidths)。
- */
-export const widthOf = (node) => {
-  if (!PARTS[node.type]?.sized) return 1;
+/** 連接の入力端子の数の下限。1 本の連接は連接ではない */
+export const MIN_PINS = 2;
+
+/** w の枠に入っている生の値。幅にも端子の数にも使う。未指定・範囲外は 1 */
+const rawW = (node) => {
   const w = Number(node.w);
   return Number.isInteger(w) && w >= 1 && w <= MAX_WIDTH ? w : 1;
 };
+
+/**
+ * その部品の出力の幅。幅を自分で決められるのは in / const / dff / ビット取り出しだけで、
+ * ゲートと out は駆動元から伝播させる (inferWidths)。
+ */
+export const widthOf = (node) => (PARTS[node.type]?.sized ? rawW(node) : 1);
+
+/**
+ * 連接の入力端子の数。幅と同じ w の枠を使い回すが、意味は本数。
+ * 下限が 2 なので、w を持たない古い保存はこれまでどおり 2 入力になる。
+ */
+export const pinsOf = (node) => Math.max(MIN_PINS, rawW(node));
+
+/** w の枠に入る値。幅の部品なら幅、連接なら本数 */
+export const sizeOfPart = (node) =>
+  (PARTS[node.type]?.pins ? pinsOf(node) : widthOf(node));
 
 /** 幅 w に収まるように値を丸める */
 export const clampValue = (value, w) => {
@@ -152,7 +171,7 @@ export function checkName(name, taken = new Set()) {
 export function packCircuit(graph) {
   return {
     nodes: graph.nodes.map((n) => {
-      const w = widthOf(n);
+      const w = sizeOfPart(n);
       const tail = [
         normValue(n),
         n.name ?? null,
@@ -210,6 +229,7 @@ export function expandCircuit(c, depth = 0) {
     };
     // 幅は先に決める (値の丸めに使う)。未指定・範囲外は 1 に落ちる
     if (PARTS[type].sized) node.w = widthOf({ type, w });
+    else if (PARTS[type].pins) node.w = pinsOf({ w });
     node.value = normValue(node);
     if (type === 'block') {
       if (!extra || typeof extra !== 'object') throw new Error('回路部品に中身がありません');
@@ -366,7 +386,7 @@ const EXPR = {
   xnor: ([a, b]) => `~(${a} ^ ${b})`,
   // 第 2 引数にノードを取るのは、ビット取り出しだけが添字を必要とするため
   bit:  ([a], n) => `${a}${sliceOf(n)}`,
-  cat:  ([hi, lo]) => `{${hi}, ${lo}}`,
+  cat:  (args) => `{${args.join(', ')}}`,   // 端子の数は可変。先頭が上位ビット
   add:  ([a, b]) => `${a} + ${b}`,
   sub:  ([a, b]) => `${a} - ${b}`,
   eq:   ([a, b]) => `${a} == ${b}`,
