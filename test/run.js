@@ -440,6 +440,102 @@ endmodule`;
   eqs(ok16.top, 'd15', '階層: 上限内の深さなら通る');
 }
 
+// ------------------------------------------------------------------ parameter
+//
+// 効いているかどうかは「同じ module が幅も動きも変わって展開されるか」で分かる。
+async function testParams() {
+  const { compiled, all } = await bothSims(example('counter_param.v'));
+  eqs(compiled.top, 'counter_param', 'parameter: top が選ばれる');
+  eqs(compiled.warnings.length, 0, 'parameter: 未駆動の警告なし', compiled.warnings.join(' / '));
+  // 4 + 8 + 4 ビットぶんのレジスタになる
+  eqs(compiled.stats.regs, 16, 'parameter: インスタンスごとに幅が変わる', `regs=${compiled.stats.regs}`);
+  const widthOf = (name) => compiled.layout.signalTable.find((s) => s.name === name)?.width;
+  eqs(widthOf('c0.cnt'), 4, 'parameter: .WIDTH(4) の指定が効く');
+  eqs(widthOf('c1.cnt'), 8, 'parameter: 指定しなければ既定値');
+  eqs(widthOf('c2.cnt'), 4, 'parameter: 順番指定の 1 個目が WIDTH');
+
+  for (const sim of all) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('rst', 0).run(5);
+    eq(sim.get('small'), 5, `${kind} parameter: 4 ビット版が 5 まで数える`);
+    eq(sim.get('big'), 5, `${kind} parameter: 8 ビット版も同じクロックで進む`);
+    eq(sim.get('by3'), 15, `${kind} parameter: STEP=3 版は 3 刻み`);
+    sim.run(20);
+    eq(sim.get('small'), 25 % 16, `${kind} parameter: 4 ビットは 16 で回る`);
+    eq(sim.get('big'), 25, `${kind} parameter: 8 ビットは回らない`);
+  }
+
+  // --top で部分木を既定値のまま見られる
+  const solo = compile(example('counter_param.v'), { top: 'counter' });
+  eqs(solo.stats.regs, 8, 'parameter: 単体で見ると既定の 8 ビット');
+
+  // 本体宣言スタイル・前のパラメータの参照・式の中での使用・親から子へ渡す
+  const chain = `module leaf(input [7:0] a, output [7:0] y);
+  parameter MASK = 8'h0F;
+  parameter SHIFT = 1;
+  localparam DOUBLE = SHIFT + SHIFT;
+  assign y = ((a & MASK) << DOUBLE) | SHIFT;
+endmodule
+
+module mid #(parameter W = 4, parameter W1 = W + 1) (
+  input [7:0] a, output [7:0] y, output [7:0] z, output [7:0] p
+);
+  leaf #(.SHIFT(W)) l0(a, y);
+  leaf #(.MASK(8'hFF), .SHIFT(1)) l1(a, z);
+  assign p = W1;
+endmodule
+
+module top(input [7:0] a, output [7:0] y, output [7:0] z, output [7:0] p);
+  mid #(.W(2)) m0(a, y, z, p);
+endmodule`;
+  const { all: cs } = await bothSims(chain);
+  for (const sim of cs) {
+    const kind = sim.constructor.name;
+    let bad = null;
+    for (const a of [0, 1, 0xa5, 0xff, 0x10]) {
+      sim.setInput('a', a).eval();
+      const wantY = (((a & 0x0f) << 4) | 2) & 255;   // SHIFT=2 → DOUBLE=4
+      const wantZ = (((a & 0xff) << 2) | 1) & 255;   // SHIFT=1 → DOUBLE=2
+      if (Number(sim.get('y')) !== wantY && !bad) bad = `y: a=${a} 期待 ${wantY} / 実際 ${sim.get('y')}`;
+      if (Number(sim.get('z')) !== wantZ && !bad) bad = `z: a=${a} 期待 ${wantZ} / 実際 ${sim.get('z')}`;
+    }
+    ok(!bad, `${kind} parameter: 本体宣言・localparam・親から子への受け渡し`, bad ?? '');
+    eq(sim.get('p'), 3, `${kind} parameter: 前のパラメータを参照した既定値 (W+1)`);
+  }
+
+  // 定数式で使える演算子
+  const consts = compile(`module m(output [7:0] a, output [7:0] b, output [7:0] c, output [7:0] d);
+    parameter P = 6;
+    localparam SHIFTED = P << 1;
+    localparam MASKED = P & 3;
+    localparam COND = (P > 4) ? 9 : 1;
+    localparam NEG = 0 - P;
+    assign a = SHIFTED;
+    assign b = MASKED;
+    assign c = COND;
+    assign d = NEG;
+  endmodule`);
+  const cv = await WasmSimulator.create(consts);
+  cv.eval();
+  eq(cv.get('a'), 12, '定数式: << が使える');
+  eq(cv.get('b'), 2, '定数式: & が使える');
+  eq(cv.get('c'), 9, '定数式: ?: が使える');
+  eq(cv.get('d'), 250, '定数式: 負の値は 32 ビットに丸めて配線される');
+
+  // 同じ module を違うパラメータで 2 回展開しても互いに影響しない
+  const twice = compile(`module w #(parameter N = 1) (input [7:0] a, output [7:0] y);
+    assign y = a << N;
+  endmodule
+  module m(input [7:0] a, output [7:0] p, output [7:0] q);
+    w #(.N(1)) u0(a, p);
+    w #(.N(3)) u1(a, q);
+  endmodule`);
+  const tv = await WasmSimulator.create(twice);
+  tv.setInput('a', 5).eval();
+  eq(tv.get('p'), 10, 'parameter: 1 個目のインスタンスは N=1');
+  eq(tv.get('q'), 40, 'parameter: 2 個目のインスタンスは N=3');
+}
+
 // ------------------------------------------------------------ 非同期リセット
 //
 // 「クロックを待たない」のが非同期の意味なので、step() ではなく eval() だけで
@@ -1707,6 +1803,41 @@ async function testErrors() {
       `module p(input a, output y); q u0(a, y); endmodule
        module q(input a, output y); p u0(a, y); endmodule`,
       /自分自身を含んでいる/],
+    ['無い parameter を指定',
+      `module leaf #(parameter W = 4) (input a, output y); assign y = ~a; endmodule
+       module m(input a, output y); leaf #(.NOPE(1)) u0(a, y); endmodule`,
+      /parameter 'NOPE' は無い/],
+    ['localparam は差し替えられない',
+      `module leaf(input a, output y); localparam L = 1; assign y = ~a; endmodule
+       module m(input a, output y); leaf #(.L(2)) u0(a, y); endmodule`,
+      /localparam は差し替えられない/],
+    ['parameter の順番指定が多すぎる',
+      `module leaf #(parameter W = 4) (input a, output y); assign y = ~a; endmodule
+       module m(input a, output y); leaf #(1, 2) u0(a, y); endmodule`,
+      /parameter は 1 個だが 2 個目/],
+    ['同じ parameter を 2 回指定',
+      `module leaf #(parameter W = 4) (input a, output y); assign y = ~a; endmodule
+       module m(input a, output y); leaf #(.W(1), .W(2)) u0(a, y); endmodule`,
+      /parameter 'W' を 2 回指定/],
+    ['parameter 指定の名前と順番の混在',
+      `module leaf #(parameter W = 4) (input a, output y); assign y = ~a; endmodule
+       module m(input a, output y); leaf #(1, .W(2)) u0(a, y); endmodule`,
+      /名前指定と順番指定を混ぜられない/],
+    ['信号は定数式に使えない',
+      `module m(input [3:0] a, output y); wire [a:0] w; assign y = ~a[0]; endmodule`,
+      /定数式に使えない/],
+    ['定数式の単項 ~ は未対応',
+      `module m(output y); parameter P = ~1; assign y = 1'b0; endmodule`,
+      /定数式では単項/],
+    ['parameter は信号にできない',
+      `module m(output y); parameter P = 1; assign P = 1'b0; endmodule`,
+      /parameter なので信号として使えない/],
+    ['parameter の幅指定は未対応',
+      `module m(output y); parameter [3:0] P = 1; assign y = 1'b0; endmodule`,
+      /parameter の幅指定は未対応/],
+    ['幅が負になる範囲',
+      `module m #(parameter W = 0) (output [W-2:0] y); assign y = 0; endmodule`,
+      /ビット範囲 \[-2:0\] が不正/],
     ['乗算は未対応',
       `module m(input [3:0] a, output [7:0] y); assign y = a * a; endmodule`,
       /解釈できない文字/],
@@ -1856,6 +1987,7 @@ function randomDesign(rng, nWires) {
   lines.push(`    if (rst) r3 <= ${expr(1)};`);
   lines.push(`    else r3 <= ${expr(2)};`);
   lines.push(`  assign rout3 = r3;`);
+  lines.push(`  assign rout4 = subOut ^ subOut2;`);
 
   // 部品を 1 個インスタンス化する。境界をまたぐ buf と平坦化を差分テストに通す。
   // 子の中身は自分のポートだけで書く必要があるので、プールを一時的に差し替える
@@ -1866,14 +1998,18 @@ function randomDesign(rng, nWires) {
   pool.length = 0;
   pool.push(...parentPool);
 
-  lines.push(`  wire [7:0] subOut;`);
+  // パラメータ付きで 2 回インスタンス化して、同じ module が別の幅で展開されるのを見る
+  const shiftBy = 1 + Math.floor(rng() * 4);
+  lines.push(`  wire [7:0] subOut, subOut2;`);
   lines.push(`  rndsub s0(.p(${pick(pool)}), .q(${pick(pool)}), .r(subOut));`);
-  pool.push('subOut');
+  lines.push(`  rndsub #(.SH(${shiftBy})) s1(.p(${pick(pool)}), .q(${pick(pool)}), .r(subOut2));`);
+  pool.push('subOut', 'subOut2');
 
   lines.push(`  assign y = ${expr(3)};`);
 
-  return `module rndsub(input [7:0] p, input [7:0] q, output [7:0] r);
-  assign r = ${subBody};
+  return `module rndsub #(parameter SH = 0) (input [7:0] p, input [7:0] q, output [7:0] r);
+  localparam SH2 = SH + SH;
+  assign r = (${subBody}) << SH2;
 endmodule
 
 module rnd(
@@ -1885,7 +2021,8 @@ module rnd(
   output [7:0] y,
   output [7:0] rout,
   output [7:0] rout2,
-  output [7:0] rout3
+  output [7:0] rout3,
+  output [7:0] rout4
 );
 ${lines.join('\n')}
   assign rout = r;
@@ -1900,7 +2037,7 @@ async function testRandomDiff() {
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
   const seen = {
     'if': 0, 'case': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0,
-    '非同期リセット': 0, '階層': 0,
+    '非同期リセット': 0, '階層': 0, 'parameter': 0,
   };
 
   for (let d = 0; d < 25 && !mismatch; d++) {
@@ -1913,6 +2050,7 @@ async function testRandomDiff() {
     if (/(&&|\|\||\(!)/.test(src)) seen['論理']++;
     if (/or posedge rst/.test(src)) seen['非同期リセット']++;
     if (/rndsub s0\(/.test(src)) seen['階層']++;
+    if (/rndsub #\(\.SH\(/.test(src)) seen['parameter']++;
     let compiled;
     try {
       compiled = compile(src);
@@ -1942,7 +2080,7 @@ async function testRandomDiff() {
         wasm.step();
         ref.step();
       }
-      for (const port of ['y', 'rout', 'rout2', 'rout3']) {
+      for (const port of ['y', 'rout', 'rout2', 'rout3', 'rout4']) {
         if (wasm.get(port) !== ref.get(port)) {
           mismatch = `${port}: wasm=${wasm.get(port)} ref=${ref.get(port)}`
             + ` (a=${a} b=${b} c=${c} rst=${rst} t=${t})\n${src}`;
@@ -2436,6 +2574,7 @@ const suites = [
   ['if / case', testIfCase],
   ['FSM (列検出)', testSeqDet],
   ['モジュール階層', testHierarchy],
+  ['parameter', testParams],
   ['非同期リセット', testAsyncReset],
   ['カウンタ', testCounter8],
   ['DFF', testDff],

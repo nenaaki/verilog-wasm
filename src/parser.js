@@ -35,21 +35,16 @@ export function parse(src) {
     if (peek().type !== 'ident') throw err(`識別子が必要ですが '${peek().value}' がありました`);
     return next().value;
   };
-  const expectIndex = () => {
-    const t = peek();
-    if (t.type !== 'num' || t.plain === undefined) throw err(`ビット添字には 10 進数が必要 ('${t.value}')`);
-    next();
-    return t.plain;
-  };
-
   // ---- [msb:lsb] / [n] ----------------------------------------------------
+  // 添字は式で受ける。`[WIDTH-1:0]` のようにパラメータが入るので、数に落とすのは
+  // elaborate 側 (パラメータの値が決まってから)。
   function parseRange() {
     if (!at('[')) return null;
     const line = peek().line;
     expect('[');
-    const a = expectIndex();
+    const a = parseExpr();
     if (eat(':')) {
-      const b = expectIndex();
+      const b = parseExpr();
       expect(']');
       return { msb: a, lsb: b, single: false, line };
     }
@@ -154,6 +149,60 @@ export function parse(src) {
     while (eat(',')) names.push(expectIdent());
     expect(';');
     return { type: 'decl', dir, kind, range, names, line };
+  }
+
+  /**
+   * parameter / localparam の宣言。値は定数式で、elaborate が順に評価する。
+   *   parameter WIDTH = 8, DEPTH = 4;
+   *   localparam TOP = WIDTH - 1;
+   * localparam はインスタンス化のときに差し替えられない点だけが違う。
+   */
+  function parseParamDecl() {
+    const line = peek().line;
+    const local = next().value === 'localparam';
+    if (at('[')) throw err('parameter の幅指定は未対応 (値の大きさで決まる)');
+    const items = [];
+    do {
+      const name = expectIdent();
+      expect('=');
+      items.push({ name, expr: parseExpr(), local, line });
+    } while (eat(','));
+    expect(';');
+    return { type: 'param', items, line };
+  }
+
+  /**
+   * #( … ) の中身。モジュール側は宣言 (`#(parameter W = 8)`)、
+   * インスタンス側は指定 (`#(.W(4))` / `#(4)`) で形が違うので mode で分ける。
+   */
+  function parseParamList(mode) {
+    expect('#');
+    expect('(');
+    const out = [];
+    if (!at(')')) {
+      const named = mode === 'decl' ? true : at('.');
+      do {
+        if (mode === 'decl') {
+          eat('parameter');                       // ANSI 形式では省略できる
+          const name = expectIdent();
+          expect('=');
+          out.push({ name, expr: parseExpr(), local: false, line: peek().line });
+        } else {
+          if (named !== at('.')) throw err('パラメータ指定は名前指定と順番指定を混ぜられない');
+          if (named) {
+            expect('.');
+            const name = expectIdent();
+            expect('(');
+            out.push({ name, expr: parseExpr() });
+            expect(')');
+          } else {
+            out.push({ name: null, expr: parseExpr() });
+          }
+        }
+      } while (eat(','));
+    }
+    expect(')');
+    return out;
   }
 
   // ---- always の中の文 -----------------------------------------------------
@@ -283,6 +332,7 @@ export function parse(src) {
   function parseModuleInst() {
     const line = peek().line;
     const moduleName = next().value;
+    const paramArgs = at('#') ? parseParamList('inst') : [];
     const instName = expectIdent();
     expect('(');
 
@@ -304,13 +354,16 @@ export function parse(src) {
     }
     expect(')');
     expect(';');
-    return { type: 'inst', module: moduleName, name: instName, ports, line };
+    return { type: 'inst', module: moduleName, name: instName, params: paramArgs, ports, line };
   }
 
   // ---- module ------------------------------------------------------------
   function parseModule() {
     const line = expect('module').line;
     const name = expectIdent();
+    // ヘッダの #(parameter …) と本体の parameter 宣言は 1 本の順序付きリストにまとめる。
+    // 後のものが前のものを参照できるので、順番に意味がある。
+    const params = at('#') ? parseParamList('decl') : [];
     const portDecls = [];
     const portOrder = [];
 
@@ -348,7 +401,10 @@ export function parse(src) {
     while (!at('endmodule')) {
       if (peek().type === 'eof') throw err("'endmodule' が見つからない");
       const v = peek().value;
-      if (DIRECTIONS.has(v) || NET_KINDS.has(v)) items.push(parseDecl());
+      if (v === 'parameter' || v === 'localparam') {
+        // 本体の parameter は宣言の並びに足す (ヘッダのぶんの後ろに来る)
+        params.push(...parseParamDecl().items);
+      } else if (DIRECTIONS.has(v) || NET_KINDS.has(v)) items.push(parseDecl());
       else if (v === 'assign') {
         const aline = next().line;
         const lhs = parseLValue();
@@ -358,8 +414,8 @@ export function parse(src) {
         items.push({ type: 'assign', lhs, rhs, line: aline });
       } else if (v === 'always') items.push(parseAlways());
       else if (GATE_PRIMITIVES.has(v)) items.push(parseGateInst());
-      else if (peek().type === 'ident' && peek(1).type === 'ident') {
-        // <モジュール名> <インスタンス名> ( … ) ;
+      else if (peek().type === 'ident' && (peek(1).type === 'ident' || peek(1).value === '#')) {
+        // <モジュール名> [#( … )] <インスタンス名> ( … ) ;
         items.push(parseModuleInst());
       } else if (peek().type === 'ident') {
         throw err(`'${v}' は未対応 (always_comb・initial などは未実装)`);
@@ -367,7 +423,7 @@ export function parse(src) {
     }
     expect('endmodule');
 
-    return { type: 'module', name, portOrder, items, line };
+    return { type: 'module', name, params, portOrder, items, line };
   }
 
   const modules = [];

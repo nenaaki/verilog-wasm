@@ -155,12 +155,127 @@ export function elaborate(mod, all = [mod]) {
   // 深さ優先の走査中は常に「いま展開している module の接頭辞」になっている。
   let scope = '';
 
+  // ---- パラメータと定数式 ----------------------------------------------------
+  //
+  // parameter / localparam の値。signals と同じく完全修飾名で持つので、同じ module を
+  // 別のパラメータで 2 回インスタンス化しても互いに影響しない。
+  const params = new Map();
+
+  const PARAM_WIDTH = 32;              // サイズ無しリテラルと同じ扱い
+  const WRAP32 = 1n << BigInt(PARAM_WIDTH);
+
+  /**
+   * 定数式を評価する。パラメータとリテラルだけで組まれた式が対象で、
+   * 幅を持たない整数 (BigInt) として計算する。
+   * ビット幅が要る演算 (~ や連接) は意味が決まらないので断る。
+   */
+  function constExpr(e) {
+    const bool = (b) => (b ? 1n : 0n);
+    switch (e.type) {
+      case 'num':
+        return e.bits & ((1n << BigInt(e.width)) - 1n);      // 自分の幅で切る
+      case 'ref': {
+        const v = params.get(scope + e.name);
+        if (v === undefined) {
+          throw new CompileError(
+            `'${e.name}' は定数式に使えない (parameter / localparam ではない)`, e.line);
+        }
+        if (e.range) throw new CompileError('定数式でビット選択は使えない', e.line);
+        return v;
+      }
+      case 'un': {
+        if (e.op === '-') return -constExpr(e.a);
+        if (e.op === '!') return bool(constExpr(e.a) === 0n);
+        throw new CompileError(`定数式では単項 '${e.op}' は使えない (幅が決まらない)`, e.line);
+      }
+      case 'bin': {
+        const a = constExpr(e.a);
+        const b = constExpr(e.b);
+        switch (e.op) {
+          case '+': return a + b;
+          case '-': return a - b;
+          case '<<': return a << b;
+          case '>>': return a >> b;
+          case '&': return a & b;
+          case '|': return a | b;
+          case '^': return a ^ b;
+          case '==': return bool(a === b);
+          case '!=': return bool(a !== b);
+          case '<': return bool(a < b);
+          case '<=': return bool(a <= b);
+          case '>': return bool(a > b);
+          case '>=': return bool(a >= b);
+          case '&&': return bool(a !== 0n && b !== 0n);
+          case '||': return bool(a !== 0n || b !== 0n);
+          default: throw new CompileError(`定数式では '${e.op}' は使えない`, e.line);
+        }
+      }
+      case 'tern':
+        return constExpr(e.sel) !== 0n ? constExpr(e.a) : constExpr(e.b);
+      default:
+        throw new CompileError(`定数式には使えない式 ('${e.type}')`, e.line);
+    }
+  }
+
+  /** [msb:lsb] を数に落とす。パラメータの値が決まった後でないと呼べない */
+  function evalRange(range, line) {
+    const msb = Number(constExpr(range.msb));
+    const lsb = Number(constExpr(range.lsb));
+    if (!Number.isSafeInteger(msb) || !Number.isSafeInteger(lsb) || msb < 0 || lsb < 0) {
+      throw new CompileError(`ビット範囲 [${msb}:${lsb}] が不正`, range.line ?? line);
+    }
+    return { msb, lsb };
+  }
+
+  /** 定数の値を LSB 先頭のネット配列にする (パラメータを式の中で使ったとき) */
+  function constBits(value, width) {
+    const masked = ((value % WRAP32) + WRAP32) % WRAP32;
+    const out = [];
+    for (let b = 0; b < width; b++) {
+      const bit = b < PARAM_WIDTH ? (masked >> BigInt(b)) & 1n : 0n;
+      out.push(bit === 1n ? CONST1 : CONST0);
+    }
+    return out;
+  }
+
+  /**
+   * スコープのパラメータを決める。ヘッダと本体の宣言を順に評価しつつ、
+   * インスタンス側の指定 (すでに親のスコープで評価済み) で上書きする。
+   * localparam は上書きできない。
+   */
+  function setupParams(m, prefix, overrides) {
+    const declared = (m.params ?? []).filter((p) => !p.local).map((p) => p.name);
+    const byName = new Map();
+    for (const [i, o] of (overrides ?? []).entries()) {
+      const name = o.name ?? declared[i];
+      if (name === undefined) {
+        throw new CompileError(
+          `${m.name} の parameter は ${declared.length} 個だが ${i + 1} 個目を渡している`, o.line);
+      }
+      if (!declared.includes(name)) {
+        throw new CompileError(`${m.name} に parameter '${name}' は無い`
+          + `${(m.params ?? []).some((p) => p.local && p.name === name) ? ' (localparam は差し替えられない)' : ''}`,
+          o.line);
+      }
+      if (byName.has(name)) throw new CompileError(`parameter '${name}' を 2 回指定している`, o.line);
+      byName.set(name, o.value);
+    }
+
+    const saved = scope;
+    scope = prefix;                    // 既定値は自分のスコープで評価する
+    for (const p of m.params ?? []) {
+      params.set(prefix + p.name, byName.has(p.name) ? byName.get(p.name) : constExpr(p.expr));
+    }
+    scope = saved;
+  }
+
   function declare(prefix, name, { dir, kind, range }, line) {
     const full = prefix + name;
     let s = signals.get(full);
+    const r = range ? evalRange(range, line) : null;
     if (!s) {
-      const msb = range ? range.msb : 0;
-      const lsb = range ? range.lsb : 0;
+      const msb = r ? r.msb : 0;
+      const lsb = r ? r.lsb : 0;
       if (msb < lsb) throw new CompileError(`降順ビット範囲 [${msb}:${lsb}] は未対応`, line);
       const width = msb - lsb + 1;
       const bits = [];
@@ -173,7 +288,7 @@ export function elaborate(mod, all = [mod]) {
       };
       signals.set(full, s);
     } else {
-      if (range && (range.msb !== s.msb || range.lsb !== s.lsb)) {
+      if (r && (r.msb !== s.msb || r.lsb !== s.lsb)) {
         throw new CompileError(`${full} のビット範囲が宣言間で矛盾している`, line);
       }
       if (dir) s.dir = dir;
@@ -184,17 +299,26 @@ export function elaborate(mod, all = [mod]) {
 
   const lookup = (name, line) => {
     const s = signals.get(scope + name);
-    if (!s) throw new CompileError(`未宣言の信号 '${name}'`, line);
+    if (!s) {
+      if (params.has(scope + name)) {
+        throw new CompileError(`'${name}' は parameter なので信号として使えない`, line);
+      }
+      throw new CompileError(`未宣言の信号 '${name}'`, line);
+    }
     return s;
   };
 
   /** 宣言だけ先に処理して、前方参照 (assign が後続の wire 宣言を参照する等) を許す */
   function declPass(m, prefix) {
+    // [WIDTH-1:0] の WIDTH を引くのに自分のスコープが要る
+    const saved = scope;
+    scope = prefix;
     for (const item of m.items) {
       if (item.type === 'decl') {
         for (const n of item.names) declare(prefix, n, item, item.line);
       }
     }
+    scope = saved;
     for (const pname of m.portOrder) {
       if (!signals.has(prefix + pname)) {
         throw new CompileError(
@@ -213,7 +337,8 @@ export function elaborate(mod, all = [mod]) {
   function refBits(node) {
     const s = lookup(node.name, node.line);
     if (!node.range) return s.bits;
-    const { msb, lsb } = node.range;
+    // 添字は定数式。パラメータ入りの [WIDTH-1:0] もここで数になる
+    const { msb, lsb } = evalRange(node.range, node.line);
     if (msb < lsb) throw new CompileError(`降順の部分選択 [${msb}:${lsb}] は未対応`, node.line);
     const out = [];
     for (let i = lsb; i <= msb; i++) {
@@ -381,6 +506,8 @@ export function elaborate(mod, all = [mod]) {
       case 'num':
         return e.width;
       case 'ref':
+        // parameter を式の中で使ったときはサイズ無しリテラルと同じ 32 ビット扱い
+        if (params.has(scope + e.name)) return PARAM_WIDTH;
         return refBits(e).length;        // refBits は純粋 (既存のネット ID を返すだけ)
       case 'un':
         return e.op === '!' ? 1 : selfWidth(e.a);
@@ -418,8 +545,14 @@ export function elaborate(mod, all = [mod]) {
         }
         return out;
       }
-      case 'ref':
+      case 'ref': {
+        const pv = params.get(scope + e.name);
+        if (pv !== undefined) {
+          if (e.range) throw new CompileError('parameter のビット選択は未対応', e.line);
+          return constBits(pv, w);
+        }
         return resize(refBits(e), w);
+      }
       case 'un': {
         if (e.op === '!') {
           // 論理否定は「全ビット 0 か」なので OR リダクションの反転。結果は 1 ビット。
@@ -814,6 +947,13 @@ export function elaborate(mod, all = [mod]) {
     instanceNames.add(childPrefix);
 
     // --- 1. 子の宣言 ---
+    // --- 0. パラメータ ---
+    // 指定式は「親のスコープで」評価する (親のパラメータを渡せる)。
+    // 宣言より先に決めないと、[WIDTH-1:0] のような幅が数にならない。
+    setupParams(sub, childPrefix, item.params.map((o) => ({
+      name: o.name, value: constExpr(o.expr), line: item.line,
+    })));
+
     declPass(sub, childPrefix);
 
     // --- 2. ポート接続 (式は親のスコープで評価する) ---
@@ -859,6 +999,7 @@ export function elaborate(mod, all = [mod]) {
   }
 
   // ---- 展開の開始 ----------------------------------------------------------
+  setupParams(mod, '', []);          // top は既定値のまま
   declPass(mod, '');
   // top の input だけは外部から与えられるので「駆動済み」とみなす
   for (const s of signals.values()) {
