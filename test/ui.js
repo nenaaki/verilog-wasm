@@ -1239,6 +1239,26 @@ for (const label of ['ビット', '連接', '加算', '減算', '一致', '小�
   ok(btns.includes(label), `部品: パレットに「${label}」がある`, btns);
 }
 
+// ---- パレットは左サイドに置く (上のツールバーが 3 段になるのを避けるため) ----
+ok(await js(`(() => {
+  const p = document.getElementById('palette').getBoundingClientRect();
+  const c = document.getElementById('canvasWrap').getBoundingClientRect();
+  return p.right <= c.left + 1 && p.width > 60;
+})()`), 'パレット: 回路の左に縦に並ぶ');
+// ツールバーは 1 段ずつ。折り返すと 1 段 45px が 80px 以上になる
+const barHs = await js(`[...document.querySelectorAll('body > .bar')].filter(b => !b.hidden)
+  .map(b => Math.round(b.getBoundingClientRect().height)).join(',')`);
+ok(barHs.split(',').every((h) => Number(h) < 60), 'パレット: 上のツールバーが折り返さない', barHs);
+// 入力から選択まで、スクロールせずに全部見えていること
+ok(await js(`(() => { const p = document.getElementById('palette');
+  return p.scrollHeight <= p.clientHeight + 1; })()`), 'パレット: 既定の大きさなら全部入る');
+const partCount = await js(`document.querySelectorAll('#palette button.part').length`);
+ok(partCount === 18, 'パレット: 置ける部品が 18 個そろっている', String(partCount));
+// 見出しで区切る。書き忘れた部品が消えないよう「その他」に落ちる作りなので、
+// その他が出ていないこと = 一覧に漏れが無いこと
+const gl = await js(`[...document.querySelectorAll('#palette .glabel')].map(g => g.textContent).join(',')`);
+ok(gl === '入出力,ゲート,メモリ,幅,算術', 'パレット: 見出しで区切られ、漏れが無い', gl);
+
 // ==================================================== 連接の入力の本数
 // 「幅」の欄は連接だけ意味が違って、入力端子の本数になる
 await js('__preset("上下に割って")');

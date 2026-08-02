@@ -59,7 +59,25 @@
   .bar input[type=text] { width: 132px; background: #232833; color: var(--fg);
     border: 1px solid var(--line); border-radius: 5px; padding: 4px 8px; font: inherit; }
 
-  main { display: grid; grid-template-columns: 1fr 7px minmax(240px, 30%); min-height: 0; }
+  main { display: grid; grid-template-columns: auto 1fr 7px minmax(240px, 30%); min-height: 0; }
+
+  /* --- 部品パレット (キャンバスの左) ---
+     上のツールバーに横並びで置くと 18 個で行が折り返して 3 段になっていたので、
+     縦のサイドに移して 2 列に畳んである。背の高い窓でなくても収まる */
+  #palette {
+    width: 118px; padding: 7px; overflow-y: auto; min-height: 0;
+    background: var(--panel2); border-right: 1px solid var(--line);
+    display: grid; grid-template-columns: 1fr 1fr; gap: 3px; align-content: start;
+  }
+  #palette .glabel {
+    grid-column: 1 / -1; margin: 4px 0 0; color: var(--dim);
+    font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em;
+  }
+  #palette .glabel:first-child { margin-top: 0; }
+  /* 18 個を縦に並べるので、行の高さを詰めて窓の高さに収める */
+  #palette button { padding: 3px 2px; font-size: 11.5px; line-height: 1.35; }
+  /* 保存した回路の名前は長くなりうるので、バーを押し広げない範囲で切る */
+  #blockPick { max-width: 150px; }
   #canvasWrap { position: relative; min-width: 0; min-height: 0; overflow: hidden; background:
     radial-gradient(circle at 1px 1px, #232833 1px, transparent 0) 0 0 / 20px 20px, #0c0e12; }
   #svg { width: 100%; height: 100%; display: block; touch-action: none; user-select: none; }
@@ -217,9 +235,6 @@
 </header>
 
 <div class="bar">
-  <span class="label">部品</span>
-  <span id="palette"></span>
-  <span class="sep"></span>
   <button id="undo" title="元に戻す (Ctrl+Z)">↶</button>
   <button id="redo" title="やり直す (Ctrl+Y)">↷</button>
   <button id="copy" title="選択をコピー (Ctrl+C)">コピー</button>
@@ -229,7 +244,13 @@
   <span class="label">幅</span>
   <input type="number" id="bitWidth" value="1" min="1" max="32"
     title="選んだ 入力 / 定数 / メモリ のビット幅（ビット取り出しでは取り出すビット数、連接では入力の本数）。ゲートと出力は繋いだ先から決まる。1 個だけなら部品を右クリックしてそのすぐ下で打つほうが速い">
-  <button id="openBlock" title="選んだ回路部品の中身を開いて編集する (ダブルクリックでも開く)">部品の中へ</button>
+  <span class="sep"></span>
+  <span class="label">部品</span>
+  <select id="blockPick" title="保存した回路を部品として置く"></select>
+  <button id="placeBlock">置く</button>
+  <button id="syncBlocks" title="置いてある部品の中身を、保存されている最新の内容に入れ替える">更新</button>
+  <button id="openBlock" title="選んだ回路部品の中身を開いて編集する (ダブルクリックでも開く)">中へ</button>
+  <span class="sep"></span>
   <button id="clear">全部消す</button>
   <button id="fit">表示リセット</button>
   <span class="sep"></span>
@@ -257,14 +278,11 @@
   <button id="loadJson" title="書き出した .json ファイルを読み込む">.json を読み込む</button>
   <input type="file" id="jsonFile" accept=".json,application/json" hidden>
   <button id="dlWasm" title="いまの回路をコンパイルした .wasm を保存">.wasm を保存</button>
-  <span class="sep"></span>
-  <span class="label">部品にする</span>
-  <select id="blockPick" title="保存した回路を部品として置く"></select>
-  <button id="placeBlock">置く</button>
-  <button id="syncBlocks" title="置いてある部品の中身を、保存されている最新の内容に入れ替える">部品を更新</button>
 </div>
 
 <main id="main">
+  <!-- 中身は script が並べる -->
+  <nav id="palette" title="押すと回路に置かれます"></nav>
   <div id="canvasWrap">
     <svg id="svg" viewBox="0 0 900 480" preserveAspectRatio="xMidYMid meet">
       <g id="gWires"></g>
@@ -1668,7 +1686,8 @@ let asideW = null, verilogH = null;   // null = CSS の初期比率のまま
 let waveH = 150;                      // 波形パネルの高さ (px)
 
 function applyPanes() {
-  main.style.gridTemplateColumns = `1fr 7px ${asideW === null ? 'minmax(240px, 30%)' : `${asideW}px`}`;
+  main.style.gridTemplateColumns
+    = `auto 1fr 7px ${asideW === null ? 'minmax(240px, 30%)' : `${asideW}px`}`;
   aside.style.gridTemplateRows = `auto ${verilogH === null ? '1fr' : `${verilogH}px`} 7px auto 1fr`;
   // header / 部品バー / [部品の中バー] / 回路バー / canvas / 区切り / 波形 / メッセージ。
   // 部品の中バーは hidden のあいだグリッドに入らないので、行もそのぶん減らす
@@ -1752,15 +1771,36 @@ window.addEventListener('keydown', (e) => {
 });
 
 // ------------------------------------------------------------ ツールバー
-for (const [type, p] of Object.entries(PARTS)) {
-  if (p.internal || p.block) continue;      // 中継は内部用、回路部品は「部品にする」から置く
-  const b = document.createElement('button');
-  b.className = 'part';
-  b.textContent = p.btn ?? p.glyph;
-  b.title = `${p.label} を追加`;
-  b.onclick = () => addNode(type);
-  $('palette').appendChild(b);
+// 左サイドのパレット。並びは PARTS のままで、見出しの切れ目だけここで決める。
+// 一覧から漏らすと部品が置けなくなるので、書き忘れは「その他」に落ちるようにしてある。
+const PALETTE_GROUPS = [
+  ['入出力', ['in', 'out', 'const']],
+  ['ゲート', ['not', 'and', 'or', 'xor', 'nand', 'nor', 'xnor']],
+  ['メモリ', ['dff']],
+  ['幅', ['bit', 'cat']],
+  ['算術', ['add', 'sub', 'eq', 'lt', 'mux']],
+];
+
+function buildPalette() {
+  // 中継は内部用、回路部品は「部品にする」から置くのでパレットには出さない
+  const placeable = Object.keys(PARTS).filter((t) => !PARTS[t].internal && !PARTS[t].block);
+  const listed = new Set(PALETTE_GROUPS.flatMap(([, types]) => types));
+  const groups = [...PALETTE_GROUPS];
+  const rest = placeable.filter((t) => !listed.has(t));
+  if (rest.length) groups.push(['その他', rest]);
+
+  for (const [label, types] of groups) {
+    hel('div', $('palette'), 'glabel').textContent = label;
+    for (const type of types) {
+      if (!placeable.includes(type)) continue;
+      const b = hel('button', $('palette'), 'part');
+      b.textContent = PARTS[type].btn ?? PARTS[type].glyph;
+      b.title = `${PARTS[type].label} を追加`;
+      b.onclick = () => addNode(type);
+    }
+  }
 }
+buildPalette();
 
 $('presets').onchange = () => loadFromList($('presets').value);
 
