@@ -159,6 +159,28 @@ export function elaborate(mod, all = [mod]) {
   // 深さ優先の走査中は常に「いま展開している module の接頭辞」になっている。
   let scope = '';
 
+  // ---- function ---------------------------------------------------------------
+  //
+  // function は呼び出しごとにインライン展開する。本体は Verilog の仕様上時間制御を
+  // 持てないので必ず組合せ回路で、ローカル変数はレジスタではなく「その場で値が入る
+  // 一時変数」= ただのネット配列になる。だから blocking 代入は「名前をネット配列に
+  // 貼り替える」だけで表せる (always の非ノンブロッキングと違って保持の場合分けが無い)。
+  // integer で宣言した名前 (完全修飾名)。信号ではなく「elaborate 時の整数」で、
+  // for のループ変数としてだけ動く。値は params に入れるので、本体の `q[i]` のような
+  // 添字が parameter と同じ経路でそのまま定数式として解ける
+  const loopVars = new Set();
+  const MAX_UNROLL = 4096;             // 展開しきれない for の歯止め
+
+  // 定数式では計算できるが、回路にはしない演算子
+  const MULDIV = { '*': '乗算', '/': '除算', '%': '剰余' };
+
+  const funcs = new Map();             // 完全修飾名 → AST
+  // 展開中のローカル環境。null 以外のあいだ refBits がこちらを先に見る。
+  // 入れ子の呼び出し (f(g(a))) は保存・復帰でスタックにする
+  let funcEnv = null;
+  const MAX_FUNC_DEPTH = 32;           // 再帰の歯止め
+  let funcDepth = 0;
+
   // ---- パラメータと定数式 ----------------------------------------------------
   //
   // parameter / localparam の値。signals と同じく完全修飾名で持つので、同じ module を
@@ -179,6 +201,9 @@ export function elaborate(mod, all = [mod]) {
       case 'num':
         if (e.mask) throw new CompileError(DONT_CARE_ONLY_IN_CASEZ, e.line);
         return e.bits & ((1n << BigInt(e.width)) - 1n);      // 自分の幅で切る
+      case 'call':
+        // 定数式は幅を持たない整数で計算するので、ビットに展開する function は使えない
+        throw new CompileError(`定数式では function (${e.name}) を呼べない`, e.line);
       case 'ref': {
         const v = params.get(scope + e.name);
         if (v === undefined) {
@@ -199,6 +224,14 @@ export function elaborate(mod, all = [mod]) {
         switch (e.op) {
           case '+': return a + b;
           case '-': return a - b;
+          // 回路にはならないが、定数どうしなら elaborate 時に計算できる
+          case '*': return a * b;
+          case '/':
+            if (b === 0n) throw new CompileError('定数式で 0 除算', e.line);
+            return a / b;
+          case '%':
+            if (b === 0n) throw new CompileError('定数式で 0 除算', e.line);
+            return a % b;
           case '<<': return a << b;
           case '>>': return a >> b;
           case '&': return a & b;
@@ -308,6 +341,10 @@ export function elaborate(mod, all = [mod]) {
       if (params.has(scope + name)) {
         throw new CompileError(`'${name}' は parameter なので信号として使えない`, line);
       }
+      if (loopVars.has(scope + name)) {
+        throw new CompileError(
+          `'${name}' は integer なので信号として使えない (for のループ変数と定数式でだけ使える)`, line);
+      }
       throw new CompileError(`未宣言の信号 '${name}'`, line);
     }
     return s;
@@ -321,6 +358,23 @@ export function elaborate(mod, all = [mod]) {
     for (const item of m.items) {
       if (item.type === 'decl') {
         for (const n of item.names) declare(prefix, n, item, item.line);
+      }
+      if (item.type === 'intdecl') {
+        for (const n of item.names) {
+          if (signals.has(prefix + n)) {
+            throw new CompileError(`'${n}' が信号と integer で二重に宣言されている`, item.line);
+          }
+          loopVars.add(prefix + n);
+        }
+      }
+      if (item.type === 'func') {
+        if (funcs.has(prefix + item.name)) {
+          throw new CompileError(`function '${item.name}' が二重に定義されている`, item.line);
+        }
+        if (signals.has(prefix + item.name)) {
+          throw new CompileError(`'${item.name}' は信号と function で名前がぶつかっている`, item.line);
+        }
+        funcs.set(prefix + item.name, item);
       }
     }
     scope = saved;
@@ -340,6 +394,10 @@ export function elaborate(mod, all = [mod]) {
   }
 
   function refBits(node) {
+    // function を展開している間はローカル (引数・ローカル変数・戻り値) を先に見る。
+    // 外側の信号と同じ名前でもローカルが勝つ (Verilog のスコープ規則)
+    const local = funcEnv?.get(node.name);
+    if (local) return sliceBits(local, node);
     const s = lookup(node.name, node.line);
     if (!node.range) return s.bits;
     // 添字は定数式。パラメータ入りの [WIDTH-1:0] もここで数になる
@@ -352,6 +410,26 @@ export function elaborate(mod, all = [mod]) {
         throw new CompileError(`${s.name}[${i}] は宣言範囲 [${s.msb}:${s.lsb}] の外`, node.line);
       }
       out.push(s.bits[pos]);
+    }
+    return out;
+  }
+
+  /**
+   * function のローカル変数のビット選択 / 部分選択。signals と同じ添字の数え方に
+   * するため、宣言時の msb / lsb を持ち歩いている。
+   */
+  function sliceBits(local, node) {
+    if (!node.range) return local.bits;
+    const { msb, lsb } = evalRange(node.range, node.line);
+    if (msb < lsb) throw new CompileError(`降順の部分選択 [${msb}:${lsb}] は未対応`, node.line);
+    const out = [];
+    for (let i = lsb; i <= msb; i++) {
+      const pos = i - local.lsb;
+      if (pos < 0 || pos >= local.bits.length) {
+        throw new CompileError(
+          `${node.name}[${i}] は宣言範囲 [${local.msb}:${local.lsb}] の外`, node.line);
+      }
+      out.push(local.bits[pos]);
     }
     return out;
   }
@@ -544,6 +622,9 @@ export function elaborate(mod, all = [mod]) {
     switch (e.type) {
       case 'num':
         return e.width;
+      case 'call':
+        // 関数呼び出しの自己決定幅は宣言した戻り値の幅。中身は見なくて済む
+        return funcWidth(lookupFunc(e));
       case 'ref':
         // parameter を式の中で使ったときはサイズ無しリテラルと同じ 32 ビット扱い
         if (params.has(scope + e.name)) return PARAM_WIDTH;
@@ -577,6 +658,10 @@ export function elaborate(mod, all = [mod]) {
     const w = Math.max(selfWidth(e), ctx);
 
     switch (e.type) {
+      // 関数呼び出しは自己決定幅 (= 宣言した戻り値の幅) で展開して、
+      // 外の文脈幅にはゼロ拡張で合わせる。文脈は中に配らない
+      case 'call':
+        return resize(inlineFunc(e), w);
       case 'num': {
         if (e.mask) throw new CompileError(DONT_CARE_ONLY_IN_CASEZ, e.line);
         const out = [];
@@ -619,6 +704,11 @@ export function elaborate(mod, all = [mod]) {
         throw new CompileError(`未対応の単項演算子 '${e.op}'`, e.line);
       }
       case 'bin': {
+        // 乗除算は回路にしない。定数どうしなら constExpr が計算するので、ここに
+        // 来た = 信号が絡んでいる。ビット展開すると回路が一気に膨らむため断る
+        if (MULDIV[e.op]) {
+          throw new CompileError(`${MULDIV[e.op]}は未対応 (定数式の中だけで使える)`, e.line);
+        }
         // --- 文脈を受け取らないもの (結果 1 ビット) ---
         if (e.op === '&&' || e.op === '||') {
           // 両辺を「0 でないか」に潰してからゲート 1 個。
@@ -710,6 +800,221 @@ export function elaborate(mod, all = [mod]) {
     return out;
   }
 
+  // ---- function の展開 --------------------------------------------------------
+
+  /** 呼び出し名から function を引く。スコープを外側へ辿る */
+  function lookupFunc(node) {
+    for (let p = scope; ; p = p.slice(0, p.lastIndexOf('.', p.length - 2) + 1)) {
+      const f = funcs.get(p + node.name);
+      if (f) return f;
+      if (p === '') break;
+    }
+    throw new CompileError(
+      `'${node.name}' という function は無い (式の中の名前 + '(' は関数呼び出し)`, node.line);
+  }
+
+  /** 宣言した戻り値の幅。範囲を省略したら 1 ビット */
+  function funcWidth(f) {
+    if (!f.range) return 1;
+    const { msb, lsb } = evalRange(f.range, f.line);
+    return msb - lsb + 1;
+  }
+
+  /** 宣言の [msb:lsb] を {msb, lsb, width} にする。省略なら 1 ビットの [0:0] */
+  function declRange(range, line) {
+    if (!range) return { msb: 0, lsb: 0, width: 1 };
+    const { msb, lsb } = evalRange(range, line);
+    if (msb < lsb) throw new CompileError(`降順の宣言 [${msb}:${lsb}] は未対応`, line);
+    return { msb, lsb, width: msb - lsb + 1 };
+  }
+
+  /**
+   * function をインライン展開して戻り値のビット配列を返す。
+   *
+   * ローカル環境 (引数・ローカル変数・戻り値) は「名前 → ネット配列」の Map で、
+   * blocking 代入はここを貼り替えるだけ。if / case は環境のコピーを 2 本走らせて
+   * mux で合流する (always の mergeStates と同じ形)。
+   */
+  function inlineFunc(node) {
+    const f = lookupFunc(node);
+    if (node.args.length !== f.args.length) {
+      throw new CompileError(
+        `${f.name} の引数は ${f.args.length} 個 (${node.args.length} 個渡されている)`, node.line);
+    }
+    if (++funcDepth > MAX_FUNC_DEPTH) {
+      funcDepth = 0;
+      throw new CompileError(`function '${f.name}' の呼び出しが深すぎる (再帰は未対応)`, node.line);
+    }
+
+    // 引数は**呼び出し側の環境**で評価する。渡した後に新しい環境へ切り替える
+    const bound = f.args.map((a, i) => {
+      const r = declRange(a.range, a.line);
+      return [a.name, { ...r, bits: resize(evalExpr(node.args[i], r.width), r.width) }];
+    });
+
+    const env = new Map(bound);
+    // 戻り値とローカルは 0 から始める (Verilog では未定義だが 2 値しか無いので 0)
+    const retR = declRange(f.range, f.line);
+    env.set(f.name, { ...retR, bits: Array(retR.width).fill(CONST0) });
+    for (const l of f.locals) {
+      if (env.has(l.name)) {
+        throw new CompileError(`${f.name}: '${l.name}' が引数と重複している`, l.line);
+      }
+      const r = declRange(l.range, l.line);
+      env.set(l.name, { ...r, bits: Array(r.width).fill(CONST0) });
+    }
+
+    // ローカルの integer も for のループ変数。scope はいまの module のままにする
+    // (書き換えると module の parameter や信号が引けなくなる)。値は unrollFor が
+    // ループの前後で退避・復帰するので、外側に同名があっても壊れない
+    for (const n of f.ints ?? []) loopVars.add(scope + n);
+
+    const outer = funcEnv;
+    funcEnv = env;
+    let out;
+    try {
+      const end = runFuncStmts(f.body, envBits(env));
+      out = end.get(f.name);
+      if (!out) throw new CompileError(`function ${f.name} は戻り値を代入していない`, f.line);
+    } finally {
+      funcEnv = outer;
+      funcDepth--;
+    }
+    return out;
+  }
+
+  /** 環境から「名前 → ネット配列」だけを取り出す (合流のときに扱いやすい形) */
+  const envBits = (env) => new Map([...env].map(([k, v]) => [k, v.bits]));
+
+  /** 走らせた結果のビット配列を funcEnv に書き戻す (以降の式が新しい値を読む) */
+  function syncEnv(bits) {
+    for (const [k, v] of bits) funcEnv.get(k).bits = v;
+  }
+
+  /** if / case の合流。触られていないビットには mux を作らない */
+  function mergeBits(cond, a, b) {
+    const out = new Map();
+    for (const k of new Set([...a.keys(), ...b.keys()])) {
+      const av = a.get(k);
+      const bv = b.get(k);
+      out.set(k, av.map((n, i) => (n === bv[i] ? n : newGate('mux', [cond, n, bv[i]]))));
+    }
+    return out;
+  }
+
+  /**
+   * for を elaborate 時に完全展開する。合成ツールと同じやり方。
+   *
+   * ループ変数は parameter と同じ表 (params) に入れる。おかげで本体の `q[i]` や
+   * `d[7-i]` は「定数式の添字」としてそのまま解け、専用の仕組みが要らない。
+   *
+   * @param run 本体を走らせる関数 (always なら runStmts、function なら runFuncStmts)
+   */
+  function unrollFor(st, state, run) {
+    const key = scope + st.name;
+    if (!loopVars.has(key)) {
+      throw new CompileError(
+        `'${st.name}' は integer で宣言されていない (for のループ変数)`, st.line);
+    }
+    const had = params.has(key);
+    const saved = params.get(key);
+    let cur = state;
+    try {
+      params.set(key, constExpr(st.init));
+      for (let n = 0; ; n++) {
+        // 添字が変わると部分選択の幅も変わり得るので、幅のキャッシュを捨てる
+        selfWidthCache.clear();
+        if (constExpr(st.cond) === 0n) break;
+        if (n >= MAX_UNROLL) {
+          throw new CompileError(
+            `for の繰り返しが ${MAX_UNROLL} 回を超えた (条件が定数で終わらない?)`, st.line);
+        }
+        cur = run(st.body, cur);
+        params.set(key, constExpr(st.step));
+      }
+    } finally {
+      selfWidthCache.clear();
+      if (had) params.set(key, saved); else params.delete(key);
+    }
+    return cur;
+  }
+
+  /** function の本体を走らせる。state は「名前 → ネット配列」 */
+  function runFuncStmts(stmts, state) {
+    let cur = state;
+    for (const st of stmts) {
+      syncEnv(cur);                     // 右辺は「ここまでの結果」を読む
+      if (st.type === 'ba') {
+        const target = cur.get(st.lhs.name);
+        if (!target) {
+          throw new CompileError(
+            `'${st.lhs.name}' は function の中で宣言されていない`, st.line);
+        }
+        const decl = funcEnv.get(st.lhs.name);
+        if (!st.lhs.range) {
+          cur.set(st.lhs.name, resize(evalExpr(st.rhs, target.length), target.length));
+          continue;
+        }
+        // 部分代入。触ったビットだけ差し替える
+        const { msb, lsb } = evalRange(st.lhs.range, st.line);
+        if (msb < lsb) throw new CompileError(`降順の部分代入 [${msb}:${lsb}] は未対応`, st.line);
+        const w = msb - lsb + 1;
+        const src = resize(evalExpr(st.rhs, w), w);
+        const next = [...target];
+        for (let i = 0; i < w; i++) {
+          const pos = lsb + i - decl.lsb;
+          if (pos < 0 || pos >= next.length) {
+            throw new CompileError(
+              `${st.lhs.name}[${lsb + i}] は宣言範囲 [${decl.msb}:${decl.lsb}] の外`, st.line);
+          }
+          next[pos] = src[i];
+        }
+        cur.set(st.lhs.name, next);
+        continue;
+      }
+
+      if (st.type === 'for') {
+        cur = unrollFor(st, cur, runFuncStmts);
+        continue;
+      }
+
+      if (st.type === 'if') {
+        const cond = reduceOr(evalExpr(st.cond));
+        const thenB = runFuncStmts(st.then, new Map(cur));
+        syncEnv(cur);                   // else 側は if に入る前の値から始める
+        const elseB = st.else ? runFuncStmts(st.else, new Map(cur)) : new Map(cur);
+        cur = mergeBits(cond, thenB, elseB);
+        continue;
+      }
+
+      if (st.type === 'case') {
+        let cw = selfWidth(st.sel);
+        for (const it of st.items) {
+          for (const label of it.labels) cw = Math.max(cw, selfWidth(label));
+        }
+        const sel = evalExpr(st.sel, cw);
+        const before = new Map(cur);
+        let acc = st.default ? runFuncStmts(st.default, new Map(before)) : new Map(before);
+        for (let k = st.items.length - 1; k >= 0; k--) {
+          const it = st.items[k];
+          syncEnv(before);
+          let cond = null;
+          for (const label of it.labels) {
+            const hit = matchLabel(sel, label, cw, st.casez);
+            cond = cond === null ? hit : newGate('or', [cond, hit]);
+          }
+          acc = mergeBits(cond, runFuncStmts(it.stmts, new Map(before)), acc);
+        }
+        cur = acc;
+        continue;
+      }
+
+      throw new CompileError(`function の中に書けない文 '${st.type}'`, st.line);
+    }
+    syncEnv(cur);
+    return cur;
+  }
+
   function runStmts(stmts, state) {
     let cur = state;
     for (const st of stmts) {
@@ -721,6 +1026,11 @@ export function elaborate(mod, all = [mod]) {
           cur.set(qn, d[i]);
           regLine.set(qn, st.line);
         });
+        continue;
+      }
+
+      if (st.type === 'for') {
+        cur = unrollFor(st, cur, runStmts);
         continue;
       }
 
@@ -768,6 +1078,7 @@ export function elaborate(mod, all = [mod]) {
     if (e.type === 'ref') out.push(e.name);
     for (const k of ['a', 'b', 'sel']) if (e[k]) refNames(e[k], out);
     if (e.parts) for (const p of e.parts) refNames(p, out);
+    if (e.args) for (const a of e.args) refNames(a, out);   // 関数呼び出しの引数
     return out;
   }
 
@@ -866,6 +1177,10 @@ export function elaborate(mod, all = [mod]) {
   function itemPass(mod, prefix, isTop, depth, stack) {
   for (const item of mod.items) {
     if (item.type === 'decl') continue;
+    // function は宣言だけ。回路になるのは呼び出された場所 (declPass で集めてある)
+    if (item.type === 'func') continue;
+    // integer は for のループ変数。declPass で名前を登録してある
+    if (item.type === 'intdecl') continue;
 
     if (item.type === 'assign') {
       const s = lookup(item.lhs.name, item.line);

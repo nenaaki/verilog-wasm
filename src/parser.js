@@ -18,13 +18,17 @@ const GATE_PRIMITIVES = new Set(['and', 'or', 'not', 'nand', 'nor', 'xor', 'xnor
 // module 本体に書けそうで書けないもの。名前を出して断る。こうしないと
 // 「<モジュール名> <インスタンス名>」に見えて、遠いところでエラーになる
 const UNSUPPORTED_ITEMS = new Set([
-  'initial', 'generate', 'endgenerate', 'function', 'task', 'defparam', 'specify',
-  'always_comb', 'always_ff', 'always_latch', 'genvar', 'integer', 'real', 'time',
+  'initial', 'generate', 'endgenerate', 'task', 'defparam', 'specify',
+  'always_comb', 'always_ff', 'always_latch', 'genvar', 'real', 'time',
 ]);
 const DIRECTIONS = new Set(['input', 'output']);
 const NET_KINDS = new Set(['wire', 'reg']);
 // signed / unsigned は宣言の中で幅の前に来る (`wire signed [3:0] x;`)。予約語として
 // 知らないと識別子に見えてしまい、次の '[' で見当違いのエラーになる
+// module 本体にしか出てこない語。function の中で出会ったら endfunction の書き忘れ
+const FUNC_BODY_STOP = new Set([
+  'endmodule', 'module', 'assign', 'always', 'function', 'task', 'input', 'output', 'inout',
+]);
 const SIGNEDNESS = {
   signed: 'signed は未対応 (すべて符号なしとして扱う)',
   unsigned: 'unsigned は既定なので、書かずに省いてください',
@@ -96,7 +100,10 @@ export function parse(src) {
     };
   }
 
-  const parseAdd = binaryLevel(['+', '-'], () => parseUnary());
+  // * / % は + - より強く結合する (Verilog と同じ)。回路としては未対応で、
+  // 定数式の中だけで計算できる — for の添字 (`d[i*4+b]`) に要るため
+  const parseMul = binaryLevel(['*', '/', '%'], () => parseUnary());
+  const parseAdd = binaryLevel(['+', '-'], parseMul);
   const parseShift = binaryLevel(['<<', '>>'], parseAdd);
   const parseRel = binaryLevel(['<=', '>=', '<', '>'], parseShift);
   const parseEq = binaryLevel(['==', '!='], parseRel);
@@ -150,6 +157,18 @@ export function parse(src) {
 
     if (t.type === 'ident') {
       next();
+      // 識別子のすぐ後ろに '(' が来たら関数呼び出し。式の中でここが曖昧になる
+      // 書き方は他に無い (ゲートのインスタンス化は文の位置にしか出てこない)
+      if (at('(')) {
+        next();
+        const args = [];
+        if (!at(')')) {
+          args.push(parseExpr());
+          while (eat(',')) args.push(parseExpr());
+        }
+        expect(')');
+        return { type: 'call', name: t.value, args, line: t.line };
+      }
       return { type: 'ref', name: t.value, range: parseRange(), line: t.line };
     }
 
@@ -239,30 +258,144 @@ export function parse(src) {
   //   { type:'if',   cond, then:[], else }   … else は文の列か null
   //   { type:'case', sel, items:[{labels,stmts}], default }
 
-  /** begin...end なら中の文の列、そうでなければ 1 文だけの列 */
-  function parseStmtBlock() {
+  /**
+   * function の宣言。戻り値は関数名そのものへの代入で決まる (Verilog の決まり)。
+   *
+   *   function [7:0] add1(input [7:0] a);
+   *     reg [7:0] t;          … ローカル変数
+   *     begin
+   *       t = a + 1;          … ブロッキング代入
+   *       add1 = t;           … 関数名に入れた値が戻り値
+   *     end
+   *   endfunction
+   *
+   * 引数は ANSI 形式 (括弧の中に input) だけ。時間制御は Verilog の仕様上そもそも
+   * 書けないので、本体は必ず組合せ回路になる = このコンパイラの表現範囲に収まる。
+   */
+  function parseFunction() {
+    const line = expect('function').line;
+    if (at('automatic') || at('static')) throw err(`function の ${peek().value} は未対応`);
+    rejectSignedness();
+    const range = parseRange();          // 省略時は 1 ビット
+    const name = expectIdent();
+
+    const args = [];
+    if (eat('(')) {
+      if (at(')')) throw err('function には引数が 1 つ以上必要');
+      do {
+        if (!at('input')) throw err('function の引数は input だけ');
+        next();
+        rejectSignedness();
+        const arange = parseRange();
+        args.push({ name: expectIdent(), range: arange, line: peek().line });
+        // input a, b; のようにまとめて書く形も許す
+        while (at(',') && peek(1).type === 'ident' && !at2Input()) {
+          next();
+          args.push({ name: expectIdent(), range: arange, line: peek().line });
+        }
+      } while (eat(','));
+      expect(')');
+    }
+    expect(';');
+    if (args.length === 0) {
+      throw err('引数を括弧の中に input で書く (function f(input a); の形。旧形式は未対応)');
+    }
+
+    // ローカル変数の宣言。本体より先にまとめて書く。integer は for のループ変数
+    const locals = [];
+    const ints = [];
+    while (at('reg') || at('wire') || at('integer')) {
+      if (at('integer')) { ints.push(...parseIntDecl().names); continue; }
+      const kind = next().value;
+      rejectSignedness();
+      const lrange = parseRange();
+      const names = [expectIdent()];
+      while (eat(',')) names.push(expectIdent());
+      expect(';');
+      for (const n of names) locals.push({ name: n, range: lrange, kind, line });
+    }
+
+    // begin...end で囲んでも囲まなくてもよいので parseStmtBlock で読む。
+    // module 本体にしか出てこない語が来たら endfunction の書き忘れ ― ここで止めないと
+    // `assign` を代入の左辺として読んでしまい、原因から遠いエラーになる
+    const body = [];
+    while (!at('endfunction')) {
+      if (peek().type === 'eof' || FUNC_BODY_STOP.has(peek().value)) {
+        throw err("'endfunction' が見つからない");
+      }
+      body.push(...parseStmtBlock(true));
+    }
+    expect('endfunction');
+    if (body.length === 0) throw err(`function ${name} の中身が空`);
+    // 戻り値は「関数名への代入」なので、1 度も代入していなければ書き間違い。
+    // 実行時ではなくここで見るのは、分岐の片側だけの代入は正しい形だから
+    if (!assignsTo(body, name)) {
+      throw err(`function ${name} は戻り値 (${name} への代入) がどこにも無い`);
+    }
+    return { type: 'func', name, range, args, locals, ints, body, line };
+  }
+
+  /** 文の列のどこかで name に代入しているか */
+  function assignsTo(stmts, name) {
+    return stmts.some((st) => {
+      if (st.type === 'ba' || st.type === 'nb') return st.lhs.name === name;
+      if (st.type === 'if') {
+        return assignsTo(st.then, name) || (st.else ? assignsTo(st.else, name) : false);
+      }
+      if (st.type === 'for') return assignsTo(st.body, name);
+      if (st.type === 'case') {
+        return st.items.some((it) => assignsTo(it.stmts, name))
+          || (st.default ? assignsTo(st.default, name) : false);
+      }
+      return false;
+    });
+  }
+
+  /** 次の ',' の後ろが input かどうか (引数をまとめて書く形の判定用) */
+  const at2Input = () => peek(1).value === 'input';
+
+  /**
+   * begin...end なら中の文の列、そうでなければ 1 文だけの列。
+   * blocking = true は function の中。代入が `<=` ではなく `=` になる。
+   */
+  function parseStmtBlock(blocking = false) {
     if (eat('begin')) {
       const list = [];
       while (!at('end')) {
-        // endmodule もここで止める。止めないと次の文の左辺として読んでしまい、
-        // 「'<=' が必要」のような原因から遠いエラーになる
-        if (peek().type === 'eof' || at('endmodule')) throw err("'end' が見つからない");
-        list.push(parseStmt());
+        // endmodule / endfunction もここで止める。止めないと次の文の左辺として
+        // 読んでしまい、「'<=' が必要」のような原因から遠いエラーになる
+        if (peek().type === 'eof' || at('endmodule') || at('endfunction')) {
+          throw err("'end' が見つからない");
+        }
+        list.push(parseStmt(blocking));
       }
       expect('end');
       return list;
     }
-    return [parseStmt()];
+    return [parseStmt(blocking)];
   }
 
-  function parseStmt() {
-    if (at('if')) return parseIf();
-    if (at('case') || at('casez')) return parseCase();
+  function parseStmt(blocking = false) {
+    if (at('if')) return parseIf(blocking);
+    if (at('for')) return parseFor(blocking);
+    if (at('while') || at('repeat') || at('forever')) {
+      throw err(`${peek().value} は未対応 (繰り返しは回数の決まった for だけ)`);
+    }
+    if (at('case') || at('casez')) return parseCase(blocking);
     // casex は x も don't care にする。x を値として持たないので z との差が出ず、
     // 「x なら何でも一致」を装うことになるので断る (casez なら z / ? で足りる)
     if (at('casex')) throw err('casex は未対応 (x を値として扱わない。casez を使う)');
     const line = peek().line;
     const lhs = parseLValue();
+    // function の中はレジスタではなくその場で値が入る一時変数なので blocking 代入。
+    // always の中はレジスタなのでノンブロッキング。取り違えを名指しで断る
+    if (blocking) {
+      if (at('<=')) throw err('function の中はブロッキング代入 = を使う');
+      expect('=');
+      const rhs = parseExpr();
+      expect(';');
+      return { type: 'ba', lhs, rhs, line };
+    }
     if (at('=')) throw err('always ブロック内ではノンブロッキング代入 <= を使う');
     expect('<=');
     const rhs = parseExpr();
@@ -270,18 +403,56 @@ export function parse(src) {
     return { type: 'nb', lhs, rhs, line };
   }
 
-  function parseIf() {
+  /**
+   * for。elaborate 時に完全展開するので、初期値・条件・更新式はすべて定数式で、
+   * 動くのはループ変数 (integer で宣言) だけ。
+   *
+   *   for (i = 0; i < 8; i = i + 1) q[i] <= d[7-i];
+   *
+   * ヘッダの代入は Verilog では always の中でもブロッキング (`=`) なので、
+   * 本体が `<=` でもここは `=` で受ける。
+   */
+  function parseFor(blocking) {
+    const line = expect('for').line;
+    expect('(');
+    const name = expectIdent();
+    expect('=');
+    const init = parseExpr();
+    expect(';');
+    const cond = parseExpr();
+    expect(';');
+    const stepName = expectIdent();
+    expect('=');
+    const step = parseExpr();
+    expect(')');
+    if (stepName !== name) {
+      throw err(`for の更新式は初期化と同じ変数でなければならない (${name} と ${stepName})`);
+    }
+    return { type: 'for', name, init, cond, step, body: parseStmtBlock(blocking), line };
+  }
+
+  /** integer の宣言。信号ではなく「elaborate 時の整数」= for のループ変数になる */
+  function parseIntDecl() {
+    const line = expect('integer').line;
+    if (at('[')) throw err('integer に幅は書けない (for のループ変数として使う)');
+    const names = [expectIdent()];
+    while (eat(',')) names.push(expectIdent());
+    expect(';');
+    return { type: 'intdecl', names, line };
+  }
+
+  function parseIf(blocking = false) {
     const line = expect('if').line;
     expect('(');
     const cond = parseExpr();
     expect(')');
-    const thenStmts = parseStmtBlock();
+    const thenStmts = parseStmtBlock(blocking);
     // else if は「else の中身が 1 個の if 文」として自然に入れ子になる
-    const elseStmts = eat('else') ? parseStmtBlock() : null;
+    const elseStmts = eat('else') ? parseStmtBlock(blocking) : null;
     return { type: 'if', cond, then: thenStmts, else: elseStmts, line };
   }
 
-  function parseCase() {
+  function parseCase(blocking = false) {
     // casez はラベルの z / ? をその桁だけ比較から外す。式の側は 2 値しか無いので
     // 「ラベルの don't care」だけを見れば Verilog と同じ結果になる
     const casez = at('casez');
@@ -294,20 +465,20 @@ export function parse(src) {
     let dflt = null;
     while (!at('endcase')) {
       // ラベルとして読み込んでしまう前に、ブロックの終わりを止める
-      if (peek().type === 'eof' || at('endmodule') || at('end')) {
+      if (peek().type === 'eof' || at('endmodule') || at('endfunction') || at('end')) {
         throw err("'endcase' が見つからない");
       }
       const iline = peek().line;
       if (eat('default')) {
         eat(':');                       // Verilog では ':' は省略できる
         if (dflt) throw err('default が 2 つある');
-        dflt = parseStmtBlock();
+        dflt = parseStmtBlock(blocking);
         continue;
       }
       const labels = [parseExpr()];
       while (eat(',')) labels.push(parseExpr());
       expect(':');
-      items.push({ labels, stmts: parseStmtBlock(), line: iline });
+      items.push({ labels, stmts: parseStmtBlock(blocking), line: iline });
     }
     expect('endcase');
     if (items.length === 0 && !dflt) throw err('case の中身が空');
@@ -444,6 +615,8 @@ export function parse(src) {
         expect(';');
         items.push({ type: 'assign', lhs, rhs, line: aline });
       } else if (v === 'always') items.push(parseAlways());
+      else if (v === 'integer') items.push(parseIntDecl());
+      else if (v === 'function') items.push(parseFunction());
       else if (GATE_PRIMITIVES.has(v)) items.push(parseGateInst());
       else if (UNSUPPORTED_ITEMS.has(v)) throw err(`'${v}' は未対応`);
       else if (peek().type === 'ident' && (peek(1).type === 'ident' || peek(1).value === '#')) {

@@ -1843,6 +1843,272 @@ endmodule`);
   ok(!pbad, 'casez: priority8.v が全 256 通り正しい', pbad ?? '');
 }
 
+// --------------------------------------------------------------- function
+// function は呼び出しごとにインライン展開する。中身は組合せ回路で、ローカル変数は
+// レジスタではなく一時変数なので blocking 代入 (=) になる。
+async function testFunction() {
+  // 1 行の function / ローカル変数 / begin-end / if を並べて JS のモデルと比べる
+  const basic = await bothSims(`module m(input [3:0] a, output y, output [7:0] z, output [3:0] w);
+  function par(input [3:0] d);
+    par = ^d;
+  endfunction
+  function [7:0] add1(input [7:0] v);
+    reg [7:0] t;
+    begin
+      t = v + 1;
+      add1 = t;
+    end
+  endfunction
+  function [3:0] mx(input [3:0] p, input [3:0] q);
+    if (p > q) mx = p;
+    else       mx = q;
+  endfunction
+  assign y = par(a);
+  assign z = add1({4'h0, a});
+  assign w = mx(a, 4'd7);
+endmodule`);
+  let bad = null;
+  for (const sim of basic.all) {
+    for (let a = 0; a < 16; a++) {
+      sim.setInput('a', a).eval();
+      const par = [...a.toString(2)].reduce((s, b) => s ^ Number(b), 0);
+      const want = { y: par, z: a + 1, w: Math.max(a, 7) };
+      for (const [k, v] of Object.entries(want)) {
+        if (Number(sim.get(k)) !== v && !bad) {
+          bad = `${sim.constructor.name} a=${a} ${k}=${sim.get(k)} (期待 ${v})`;
+        }
+      }
+    }
+  }
+  ok(!bad, 'function: 1 行 / ローカル変数 / if を全 16 通り', bad ?? '');
+
+  // 入れ子の呼び出し・case・部分代入・always の中での呼び出し
+  const nest = await bothSims(`module m(input clk, input [3:0] a, output reg [7:0] q, output [7:0] n);
+  function [3:0] inc(input [3:0] v);
+    inc = v + 1;
+  endfunction
+  function [7:0] dec4(input [1:0] s);
+    begin
+      dec4 = 8'h00;
+      case (s)
+        2'd0: dec4[3:0] = 4'h1;
+        2'd1: dec4[3:0] = 4'h2;
+        2'd2: dec4[7:4] = 4'h4;
+        default: dec4 = 8'hFF;
+      endcase
+    end
+  endfunction
+  assign n = dec4(a[1:0]);
+  always @(posedge clk) q <= {4'h0, inc(inc(a))};
+endmodule`);
+  let nbad = null;
+  for (const sim of nest.all) {
+    for (let a = 0; a < 16; a++) {
+      sim.setInput('a', a).step();
+      const s = a & 3;
+      const wantN = s === 0 ? 0x01 : s === 1 ? 0x02 : s === 2 ? 0x40 : 0xFF;
+      if ((Number(sim.get('q')) !== ((a + 2) & 15) || Number(sim.get('n')) !== wantN) && !nbad) {
+        nbad = `${sim.constructor.name} a=${a} q=${sim.get('q')} n=${sim.get('n')}`;
+      }
+    }
+  }
+  ok(!nbad, 'function: 入れ子の呼び出し・case・部分代入・always の中', nbad ?? '');
+
+  // インライン展開なので、式を直接書いた場合とゲート数が完全に一致する
+  const pairs = [
+    ['1 出力', `assign y = F(a);`, `assign y = a + 8'd3;`, 'output [7:0] y'],
+    ['同じ引数で 2 回', `assign y = F(a); assign z = F(a);`,
+      `assign y = a + 8'd3; assign z = a + 8'd3;`, 'output [7:0] y, output [7:0] z'],
+    ['違う引数で 2 回', `assign y = F(a); assign z = F(b);`,
+      `assign y = a + 8'd3; assign z = b + 8'd3;`, 'output [7:0] y, output [7:0] z'],
+  ];
+  for (const [label, withFn, direct, ports] of pairs) {
+    const head = `module m(input [7:0] a, input [7:0] b, ${ports});`;
+    const fn = compile(`${head}
+  function [7:0] F(input [7:0] v); F = v + 8'd3; endfunction
+  ${withFn}
+endmodule`);
+    const raw = compile(`${head}\n  ${direct}\nendmodule`);
+    eqs(fn.stats.gates, raw.stats.gates,
+      `function: ${label} — 式を直接書いたのと同じゲート数`);
+  }
+
+  // 引数と同じ名前の信号が外にあってもローカルが勝つ (Verilog のスコープ規則)
+  const shadow = await bothSims(`module m(input [3:0] a, input [3:0] v, output [3:0] y);
+  function [3:0] f(input [3:0] v);
+    f = ~v;
+  endfunction
+  assign y = f(a);
+endmodule`);
+  for (const sim of shadow.all) {
+    sim.setInput('a', 3).setInput('v', 12).eval();
+    eq(sim.get('y'), 12, `${sim.constructor.name} function: 引数が外の同名信号より優先される`);
+  }
+
+  // グレイコード変換器。往復すると元に戻る / カウンタが 16 で巡回する
+  const gray = await bothSims(example('gray4.v'));
+  let gbad = null;
+  for (const sim of gray.all) {
+    for (let b = 0; b < 16; b++) {
+      sim.setInput('bin', b).eval();
+      const g = b ^ (b >> 1);
+      const nx = ((b + 1) & 15) ^ (((b + 1) & 15) >> 1);
+      const adj = [1, 2, 4, 8].includes(g ^ nx) ? 1 : 0;
+      if ((Number(sim.get('gray')) !== g || Number(sim.get('back')) !== b
+        || Number(sim.get('adjacent')) !== adj) && !gbad) {
+        gbad = `${sim.constructor.name} bin=${b}: gray=${sim.get('gray')} back=${sim.get('back')}`;
+      }
+    }
+  }
+  ok(!gbad, 'function: gray4.v の変換が全 16 通り正しく、往復して元に戻る', gbad ?? '');
+
+  const gsim = gray.wasm;
+  gsim.reset();
+  const seq = [];
+  for (let i = 0; i < 17; i++) { gsim.step(); seq.push(Number(gsim.get('counted'))); }
+  ok(seq.slice(1).every((v, i) => [1, 2, 4, 8].includes(v ^ seq[i])),
+    'function: グレイカウンタは 1 クロックで 1 ビットしか変わらない', seq.join(','));
+  eqs(seq[16], seq[0], 'function: グレイカウンタは 16 サイクルで巡回する');
+}
+
+// -------------------------------------------------------------------- for
+// for は elaborate 時に完全展開する。ループ変数は integer で宣言し、値は parameter と
+// 同じ表に入るので、本体の `q[i]` が定数式の添字としてそのまま解ける。
+async function testForLoop() {
+  const rev8 = (v) => { let r = 0; for (let i = 0; i < 8; i++) r |= ((v >> i) & 1) << (7 - i); return r; };
+
+  // 反転・数え上げ・累積 OR・always の中の for を全 256 通り
+  const ops = await bothSims(example('bitops8.v'));
+  let bad = null;
+  for (const sim of ops.all) {
+    for (let d = 0; d < 256; d++) {
+      sim.setInput('d', d).step();
+      let ones = 0; let acc = 0; let pfx = 0;
+      for (let k = 0; k < 8; k++) { ones += (d >> k) & 1; acc |= (d >> k) & 1; pfx |= acc << k; }
+      const want = { rev: rev8(d), ones, pfx, latched: rev8(d) };
+      for (const [k, v] of Object.entries(want)) {
+        if (Number(sim.get(k)) !== v && !bad) {
+          bad = `${sim.constructor.name} d=${d} ${k}=${sim.get(k)} (期待 ${v})`;
+        }
+      }
+    }
+  }
+  ok(!bad, 'for: bitops8.v の 4 出力が全 256 通り正しい', bad ?? '');
+
+  // 展開なので手で書き並べたのと同じ回路になる
+  const loop = compile(`module m(input [7:0] d, output [7:0] y);
+  function [7:0] f(input [7:0] v);
+    integer k;
+    begin f = 8'h00; for (k = 0; k < 8; k = k + 1) f[k] = v[7-k]; end
+  endfunction
+  assign y = f(d);
+endmodule`);
+  const hand = compile(`module m(input [7:0] d, output [7:0] y);
+  assign y = {d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]};
+endmodule`);
+  eqs(loop.stats.gates, hand.stats.gates, 'for: 手で連接を書いたのと同じゲート数');
+
+  // 入れ子・下降・刻み 2・parameter を境界に・添字の掛け算
+  const mix = await bothSims(`module m #(parameter N = 6) (input [15:0] d,
+                             output [15:0] t, output [3:0] ev, output [3:0] upto);
+  integer i;
+  function [15:0] transpose(input [15:0] v);
+    integer a, b;
+    begin
+      transpose = 16'h0;
+      for (a = 0; a < 4; a = a + 1)
+        for (b = 0; b < 4; b = b + 1)
+          transpose[a*4+b] = v[b*4+a];
+    end
+  endfunction
+  function [3:0] evens(input [15:0] v);
+    integer k;
+    begin
+      evens = 4'd0;
+      for (k = 14; k >= 0; k = k - 2)
+        evens = evens + {3'b000, v[k]};
+    end
+  endfunction
+  function [3:0] first_n(input [15:0] v);
+    integer k;
+    begin
+      first_n = 4'd0;
+      for (k = 0; k < N; k = k + 1)
+        first_n = first_n + {3'b000, v[k]};
+    end
+  endfunction
+  assign t = transpose(d);
+  assign ev = evens(d);
+  assign upto = first_n(d);
+endmodule`);
+  let mbad = null;
+  for (const sim of mix.all) {
+    for (const d of [0x0000, 0xFFFF, 0x1234, 0xACE0, 0x8001, 0x5555, 0x000F]) {
+      sim.setInput('d', d).eval();
+      let tr = 0;
+      for (let a = 0; a < 4; a++) {
+        for (let b = 0; b < 4; b++) tr |= ((d >> (b * 4 + a)) & 1) << (a * 4 + b);
+      }
+      let ev = 0;
+      for (let k = 14; k >= 0; k -= 2) ev += (d >> k) & 1;
+      let up = 0;
+      for (let k = 0; k < 6; k++) up += (d >> k) & 1;
+      if ((Number(sim.get('t')) !== tr || Number(sim.get('ev')) !== ev
+        || Number(sim.get('upto')) !== up) && !mbad) {
+        mbad = `${sim.constructor.name} d=0x${d.toString(16)}: t=${sim.get('t')}/${tr}`
+          + ` ev=${sim.get('ev')}/${ev} upto=${sim.get('upto')}/${up}`;
+      }
+    }
+  }
+  ok(!mbad, 'for: 入れ子・下降・刻み 2・parameter 境界・i*4+b の添字', mbad ?? '');
+
+  // 1 度も回らない for は何も起きない (保持になる)
+  const never = await bothSims(`module m(input clk, input [7:0] d, output reg [7:0] q);
+  integer i;
+  always @(posedge clk) begin
+    q <= 8'hAA;
+    for (i = 0; i < 0; i = i + 1) q[i] <= d[i];
+  end
+endmodule`);
+  for (const sim of never.all) {
+    sim.reset().setInput('d', 0xff).step();
+    eq(sim.get('q'), 0xaa, `${sim.constructor.name} for: 0 回のループは何も生まない`);
+  }
+
+  // ループ変数は外側の同名を壊さない (ループの前後で退避・復帰する)
+  const shadow = compile(`module m(input [7:0] d, output [7:0] y, output [7:0] z);
+  function [7:0] f(input [7:0] v);
+    integer i;
+    begin f = 8'h00; for (i = 0; i < 8; i = i + 1) f[i] = v[7-i]; end
+  endfunction
+  function [7:0] g(input [7:0] v);
+    integer i;
+    begin g = 8'h00; for (i = 0; i < 4; i = i + 1) g[i] = v[i]; end
+  endfunction
+  assign y = f(d);
+  assign z = g(f(d));
+endmodule`);
+  const ss = await WasmSimulator.create(shadow);
+  ss.setInput('d', 0b1000_0001).eval();
+  eq(ss.get('y'), 0b1000_0001, 'for: 入れ子の呼び出しでループ変数が混ざらない (y)');
+  eq(ss.get('z'), 0b0000_0001, 'for: 入れ子の呼び出しでループ変数が混ざらない (z)');
+
+  // 定数式の * / % は計算できる。優先順位も Verilog どおり
+  const konst = compile(`module m(output [7:0] a, output [7:0] b, output [7:0] c);
+  localparam K1 = 2 + 3 * 4;
+  localparam K2 = 17 / 5;
+  localparam K3 = 17 % 5;
+  assign a = K1;
+  assign b = K2;
+  assign c = K3;
+endmodule`);
+  const ks = await WasmSimulator.create(konst);
+  ks.eval();
+  eq(ks.get('a'), 14, 'for: 定数式の * は + より強く結合する (2 + 3 * 4 = 14)');
+  eq(ks.get('b'), 3, 'for: 定数式の / は切り捨て (17 / 5 = 3)');
+  eq(ks.get('c'), 2, 'for: 定数式の % (17 % 5 = 2)');
+}
+
 // ------------------------------------------------------------------- FSM
 async function testSeqDet() {
   const { compiled, all } = await bothSims(example('seqdet.v'));
@@ -2171,9 +2437,19 @@ async function testErrors() {
     ['幅が負になる範囲',
       `module m #(parameter W = 0) (output [W-2:0] y); assign y = 0; endmodule`,
       /ビット範囲 \[-2:0\] が不正/],
-    ['乗算は未対応',
+    // * / % は定数式では計算できる (for の添字に要る) が、回路にはしない
+    ['信号どうしの乗算は未対応',
       `module m(input [3:0] a, output [7:0] y); assign y = a * a; endmodule`,
-      /解釈できない文字/],
+      /乗算は未対応 \(定数式の中だけで使える\)/],
+    ['信号の除算は未対応',
+      `module m(input [3:0] a, output [3:0] y); assign y = a / 2; endmodule`,
+      /除算は未対応/],
+    ['信号の剰余は未対応',
+      `module m(input [3:0] a, output [3:0] y); assign y = a % 3; endmodule`,
+      /剰余は未対応/],
+    ['定数式の 0 除算',
+      `module m(output [7:0] y); localparam K = 3 / 0; assign y = K; endmodule`,
+      /定数式で 0 除算/],
     ['=== は未対応',
       `module m(input [3:0] a, output y); assign y = a === 4'h3; endmodule`,
       /=== は未対応/],
@@ -2224,6 +2500,118 @@ async function testErrors() {
     ['always_comb は未対応',
       `module m(input a, output reg y); always_comb y = ~a; endmodule`,
       /'always_comb' は未対応/],
+    // function — 書き間違えやすい所を名指しで断る
+    ['無い function を呼んだら断る',
+      `module m(input a, output y); assign y = f(a); endmodule`,
+      /'f' という function は無い/],
+    ['引数の数が合わない',
+      `module m(input a, output y);
+       function g(input p, input q); g = p & q; endfunction
+       assign y = g(a); endmodule`,
+      /g の引数は 2 個/],
+    ['戻り値を代入していない',
+      `module m(input a, output y);
+       function g(input p); reg t; t = p; endfunction
+       assign y = g(a); endmodule`,
+      /戻り値 \(g への代入\) がどこにも無い/],
+    ['function の中の <= は断る',
+      `module m(input a, output y);
+       function g(input p); g <= p; endfunction
+       assign y = g(a); endmodule`,
+      /function の中はブロッキング代入 = を使う/],
+    ['function の引数は input だけ',
+      `module m(input a, output y);
+       function g(output p); g = 1'b0; endfunction
+       assign y = g(a); endmodule`,
+      /function の引数は input だけ/],
+    ['引数が無い function は断る',
+      `module m(input a, output y);
+       function g(); g = 1'b0; endfunction
+       assign y = g(a); endmodule`,
+      /function には引数が 1 つ以上必要/],
+    ['旧形式の引数宣言は断る',
+      `module m(input a, output y);
+       function g; input p; g = p; endfunction
+       assign y = g(a); endmodule`,
+      /引数を括弧の中に input で書く/],
+    ['再帰は深さで止める',
+      `module m(input [3:0] a, output y);
+       function g(input [3:0] p); g = g(p); endfunction
+       assign y = g(a); endmodule`,
+      /呼び出しが深すぎる \(再帰は未対応\)/],
+    ['function の中の未宣言の名前',
+      `module m(input a, output y);
+       function g(input p); begin t = p; g = t; end endfunction
+       assign y = g(a); endmodule`,
+      /'t' は function の中で宣言されていない/],
+    ['定数式では function を呼べない',
+      `module m(output [3:0] y);
+       function [3:0] g(input [3:0] p); g = p; endfunction
+       localparam W = g(4'd2);
+       assign y = W; endmodule`,
+      /定数式では function \(g\) を呼べない/],
+    ['信号と function の名前がぶつかる',
+      `module m(input a, output y);
+       wire g;
+       function g(input p); g = p; endfunction
+       assign y = a; endmodule`,
+      /信号と function で名前がぶつかっている/],
+    ['function の二重定義',
+      `module m(input a, output y);
+       function g(input p); g = p; endfunction
+       function g(input p); g = ~p; endfunction
+       assign y = g(a); endmodule`,
+      /二重に定義されている/],
+    ['endfunction 忘れ',
+      `module m(input a, output y);
+       function g(input p); g = p;
+       assign y = g(a); endmodule`,
+      /'endfunction' が見つからない/],
+    // for — 定数で終わることを保証できないものは断る
+    ['integer で宣言していないループ変数',
+      `module m(input clk, input [7:0] d, output reg [7:0] q);
+       always @(posedge clk) for (i = 0; i < 8; i = i + 1) q[i] <= d[i]; endmodule`,
+      /'i' は integer で宣言されていない/],
+    ['for の更新式が別の変数',
+      `module m(input clk, input [7:0] d, output reg [7:0] q);
+       integer i, j;
+       always @(posedge clk) for (i = 0; i < 8; j = j + 1) q[i] <= d[i]; endmodule`,
+      /初期化と同じ変数でなければならない/],
+    ['終わらない for は打ち切る',
+      `module m(input clk, input [7:0] d, output reg [7:0] q);
+       integer i;
+       always @(posedge clk) for (i = 0; i < 8; i = i + 0) q[0] <= d[0]; endmodule`,
+      /for の繰り返しが 4096 回を超えた/],
+    ['for の条件に信号は書けない',
+      `module m(input clk, input [7:0] d, output reg [7:0] q);
+       integer i;
+       always @(posedge clk) for (i = 0; i < d; i = i + 1) q[i] <= d[i]; endmodule`,
+      /'d' は定数式に使えない/],
+    ['while は未対応',
+      `module m(input clk, output reg y); always @(posedge clk) while (1) y <= 1'b0; endmodule`,
+      /while は未対応 \(繰り返しは回数の決まった for だけ\)/],
+    ['repeat も未対応',
+      `module m(input clk, output reg y); always @(posedge clk) repeat (3) y <= 1'b0; endmodule`,
+      /repeat は未対応/],
+    ['integer に幅は書けない',
+      `module m(output y); integer [3:0] i; assign y = 1'b0; endmodule`,
+      /integer に幅は書けない/],
+    ['integer は信号として使えない',
+      `module m(output y); integer i; assign y = i; endmodule`,
+      /'i' は integer なので信号として使えない/],
+    ['ループの添字が宣言範囲の外',
+      `module m(input clk, input [7:0] d, output reg [7:0] q);
+       integer i;
+       always @(posedge clk) for (i = 0; i < 9; i = i + 1) q[i] <= d[i]; endmodule`,
+      /q\[8\] は宣言範囲 \[7:0\] の外/],
+    ['信号と integer の二重宣言',
+      `module m(output y); wire i; integer i; assign y = 1'b0; endmodule`,
+      /信号と integer で二重に宣言されている/],
+    ['task はまだ未対応',
+      `module m(input clk, input a, output reg y);
+       task t(input p, output q); q = ~p; endtask
+       always @(posedge clk) t(a, y); endmodule`,
+      /'task' は未対応/],
     ['casex は未対応',
       `module m(input clk, input [1:0] s, output reg q);
        always @(posedge clk) casex (s) 2'b0?: q <= 1'b1; endcase endmodule`,
@@ -2294,6 +2682,7 @@ function randomDesign(rng, nWires) {
   const pick = (arr) => arr[Math.floor(rng() * arr.length)];
   const pool = ['a', 'b', 'c'];
   const lines = [];
+  let inSub = false;         // 子モジュールの本体を組み立てている間だけ true
 
   const expr = (depth) => {
     const r = rng();
@@ -2337,9 +2726,32 @@ function randomDesign(rng, nWires) {
       const amt = rng() < 0.5 ? String(Math.floor(rng() * 10)) : expr(0);
       return `(${expr(depth - 1)} ${op} ${amt})`;
     }
-    if (r < 0.97) return `(${expr(depth - 1)} ? ${expr(depth - 1)} : ${expr(depth - 1)})`;
+    if (r < 0.96) return `(${expr(depth - 1)} ? ${expr(depth - 1)} : ${expr(depth - 1)})`;
+    // 生成した function をインライン展開に通す。中身は if / case / ローカル変数入り。
+    // 子モジュールには宣言していないので、そちらを組み立てている間は出さない
+    if (r < 0.98 && !inSub) return `rndf(${expr(depth - 1)}, ${expr(depth - 1)})`;
     return `{${expr(depth - 1)}, ${expr(depth - 1)}}`;
   };
+
+  // 式から呼べる function を 1 本置く。ローカル変数・部分代入・if / case を
+  // まとめて通したいので、中身は少し込み入った形にしてある
+  lines.push(`  function [7:0] rndf(input [7:0] p, input [7:0] q);
+    reg [7:0] t;
+    integer k;
+    begin
+      t = p ^ q;
+      if (t[0]) t[7:4] = q[3:0];
+      // for の展開も差分テストに通す (ビット並べ替え + 累積)
+      for (k = 0; k < 4; k = k + 1)
+        t[k] = t[k] ^ p[7-k];
+      case (t[2:1])
+        2'd0: rndf = t + p;
+        2'd1: rndf = t - q;
+        2'd2: rndf = {t[3:0], q[7:4]};
+        default: rndf = t;
+      endcase
+    end
+  endfunction`);
 
   for (let i = 0; i < nWires; i++) {
     lines.push(`  wire [7:0] w${i};`);
@@ -2392,7 +2804,9 @@ function randomDesign(rng, nWires) {
   const parentPool = [...pool];
   pool.length = 0;
   pool.push('p', 'q');
+  inSub = true;
   const subBody = expr(2);
+  inSub = false;
   pool.length = 0;
   pool.push(...parentPool);
 
@@ -2434,7 +2848,7 @@ async function testRandomDiff() {
 
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
   const seen = {
-    'if': 0, 'case': 0, 'casez': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0,
+    'if': 0, 'case': 0, 'casez': 0, 'function': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0,
     '非同期リセット': 0, '階層': 0, 'parameter': 0, 'リダクション': 0,
   };
 
@@ -2443,6 +2857,7 @@ async function testRandomDiff() {
     if (/\bif \(/.test(src)) seen['if']++;
     if (/\bcase \(/.test(src)) seen['case']++;
     if (/\bcasez \(/.test(src)) seen['casez']++;
+    if (/\brndf\(/.test(src)) seen['function']++;
     if (/[-+] /.test(src)) seen['+ / -']++;
     if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
     if (/(<<|>>)/.test(src)) seen['シフト']++;
@@ -3219,6 +3634,8 @@ const suites = [
   ['シフト回路', testShifter],
   ['if / case', testIfCase],
   ['casez', testCasez],
+  ['function', testFunction],
+  ['for', testForLoop],
   ['FSM (列検出)', testSeqDet],
   ['モジュール階層', testHierarchy],
   ['parameter', testParams],

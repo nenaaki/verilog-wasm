@@ -233,6 +233,86 @@ endmodule`,
   assign exactly = (a && !b && !c) || (!a && b && !c) || (!a && !b && c);
 endmodule`,
 
+  'bitops8 — ビット並べ替えと数え上げ (for)': `module bitops8(
+  input clk,
+  input [7:0] d,
+  output [7:0] rev,          // ビット順を反転
+  output [3:0] ones,         // 立っているビットの数
+  output [7:0] pfx,          // 下位から見た累積 OR
+  output reg [7:0] latched
+);
+  // for は elaborate 時に完全展開する。ループ変数は integer で宣言し、実体は
+  // 「展開時の整数」なので q[i] や d[7-i] が定数式の添字として解ける
+  integer i;
+
+  function [7:0] reverse(input [7:0] v);
+    integer k;
+    begin
+      reverse = 8'h00;
+      for (k = 0; k < 8; k = k + 1)
+        reverse[k] = v[7-k];
+    end
+  endfunction
+
+  function [3:0] popcount(input [7:0] v);
+    integer k;
+    begin
+      popcount = 4'd0;
+      for (k = 0; k < 8; k = k + 1)
+        popcount = popcount + {3'b000, v[k]};
+    end
+  endfunction
+
+  // 直前の代入結果を次の段が読む形。ブロッキング代入が要る所
+  function [7:0] prefix_or(input [7:0] v);
+    integer k;
+    begin
+      prefix_or[0] = v[0];
+      for (k = 1; k < 8; k = k + 1)
+        prefix_or[k] = prefix_or[k-1] | v[k];
+    end
+  endfunction
+
+  assign rev  = reverse(d);
+  assign ones = popcount(d);
+  assign pfx  = prefix_or(d);
+
+  always @(posedge clk)
+    for (i = 0; i < 8; i = i + 1)
+      latched[i] <= d[7-i];
+endmodule`,
+
+  'gray4 — グレイコード変換 (function)': `module gray4(
+  input clk,
+  input [3:0] bin,
+  output [3:0] gray,        // 2 進 → グレイ
+  output [3:0] back,        // グレイ → 2 進 (往復して元に戻る)
+  output reg [3:0] counted  // グレイコードで数えるカウンタ
+);
+  // function は呼び出しごとにインライン展開される。中身は必ず組合せ回路なので、
+  // ローカル変数はレジスタではなく一時変数 = 代入は = (ノンブロッキングではない)
+  function [3:0] to_gray(input [3:0] b);
+    to_gray = b ^ (b >> 1);
+  endfunction
+
+  function [3:0] from_gray(input [3:0] g);
+    reg [3:0] acc;
+    begin
+      acc[3] = g[3];
+      acc[2] = acc[3] ^ g[2];
+      acc[1] = acc[2] ^ g[1];
+      acc[0] = acc[1] ^ g[0];
+      from_gray = acc;
+    end
+  endfunction
+
+  assign gray = to_gray(bin);
+  assign back = from_gray(to_gray(bin));      // 入れ子の呼び出し
+
+  always @(posedge clk)
+    counted <= to_gray(from_gray(counted) + 4'd1);
+endmodule`,
+
   'priority8 — 優先順位エンコーダ (casez)': `module priority8(
   input clk,
   input [7:0] req,
