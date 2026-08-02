@@ -15,9 +15,11 @@ export function schedule(netlist) {
 
   const available = new Uint8Array(nets.length);
 
-  // ソース: 入力ポートのビットと、レジスタの Q
+  // ソース: top の入力ポートのビットと、レジスタの Q。
+  // 子モジュールの入力ポートはソースではない (親から buf で駆動されるので、
+  // ここでソース扱いすると順序が付かないまま並べてしまう)
   for (const s of signals.values()) {
-    if (s.dir === 'input') s.bits.forEach((n) => (available[n] = 1));
+    if (s.isTop !== false && s.dir === 'input') s.bits.forEach((n) => (available[n] = 1));
   }
   for (const r of regs) available[r.q] = 1;
 

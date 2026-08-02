@@ -32,14 +32,21 @@ export function compile(src, opts = {}) {
     mod = modules.find((m) => m.name === opts.top);
     if (!mod) throw new CompileError(`module '${opts.top}' が見つからない`);
   } else {
-    mod = modules[0];
-    if (modules.length > 1) {
-      // 階層は未対応なので、複数あるときは先頭を top として扱う旨を伝える
-      mod.note = `${modules.length} 個の module が見つかったため先頭 '${mod.name}' を top として扱いました`;
+    // 誰にもインスタンス化されていない module を top とみなす。これで
+    // 「部品を先に、top を後に」書いたファイルでも --top なしで通る。
+    const used = new Set();
+    for (const m of modules) {
+      for (const item of m.items) if (item.type === 'inst') used.add(item.module);
+    }
+    const roots = modules.filter((m) => !used.has(m.name));
+    mod = roots[0] ?? modules[0];
+    if (roots.length > 1) {
+      mod.note = `top になりうる module が ${roots.length} 個あるため先頭の '${mod.name}' を選びました`
+        + ` (--top で指定できます)`;
     }
   }
 
-  const netlist = elaborate(mod);
+  const netlist = elaborate(mod, modules);
   const order = schedule(netlist);
   const layout = buildLayout(netlist);
   const bytes = emitWasm(netlist, order, layout);

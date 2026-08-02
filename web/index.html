@@ -166,6 +166,27 @@ endmodule`,
     q <= clr ? 8'h00 : (en ? q + 1 : q);
 endmodule`,
 
+  'adder2 — モジュール階層 (2 段の入れ子)': `module half_adder(input a, input b, output s, output c);
+  assign s = a ^ b;
+  assign c = a & b;
+endmodule
+
+module full_adder(input a, input b, input cin, output sum, output cout);
+  wire s1, c1, c2;
+
+  half_adder h0(a, b, s1, c1);
+  half_adder h1(.a(s1), .b(cin), .s(sum), .c(c2));
+
+  assign cout = c1 | c2;
+endmodule
+
+module adder2(input [1:0] a, input [1:0] b, input cin, output [1:0] sum, output cout);
+  wire carry;
+
+  full_adder f0(.a(a[0]), .b(b[0]), .cin(cin),   .sum(sum[0]), .cout(carry));
+  full_adder f1(.a(a[1]), .b(b[1]), .cin(carry), .sum(sum[1]), .cout(cout));
+endmodule`,
+
   'counter_rst — 非同期リセット付きカウンタ': `module counter_rst(
   input clk,
   input rst,

@@ -27,9 +27,13 @@ export function buildLayout(netlist) {
     }
   };
 
+  // スロットを持つのは top のポートだけ。階層を平坦化した後の子モジュールの
+  // ポートはただの内部配線なので、ホストとの受け渡しには出てこない。
+  const isPort = (s) => s.isTop !== false && (s.dir === 'input' || s.dir === 'output');
+
   const ports = [];
   for (const s of signals.values()) {
-    if (s.dir === 'input' || s.dir === 'output') {
+    if (isPort(s)) {
       s.bits.forEach(assign);
       ports.push(s);
     }
@@ -47,13 +51,13 @@ export function buildLayout(netlist) {
   const regQ = new Set(regs.map((r) => r.q));
   const outputNets = [];
   for (const s of signals.values()) {
-    if (s.dir !== 'output') continue;
+    if (!isPort(s) || s.dir !== 'output') continue;
     for (const n of s.bits) if (!regQ.has(n)) outputNets.push(n);
   }
 
   const inputNets = [];
   for (const s of signals.values()) {
-    if (s.dir === 'input') inputNets.push(...s.bits);
+    if (isPort(s) && s.dir === 'input') inputNets.push(...s.bits);
   }
 
   return {
@@ -64,9 +68,12 @@ export function buildLayout(netlist) {
     inputNets,
     outputNets,
     regQ,
-    /** 外部に見せる信号表 */
+    /**
+     * 外部に見せる信号表。top のポートに加えて、階層の奥にあるレジスタも
+     * 完全修飾名 (`h0.count`) で載せる — スロットを持つ状態なので観測できる。
+     */
     signalTable: [...signals.values()]
-      .filter((s) => s.dir === 'input' || s.dir === 'output' || s.kind === 'reg')
+      .filter((s) => isPort(s) || s.kind === 'reg')
       .map((s) => ({
         name: s.name,
         dir: s.dir ?? 'internal',

@@ -332,6 +332,114 @@ endmodule`);
   }
 }
 
+// ------------------------------------------------------------ モジュール階層
+//
+// 展開して 1 個の平坦なネットリストにするので、確かめたいのは
+// 「境界をまたいでも値が正しいか」と「奥の状態が観測できるか」。
+async function testHierarchy() {
+  // 半加算器 2 個で全加算器 → 全加算器 2 個で 2 ビット加算器 (2 段の入れ子)
+  const { compiled, all } = await bothSims(example('adder2.v'));
+  eqs(compiled.top, 'adder2', '階層: インスタンス化されていない module が top になる');
+  eqs(compiled.warnings.length, 0, '階層: 未駆動の警告なし', compiled.warnings.join(' / '));
+
+  for (const sim of all) {
+    const kind = sim.constructor.name;
+    let bad = null;
+    for (let a = 0; a < 4 && !bad; a++) {
+      for (let b = 0; b < 4 && !bad; b++) {
+        for (const cin of [0, 1]) {
+          sim.setInput('a', a).setInput('b', b).setInput('cin', cin).eval();
+          const total = a + b + cin;
+          if (Number(sim.get('sum')) !== (total & 3) || Number(sim.get('cout')) !== (total >> 2)) {
+            bad = `a=${a} b=${b} cin=${cin} 期待 sum=${total & 3} cout=${total >> 2}`
+              + ` / 実際 sum=${sim.get('sum')} cout=${sim.get('cout')}`;
+            break;
+          }
+        }
+      }
+    }
+    ok(!bad, `${kind} adder2: 全 4×4×2 通りが加算と一致`, bad ?? '');
+  }
+
+  // 部分木を top に切り替えられる
+  const fa = compile(example('adder2.v'), { top: 'full_adder' });
+  eqs(fa.top, 'full_adder', '階層: --top で部分木を選べる');
+  const faSim = await WasmSimulator.create(fa);
+  let faBad = 0;
+  for (let v = 0; v < 8; v++) {
+    const a = v & 1;
+    const b = (v >> 1) & 1;
+    const cin = (v >> 2) & 1;
+    faSim.setInput('a', a).setInput('b', b).setInput('cin', cin).eval();
+    const total = a + b + cin;
+    if (Number(faSim.get('sum')) !== (total & 1) || Number(faSim.get('cout')) !== (total >> 1)) faBad++;
+  }
+  eqs(faBad, 0, '階層: 部分木だけでも正しく動く');
+
+  // 平坦化したので、階層のあるなしで同じ回路になる
+  const flat = compile(`module full_adder(input a, input b, input cin, output sum, output cout);
+    wire axb;
+    assign axb = a ^ b;
+    assign sum = axb ^ cin;
+    assign cout = (a & b) | (cin & axb);
+  endmodule`);
+  const sameBits = fa.stats.gates >= flat.stats.gates;
+  ok(sameBits, '階層: 平坦に書いた版と同程度のゲート数',
+    `階層=${fa.stats.gates} 平坦=${flat.stats.gates} (差は中継の buf)`);
+
+  // 奥のレジスタが完全修飾名で観測でき、クロックが境界をまたいで共有される
+  const withRegs = `module counter(input clk, input rst, output [3:0] q);
+  reg [3:0] cnt;
+  always @(posedge clk or posedge rst)
+    if (rst) cnt <= 4'h0;
+    else cnt <= cnt + 1;
+  assign q = cnt;
+endmodule
+
+module top(input clk, input rst, output [3:0] a, output [3:0] b, output same);
+  counter c0(.clk(clk), .rst(rst), .q(a));
+  counter c1(clk, rst, b);
+  assign same = a == b;
+endmodule`;
+  const { compiled: wc, all: ws } = await bothSims(withRegs);
+  eqs(wc.stats.regs, 8, '階層: 子のレジスタが 2 個ぶん (4 ビット × 2) 出る');
+  const names = wc.layout.signalTable.map((s) => s.name);
+  ok(names.includes('c0.cnt') && names.includes('c1.cnt'),
+    '階層: 奥のレジスタが完全修飾名で信号表に出る', names.join(', '));
+
+  for (const sim of ws) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('rst', 0).run(5);
+    eq(sim.get('a'), 5, `${kind} 階層: 子のカウンタが 5 まで進む`);
+    eq(sim.get('b'), 5, `${kind} 階層: もう 1 個も同じクロックで進む`);
+    eq(sim.get('same'), 1, `${kind} 階層: 親の比較器が両方を見る`);
+    eq(sim.get('c0.cnt'), 5, `${kind} 階層: 奥のレジスタを名前で読める`);
+    // 非同期リセットも境界をまたいで効く (状態は eval 1 回で戻る)
+    sim.setInput('rst', 1).eval();
+    eq(sim.get('c0.cnt'), 0, `${kind} 階層: 子の非同期リセットが eval だけで効く`);
+  }
+
+  // 未接続のポートは 0 に固定されて警告が出る
+  const unconn = compile(`module sub(input a, input b, output y); assign y = a & b; endmodule
+    module m(input a, output y); sub u0(.a(a), .y(y)); endmodule`);
+  ok(/u0\.b/.test(unconn.warnings[0] ?? ''), '階層: 未接続の入力ポートが未駆動検査に乗る',
+    unconn.warnings.join(' / '));
+
+  // 入れ子の深さ上限
+  let deep = 'module d0(input a, output y); assign y = ~a; endmodule\n';
+  for (let i = 1; i <= 20; i++) {
+    deep += `module d${i}(input a, output y); d${i - 1} u0(a, y); endmodule\n`;
+  }
+  let caught = null;
+  try { compile(deep, { top: 'd20' }); } catch (e) { caught = e; }
+  ok(caught instanceof CompileError && /入れ子が深すぎる/.test(caught.message),
+    '階層: 入れ子が深すぎるとエラーになる', caught ? caught.message : 'エラーにならなかった');
+
+  // 上限内なら通る
+  const ok16 = compile(deep, { top: 'd15' });
+  eqs(ok16.top, 'd15', '階層: 上限内の深さなら通る');
+}
+
 // ------------------------------------------------------------ 非同期リセット
 //
 // 「クロックを待たない」のが非同期の意味なので、step() ではなく eval() だけで
@@ -1569,9 +1677,36 @@ async function testErrors() {
     ['ブロッキング代入の誤用',
       `module m(input clk, a, output reg q); always @(posedge clk) q = a; endmodule`,
       /ノンブロッキング/],
-    ['モジュール階層は未対応',
+    ['無い module のインスタンス化',
       `module m(input a, output y); sub u0(y, a); endmodule`,
-      /未対応/],
+      /module 'sub' が見つからない/],
+    ['ポートの数が多い',
+      `module sub(input a, output y); assign y = ~a; endmodule
+       module m(input a, output y); sub u0(a, y, a); endmodule`,
+      /ポートは 2 個だが 3 個/],
+    ['無いポート名',
+      `module sub(input a, output y); assign y = ~a; endmodule
+       module m(input a, output y); sub u0(.a(a), .zz(y)); endmodule`,
+      /にポート 'zz' は無い/],
+    ['ポート接続の名前と順番の混在',
+      `module sub(input a, output y); assign y = ~a; endmodule
+       module m(input a, output y); sub u0(a, .y(y)); endmodule`,
+      /混ぜられない/],
+    ['出力ポートに式をつなぐ',
+      `module sub(input a, output y); assign y = ~a; endmodule
+       module m(input a, output y); sub u0(.a(a), .y(a & a)); endmodule`,
+      /信号名をつなぐ/],
+    ['インスタンス名の重複',
+      `module sub(input a, output y); assign y = ~a; endmodule
+       module m(input a, output y, output z); sub u0(a, y); sub u0(a, z); endmodule`,
+      /インスタンス名 'u0' が重複/],
+    ['自己再帰するインスタンス化',
+      `module m(input a, output y); m u0(a, y); endmodule`,
+      /自分自身を含んでいる/],
+    ['相互再帰するインスタンス化',
+      `module p(input a, output y); q u0(a, y); endmodule
+       module q(input a, output y); p u0(a, y); endmodule`,
+      /自分自身を含んでいる/],
     ['乗算は未対応',
       `module m(input [3:0] a, output [7:0] y); assign y = a * a; endmodule`,
       /解釈できない文字/],
@@ -1722,9 +1857,26 @@ function randomDesign(rng, nWires) {
   lines.push(`    else r3 <= ${expr(2)};`);
   lines.push(`  assign rout3 = r3;`);
 
+  // 部品を 1 個インスタンス化する。境界をまたぐ buf と平坦化を差分テストに通す。
+  // 子の中身は自分のポートだけで書く必要があるので、プールを一時的に差し替える
+  const parentPool = [...pool];
+  pool.length = 0;
+  pool.push('p', 'q');
+  const subBody = expr(2);
+  pool.length = 0;
+  pool.push(...parentPool);
+
+  lines.push(`  wire [7:0] subOut;`);
+  lines.push(`  rndsub s0(.p(${pick(pool)}), .q(${pick(pool)}), .r(subOut));`);
+  pool.push('subOut');
+
   lines.push(`  assign y = ${expr(3)};`);
 
-  return `module rnd(
+  return `module rndsub(input [7:0] p, input [7:0] q, output [7:0] r);
+  assign r = ${subBody};
+endmodule
+
+module rnd(
   input clk,
   input rst,
   input [7:0] a,
@@ -1747,7 +1899,8 @@ async function testRandomDiff() {
 
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
   const seen = {
-    'if': 0, 'case': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0, '非同期リセット': 0,
+    'if': 0, 'case': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0,
+    '非同期リセット': 0, '階層': 0,
   };
 
   for (let d = 0; d < 25 && !mismatch; d++) {
@@ -1759,6 +1912,7 @@ async function testRandomDiff() {
     if (/(<<|>>)/.test(src)) seen['シフト']++;
     if (/(&&|\|\||\(!)/.test(src)) seen['論理']++;
     if (/or posedge rst/.test(src)) seen['非同期リセット']++;
+    if (/rndsub s0\(/.test(src)) seen['階層']++;
     let compiled;
     try {
       compiled = compile(src);
@@ -2253,6 +2407,7 @@ const suites = [
   ['シフト回路', testShifter],
   ['if / case', testIfCase],
   ['FSM (列検出)', testSeqDet],
+  ['モジュール階層', testHierarchy],
   ['非同期リセット', testAsyncReset],
   ['カウンタ', testCounter8],
   ['DFF', testDff],

@@ -274,6 +274,39 @@ export function parse(src) {
     return { type: 'gate', gate, instName, args, line };
   }
 
+  /**
+   * モジュールのインスタンス化。
+   *   half_adder h0(a, b, s, c);                  … 順番で対応づけ
+   *   half_adder h0(.a(x), .b(y), .s(z), .c());   … 名前で対応づけ (空は未接続)
+   * 混在は Verilog でも禁止なのでエラーにする。
+   */
+  function parseModuleInst() {
+    const line = peek().line;
+    const moduleName = next().value;
+    const instName = expectIdent();
+    expect('(');
+
+    const ports = [];
+    if (!at(')')) {
+      const named = at('.');
+      do {
+        if (named !== at('.')) throw err('ポート接続は名前指定と順番指定を混ぜられない');
+        if (named) {
+          expect('.');
+          const pname = expectIdent();
+          expect('(');
+          ports.push({ name: pname, expr: at(')') ? null : parseExpr() });
+          expect(')');
+        } else {
+          ports.push({ name: null, expr: parseExpr() });
+        }
+      } while (eat(','));
+    }
+    expect(')');
+    expect(';');
+    return { type: 'inst', module: moduleName, name: instName, ports, line };
+  }
+
   // ---- module ------------------------------------------------------------
   function parseModule() {
     const line = expect('module').line;
@@ -325,8 +358,11 @@ export function parse(src) {
         items.push({ type: 'assign', lhs, rhs, line: aline });
       } else if (v === 'always') items.push(parseAlways());
       else if (GATE_PRIMITIVES.has(v)) items.push(parseGateInst());
-      else if (peek().type === 'ident') {
-        throw err(`'${v}' は未対応 (モジュール階層・always_comb・initial などは未実装)`);
+      else if (peek().type === 'ident' && peek(1).type === 'ident') {
+        // <モジュール名> <インスタンス名> ( … ) ;
+        items.push(parseModuleInst());
+      } else if (peek().type === 'ident') {
+        throw err(`'${v}' は未対応 (always_comb・initial などは未実装)`);
       } else throw err(`予期しないトークン '${v}'`);
     }
     expect('endmodule');

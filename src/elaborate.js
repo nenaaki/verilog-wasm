@@ -26,7 +26,15 @@
 import { CompileError } from './errors.js';
 import { GATE_PRIMITIVES } from './parser.js';
 
-export function elaborate(mod) {
+const MAX_DEPTH = 16;   // インスタンスの入れ子の上限
+
+/**
+ * @param {object} mod    top にする module の AST
+ * @param {object[]} [all] インスタンス解決に使う module 一覧 (省略時は階層なし)
+ */
+export function elaborate(mod, all = [mod]) {
+  const modules = new Map(all.map((m) => [m.name, m]));
+  const instanceNames = new Set();
   const nets = [];
   const gates = [];
   const regs = [];
@@ -139,9 +147,17 @@ export function elaborate(mod) {
     return out;
   };
 
-  // ---- 宣言 --------------------------------------------------------------
-  function declare(name, { dir, kind, range }, line) {
-    let s = signals.get(name);
+  // ---- 宣言とスコープ ------------------------------------------------------
+  //
+  // 階層は「展開しながら平坦化」する。signals は 1 個のフラットな Map で、キーは
+  // インスタンス名を前置した完全修飾名 (`h0.s1`、`h0.h1.carry`)。名前解決だけを
+  // 現在のスコープで行う。scope は再帰の入り口で差し替えて出口で戻すので、
+  // 深さ優先の走査中は常に「いま展開している module の接頭辞」になっている。
+  let scope = '';
+
+  function declare(prefix, name, { dir, kind, range }, line) {
+    const full = prefix + name;
+    let s = signals.get(full);
     if (!s) {
       const msb = range ? range.msb : 0;
       const lsb = range ? range.lsb : 0;
@@ -149,13 +165,16 @@ export function elaborate(mod) {
       const width = msb - lsb + 1;
       const bits = [];
       for (let b = 0; b < width; b++) {
-        bits.push(newNet(width > 1 ? `${name}[${b + lsb}]` : name));
+        bits.push(newNet(width > 1 ? `${full}[${b + lsb}]` : full));
       }
-      s = { name, dir: dir ?? null, kind: kind ?? 'wire', msb, lsb, width, bits };
-      signals.set(name, s);
+      s = {
+        name: full, local: name, isTop: prefix === '',
+        dir: dir ?? null, kind: kind ?? 'wire', msb, lsb, width, bits,
+      };
+      signals.set(full, s);
     } else {
       if (range && (range.msb !== s.msb || range.lsb !== s.lsb)) {
-        throw new CompileError(`${name} のビット範囲が宣言間で矛盾している`, line);
+        throw new CompileError(`${full} のビット範囲が宣言間で矛盾している`, line);
       }
       if (dir) s.dir = dir;
       if (kind) s.kind = kind;
@@ -164,25 +183,24 @@ export function elaborate(mod) {
   }
 
   const lookup = (name, line) => {
-    const s = signals.get(name);
+    const s = signals.get(scope + name);
     if (!s) throw new CompileError(`未宣言の信号 '${name}'`, line);
     return s;
   };
 
-  // 先に全宣言を処理して、前方参照 (assign が後続の wire 宣言を参照する等) を許す
-  for (const item of mod.items) {
-    if (item.type === 'decl') {
-      for (const n of item.names) declare(n, item, item.line);
+  /** 宣言だけ先に処理して、前方参照 (assign が後続の wire 宣言を参照する等) を許す */
+  function declPass(m, prefix) {
+    for (const item of m.items) {
+      if (item.type === 'decl') {
+        for (const n of item.names) declare(prefix, n, item, item.line);
+      }
     }
-  }
-  for (const pname of mod.portOrder) {
-    if (!signals.has(pname)) {
-      throw new CompileError(`ポート '${pname}' の方向が宣言されていない`, mod.line);
+    for (const pname of m.portOrder) {
+      if (!signals.has(prefix + pname)) {
+        throw new CompileError(
+          `${m.name}: ポート '${pname}' の方向が宣言されていない`, m.line);
+      }
     }
-  }
-  // input のネットは外部から与えられるので「駆動済み」とみなす
-  for (const s of signals.values()) {
-    if (s.dir === 'input') s.bits.forEach((n) => drivers.set(n, '入力ポート'));
   }
 
   // ---- 式の評価 (→ LSB 先頭のネット配列) ------------------------------------
@@ -625,19 +643,41 @@ export function elaborate(mod) {
     };
   }
 
-  /** 左辺のネット列に右辺を接続する (buf ゲートで橋渡し) */
-  function connect(lhsNode, rhsBits, what, line) {
-    const lhs = refBits(lhsNode);
+  /** ネット列どうしを接続する (buf ゲートで橋渡し) */
+  function connectNets(lhs, rhsBits, what, line) {
     const src = resize(rhsBits, lhs.length);
     lhs.forEach((q, i) => {
       setDriver(q, what, line);
-      gates.push({ op: 'buf', out: q, in: [src[i]] });
+      const gate = { op: 'buf', out: q, in: [src[i]] };
+      gates.push(gate);
+      gateOf.set(q, gate);   // bufRoot がたどれるように記録する
     });
   }
 
-  // ---- 項目の処理 ----------------------------------------------------------
-  let clock = null;
+  /** 左辺のネット列に右辺を接続する */
+  function connect(lhsNode, rhsBits, what, line) {
+    connectNets(refBits(lhsNode), rhsBits, what, line);
+  }
 
+  /**
+   * buf をたどって元のネットを返す。ポート接続は buf で橋渡しするので、
+   * 親のクロックと子の clk ポートは別ネットになる。クロックの同一性はここで見る。
+   */
+  function bufRoot(net) {
+    let n = net;
+    for (let i = 0; i < 64; i++) {          // 念のため上限を切る
+      const g = gateOf.get(n);
+      if (!g || g.op !== 'buf') return n;
+      n = g.in[0];
+    }
+    return n;
+  }
+
+  // ---- 項目の処理 ----------------------------------------------------------
+  let clock = null;        // クロックのルートネット (buf をたどった先)
+  let clockName = null;    // エラー表示用の名前
+
+  function itemPass(mod, prefix, isTop, depth, stack) {
   for (const item of mod.items) {
     if (item.type === 'decl') continue;
 
@@ -694,10 +734,14 @@ export function elaborate(mod) {
 
       const clk = lookup(clkName, item.line);
       if (clk.width !== 1) throw new CompileError(`クロック '${clkName}' は 1 ビットでなければならない`, item.line);
-      if (clock && clock !== clkName) {
-        throw new CompileError(`複数クロックは未対応 ('${clock}' と '${clkName}')`, item.line);
+      // 階層をまたぐと親の clk と子の clk ポートは別ネットになるので、
+      // buf をたどった元で同一性を見る
+      const clkRoot = bufRoot(clk.bits[0]);
+      if (clock !== null && clock !== clkRoot) {
+        throw new CompileError(`複数クロックは未対応 ('${clockName}' と '${clk.name}')`, item.line);
       }
-      clock = clkName;
+      clock = clkRoot;
+      clockName = clk.name;
       clk.isClock = true;
 
       // 文を上から順に辿り、レジスタの各ビットについて「次の値」を組み立てる。
@@ -710,7 +754,7 @@ export function elaborate(mod) {
       const touched = new Set([...next.keys(), ...(rstNext ? rstNext.keys() : [])]);
       for (const qn of touched) {
         const line = regLine.get(qn) ?? item.line;
-        setDriver(qn, `always @(posedge ${clock})`, line);
+        setDriver(qn, `always @(posedge ${clockName})`, line);
         const dNormal = next.get(qn) ?? qn;      // エッジでの次の値 (無ければ保持)
 
         if (rstCond === null) {
@@ -732,13 +776,103 @@ export function elaborate(mod) {
       continue;
     }
 
+    if (item.type === 'inst') {
+      instantiate(item, prefix, depth, stack);
+      continue;
+    }
+
     throw new CompileError(`未対応の項目 '${item.type}'`, item.line);
   }
+  }
+
+  /**
+   * インスタンスを展開する (階層の平坦化)。
+   *
+   *   1. 子の宣言だけ先に処理して、ポートのネットを作る
+   *   2. 親のスコープで接続式を評価し、buf でポートに橋渡しする
+   *   3. 子の中身を子のスコープで展開する (入れ子はここで再帰)
+   *
+   * 2 を 3 より先にやるのが要点。子の always がクロックの同一性を見るとき、
+   * 先に buf がつながっていないと親のクロックまでたどれない。
+   */
+  function instantiate(item, prefix, depth, stack) {
+    if (depth >= MAX_DEPTH) {
+      throw new CompileError(`インスタンスの入れ子が深すぎる (上限 ${MAX_DEPTH})`, item.line);
+    }
+    const sub = modules.get(item.module);
+    if (!sub) throw new CompileError(`module '${item.module}' が見つからない`, item.line);
+    if (stack.includes(item.module)) {
+      throw new CompileError(
+        `module '${item.module}' が自分自身を含んでいる (${[...stack, item.module].join(' → ')})`,
+        item.line);
+    }
+
+    const childPrefix = `${prefix}${item.name}.`;
+    if (instanceNames.has(childPrefix)) {
+      throw new CompileError(`インスタンス名 '${item.name}' が重複している`, item.line);
+    }
+    instanceNames.add(childPrefix);
+
+    // --- 1. 子の宣言 ---
+    declPass(sub, childPrefix);
+
+    // --- 2. ポート接続 (式は親のスコープで評価する) ---
+    const named = item.ports.length > 0 && item.ports[0].name !== null;
+    if (!named && item.ports.length > sub.portOrder.length) {
+      throw new CompileError(
+        `${item.module} のポートは ${sub.portOrder.length} 個だが ${item.ports.length} 個つないでいる`,
+        item.line);
+    }
+    const seen = new Set();
+    for (const [i, conn] of item.ports.entries()) {
+      const pname = conn.name ?? sub.portOrder[i];
+      if (!sub.portOrder.includes(pname)) {
+        throw new CompileError(`${item.module} にポート '${pname}' は無い`, item.line);
+      }
+      if (seen.has(pname)) {
+        throw new CompileError(`ポート '${pname}' を 2 回つないでいる`, item.line);
+      }
+      seen.add(pname);
+      if (!conn.expr) continue;                       // 未接続
+
+      const port = signals.get(childPrefix + pname);
+      if (port.dir === 'input') {
+        connectNets(port.bits, evalExpr(conn.expr, port.width),
+          `${item.name} の入力ポート ${pname}`, item.line);
+      } else if (port.dir === 'output') {
+        if (conn.expr.type !== 'ref') {
+          throw new CompileError(
+            `出力ポート '${pname}' には信号名をつなぐ (式は駆動できない)`, item.line);
+        }
+        connectNets(refBits(conn.expr), port.bits,
+          `${item.name} の出力ポート ${pname}`, item.line);
+      } else {
+        throw new CompileError(`ポート '${pname}' の方向が宣言されていない`, item.line);
+      }
+    }
+
+    // --- 3. 子の中身 ---
+    const saved = scope;
+    scope = childPrefix;
+    itemPass(sub, childPrefix, false, depth + 1, [...stack, item.module]);
+    scope = saved;
+  }
+
+  // ---- 展開の開始 ----------------------------------------------------------
+  declPass(mod, '');
+  // top の input だけは外部から与えられるので「駆動済み」とみなす
+  for (const s of signals.values()) {
+    if (s.isTop && s.dir === 'input') s.bits.forEach((n) => drivers.set(n, '入力ポート'));
+  }
+  itemPass(mod, '', true, 0, [mod.name]);
 
   // ---- 未駆動ネットの検査 ---------------------------------------------------
+  // top の入力ポートだけは外から与えられるので対象外。子モジュールの入力ポートは
+  // 親がつないでいなければ本当に未駆動なので、ここで拾って 0 に固定する
+  // (未接続のポートに気づけるように警告に出す)。
   const undriven = [];
   for (const s of signals.values()) {
-    if (s.dir === 'input') continue;
+    if (s.isTop && s.dir === 'input') continue;
     s.bits.forEach((n) => {
       if (!drivers.has(n)) undriven.push(nets[n].name);
     });
@@ -746,10 +880,13 @@ export function elaborate(mod) {
   if (undriven.length > 0) {
     // 未駆動は 0 に固定して継続する (途中まで書いた RTL でも動かせるようにする)
     for (const s of signals.values()) {
+      if (s.isTop && s.dir === 'input') continue;
       s.bits.forEach((n) => {
         if (!drivers.has(n)) {
           drivers.set(n, '未駆動 (0 固定)');
-          gates.push({ op: 'buf', out: n, in: [CONST0] });
+          const gate = { op: 'buf', out: n, in: [CONST0] };
+          gates.push(gate);
+          gateOf.set(n, gate);
         }
       });
     }
