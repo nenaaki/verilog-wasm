@@ -10,17 +10,25 @@ export const BLOCK_W = 120;          // 回路部品の箱の幅
 export const PIN_PITCH = 22, BLOCK_PAD = 13;
 export const CANVAS = { w: 900, h: 480 };
 
-/** 部品の箱の大きさ。回路部品だけ端子の数で縦に伸びる */
+/** 部品の箱の大きさ。端子が 3 本以上のものと回路部品は縦に伸びる */
 export function sizeOf(node) {
-  if (node.type !== 'block') return { w: W, h: H };
   const rows = Math.max(insOf(node), outsOf(node), 1);
-  return { w: BLOCK_W, h: Math.max(H, 2 * BLOCK_PAD + (rows - 1) * PIN_PITCH) };
+  if (node.type === 'block') {
+    return { w: BLOCK_W, h: Math.max(H, 2 * BLOCK_PAD + (rows - 1) * PIN_PITCH) };
+  }
+  // 2 本までは今までの箱のまま (既存の回路の見た目を変えないため)
+  return { w: W, h: rows <= 2 ? H : 2 * BLOCK_PAD + (rows - 1) * PIN_PITCH };
 }
 
 /** 端子を縦に並べた位置 */
 export function pinYs(node, count) {
   const h = sizeOf(node).h;
-  if (node.type !== 'block') return count === 1 ? [h / 2] : [h * 0.3, h * 0.7];
+  if (node.type === 'block') {
+    const top = (h - (count - 1) * PIN_PITCH) / 2;
+    return Array.from({ length: count }, (_, i) => top + i * PIN_PITCH);
+  }
+  if (count <= 1) return [h / 2];
+  if (count === 2) return [h * 0.3, h * 0.7];      // 2 本は従来の位置を保つ
   const top = (h - (count - 1) * PIN_PITCH) / 2;
   return Array.from({ length: count }, (_, i) => top + i * PIN_PITCH);
 }

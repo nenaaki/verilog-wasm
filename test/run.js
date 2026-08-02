@@ -2613,6 +2613,81 @@ async function testSaveFormat() {
   toggleSim.step();
   eq(toggleSim.get('q'), 0, '幅: もう 1 クロックで 0 に戻る');
 
+  // ---- 幅を混ぜる部品 (ビット取り出し / 連接) と算術・比較・選択 ----
+  const build = async (label, data, checks) => {
+    const p = toVerilog(expandCircuit(data));
+    eqs(p.widthErrors.length, 0, `${label}: 幅エラーなし`, p.widthErrors.join(','));
+    const s = await WasmSimulator.create(compile(p.source));
+    let bad = null;
+    for (const [set, want] of checks) {
+      for (const [k, v] of Object.entries(set)) s.setInput(k, v);
+      s.eval();
+      for (const [k, v] of Object.entries(want)) {
+        if (Number(s.get(k)) !== v && !bad) {
+          bad = `${JSON.stringify(set)} → ${k}=${s.get(k)} (期待 ${v})`;
+        }
+      }
+    }
+    ok(!bad, `${label}: 値が正しい`, bad ?? '');
+    return p;
+  };
+
+  // ビット取り出しは添字を value に持つ。幅で丸めてはいけない (幅 1 扱いで潰れる)
+  const bitP = await build('ビット取り出し', {
+    nodes: [[1, 'in', 0, 0, 0, 'a', null, 4], [2, 'bit', 200, 0, 2], [3, 'out', 400, 0, 0, 'y']],
+    wires: [[1, 0, 2, 0], [2, 0, 3, 0]],
+  }, [[{ a: 4 }, { y: 1 }], [{ a: 11 }, { y: 0 }], [{ a: 15 }, { y: 1 }]]);
+  ok(bitP.source.includes('= a[2];'), 'ビット取り出し: 部分選択になる', bitP.source);
+  eq(expandCircuit(packCircuit(expandCircuit({
+    nodes: [[1, 'bit', 0, 0, 3]], wires: [],
+  }))).nodes[0].value, 3, 'ビット取り出し: 添字が往復して残る');
+
+  const catP = await build('連接', {
+    nodes: [[1, 'in', 0, 0, 1, 'hi'], [2, 'in', 0, 100, 0, 'lo', null, 4],
+      [3, 'cat', 200, 50], [4, 'out', 400, 50, 0, 'y']],
+    wires: [[1, 0, 3, 0], [2, 0, 3, 1], [3, 0, 4, 0]],
+  }, [[{ hi: 1, lo: 5 }, { y: 21 }], [{ hi: 0, lo: 15 }, { y: 15 }]]);
+  ok(catP.source.includes('output [4:0]'), '連接: 幅が足し算になる (1 + 4 = 5)', catP.source);
+
+  const twoIn = (t) => ({
+    nodes: [[1, 'in', 0, 0, 0, 'a', null, 4], [2, 'in', 0, 100, 0, 'b', null, 4],
+      [3, t, 200, 50], [4, 'out', 400, 50, 0, 'y']],
+    wires: [[1, 0, 3, 0], [2, 0, 3, 1], [3, 0, 4, 0]],
+  });
+  await build('加算', twoIn('add'), [[{ a: 5, b: 3 }, { y: 8 }], [{ a: 15, b: 1 }, { y: 0 }]]);
+  await build('減算', twoIn('sub'), [[{ a: 5, b: 3 }, { y: 2 }], [{ a: 3, b: 5 }, { y: 14 }]]);
+  const eqP = await build('一致', twoIn('eq'), [[{ a: 5, b: 5 }, { y: 1 }], [{ a: 5, b: 4 }, { y: 0 }]]);
+  ok(!eqP.source.includes('output [3:0] y'), '一致: 出力は 1 ビット', eqP.source);
+  await build('小なり', twoIn('lt'), [[{ a: 3, b: 5 }, { y: 1 }], [{ a: 5, b: 3 }, { y: 0 }]]);
+  await build('選択', {
+    nodes: [[1, 'in', 0, 0, 0, 's'], [2, 'in', 0, 80, 0, 'a', null, 4],
+      [3, 'in', 0, 160, 0, 'b', null, 4], [4, 'mux', 250, 80], [5, 'out', 450, 80, 0, 'y']],
+    wires: [[1, 0, 4, 0], [2, 0, 4, 1], [3, 0, 4, 2], [4, 0, 5, 0]],
+  }, [[{ s: 1, a: 9, b: 6 }, { y: 9 }], [{ s: 0, a: 9, b: 6 }, { y: 6 }]]);
+
+  // 幅の規則を外れたものは未配線と同じく除外される
+  const wrong = [
+    ['ビット取り出しの添字が幅の外',
+      { nodes: [[1, 'in', 0, 0, 0, 'a', null, 4], [2, 'bit', 200, 0, 7], [3, 'out', 400, 0, 0, 'y']],
+        wires: [[1, 0, 2, 0], [2, 0, 3, 0]] }],
+    ['一致の両辺の幅が違う',
+      { nodes: [[1, 'in', 0, 0, 0, 'a', null, 4], [2, 'in', 0, 100, 0, 'b'],
+        [3, 'eq', 200, 50], [4, 'out', 400, 50, 0, 'y']],
+      wires: [[1, 0, 3, 0], [2, 0, 3, 1], [3, 0, 4, 0]] }],
+    ['選択の選択信号が 1 ビットでない',
+      { nodes: [[1, 'in', 0, 0, 0, 's', null, 2], [2, 'in', 0, 80, 0, 'a'],
+        [3, 'in', 0, 160, 0, 'b'], [4, 'mux', 250, 80], [5, 'out', 450, 80, 0, 'y']],
+      wires: [[1, 0, 4, 0], [2, 0, 4, 1], [3, 0, 4, 2], [4, 0, 5, 0]] }],
+    ['連接で幅が上限を超える',
+      { nodes: [[1, 'in', 0, 0, 0, 'a', null, 32], [2, 'in', 0, 100, 0, 'b', null, 32],
+        [3, 'cat', 200, 50], [4, 'out', 400, 50, 0, 'y']],
+      wires: [[1, 0, 3, 0], [2, 0, 3, 1], [3, 0, 4, 0]] }],
+  ];
+  for (const [label, data] of wrong) {
+    const p = toVerilog(expandCircuit(data));
+    ok(p.widthErrors.length > 0, `幅の規則: ${label} を弾く`, p.widthErrors.join(','));
+  }
+
   // 幅を超える値は丸める / 範囲外の幅は 1 に落ちる
   const clamped = expandCircuit({
     nodes: [[1, 'in', 0, 0, 999, 'a', null, 4], [2, 'in', 0, 100, 1, 'b', null, 999],

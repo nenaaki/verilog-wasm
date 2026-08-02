@@ -140,6 +140,8 @@
   /* 多ビットは 16 進なので桁が増える。等幅で少し小さく出す */
   .node text.val.wide { font-family: var(--mono); font-size: 9.5px; }
   .node text.konst.wide { font-family: var(--mono); font-size: 12px; }
+  /* ビット取り出しの添字。クリックで変えられるので定数と同じ色にする */
+  .node text.idx { font-family: var(--mono); font-size: 14px; font-weight: 700; fill: var(--amber); }
   .node.reg rect.body { fill: #1f2836; stroke: #3d5f8f; }
   .node.reg text.name { fill: var(--blue); }
   .node.konst rect.body { fill: #2a2519; stroke: #6b5a2a; }
@@ -282,7 +284,7 @@
 import { compile, CompileError } from '../src/compile.js';
 import { WasmSimulator } from '../src/sim.js';
 import {
-  CLOCK, MAX_WIDTH, PARTS, blockPorts, checkName, clampValue, decodeCircuit,
+  CLOCK, MAX_WIDTH, PARTS, bitIndex, blockPorts, checkName, clampValue, decodeCircuit,
   encodeCircuit, expandCircuit, insOf, outsOf, packCircuit, toVerilog, widthOf,
 } from '../src/schematic.js';
 import { SAMPLE_CIRCUITS } from '../src/samples.js';
@@ -993,8 +995,12 @@ function render() {
       outsOf(n) && pinYs(n, outsOf(n)).forEach((y, i) => {
         el('text', { class: 'pinlab r', x: size.w - 10, y }, g).textContent = n._ports.outputs[i];
       });
+    } else if (n.type === 'bit') {
+      // 何ビット目を取り出すかが本体なので、glyph の代わりに添字を出す
+      el('text', { class: 'idx', x: size.w / 2, y: size.h / 2 }, g)
+        .textContent = `[${bitIndex(n)}]`;
     } else {
-      el('text', { x: W / 2, y: H / 2 }, g).textContent = spec(n).glyph;
+      el('text', { x: size.w / 2, y: size.h / 2 }, g).textContent = spec(n).glyph;
     }
 
     for (let p = 0; p < insOf(n); p++) {
@@ -1194,7 +1200,9 @@ function startRename(id) {
  */
 function startValueEdit(id) {
   const n = byId(id);
-  if (!n || (n.type !== 'in' && n.type !== 'const')) return;
+  if (!n || (n.type !== 'in' && n.type !== 'const' && n.type !== 'bit')) return;
+  // ビット取り出しは「何ビット目か」なので 10 進で受ける。値とは意味が違う
+  const isIndex = n.type === 'bit';
   const w = widthOf(n);
   document.getElementById('renameBox')?.remove();
 
@@ -1205,8 +1213,10 @@ function startValueEdit(id) {
   inp.id = 'renameBox';                     // CSS と後片付けを名前の箱と共用する
   inp.type = 'text';
   inp.spellcheck = false;
-  inp.value = fmtValue(n.value ?? 0, w);
-  inp.title = `${w} ビットの値を 16 進で入れる (0x を付けても可)`;
+  inp.value = isIndex ? String(bitIndex(n)) : fmtValue(n.value ?? 0, w);
+  inp.title = isIndex
+    ? `取り出すビットの番号 (10 進。0 が最下位)`
+    : `${w} ビットの値を 16 進で入れる (0x を付けても可)`;
   Object.assign(inp.style, {
     left: `${r.x - wrap.x}px`, top: `${r.y - wrap.y}px`,
     width: `${Math.max(r.width, 84)}px`, height: `${r.height}px`,
@@ -1222,6 +1232,15 @@ function startValueEdit(id) {
     const text = inp.value.trim();
     close();
     if (text === '') return;
+    if (isIndex) {
+      if (!/^[0-9]+$/.test(text)) { setMsg(`ビット番号として読めません: ${text}`, 'err'); return; }
+      const idx = Math.min(MAX_WIDTH - 1, Number.parseInt(text, 10));
+      if (idx === bitIndex(n)) return;
+      pushUndo();
+      n.value = idx;
+      rebuild();
+      return;
+    }
     // 表示が 16 進なので入力も 16 進で読む (0x は付けても付けなくてもよい)
     const m = /^(?:0[xX])?([0-9a-fA-F]+)$/.exec(text);
     if (!m) { setMsg(`16 進の値として読めません: ${text}`, 'err'); return; }
@@ -1336,11 +1355,11 @@ svg.addEventListener('pointerup', (e) => {
       pushUndo(drag.snap);                         // 動かす前の状態を積む
       autoSave();
     }
-    // 動かさずに離した = クリック → 入力と定数の値を変える。
-    // 1 ビットならその場で反転、広いときは値を打ち込む箱を出す (16 進で何度も
+    // 動かさずに離した = クリック → 値 (入力・定数) か添字 (ビット取り出し) を変える。
+    // 1 ビットならその場で反転、広いときは打ち込む箱を出す (16 進で何度も
     // クリックさせるのは現実的でないため)
-    if (!drag.moved && (n?.type === 'in' || n?.type === 'const')) {
-      if (widthOf(n) > 1) {
+    if (!drag.moved && n && (n.type === 'in' || n.type === 'const' || n.type === 'bit')) {
+      if (n.type === 'bit' || widthOf(n) > 1) {
         startValueEdit(n.id);
       } else {
         if (n.type === 'const') pushUndo();

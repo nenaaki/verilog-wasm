@@ -25,6 +25,21 @@ export const PARTS = {
   xnor:  { label: 'XNOR',   glyph: 'XNOR', ins: 2, outs: 1 },
   // メモリ (D フリップフロップ)。クロックは 1 本を全体で共有するので端子には出さない
   dff:   { label: 'メモリ', glyph: 'DFF', ins: 1, outs: 1, reg: true, named: true, sized: true },
+
+  // ---- 幅を混ぜる部品 ----
+  // バスから 1 ビット取り出す。何ビット目かは value に入れる (幅ではないので indexed)
+  bit:   { label: 'ビット取り出し', glyph: '[i]', btn: 'ビット', ins: 1, outs: 1,
+    wrule: 'one', indexed: true },
+  // 2 本を繋げて太いバスにする。上が上位ビット
+  cat:   { label: '連接', glyph: '{ }', btn: '連接', ins: 2, outs: 1, wrule: 'sum' },
+
+  // ---- 算術・比較・選択 ----
+  add:   { label: '加算', glyph: 'A+B', btn: '加算', ins: 2, outs: 1 },
+  sub:   { label: '減算', glyph: 'A-B', btn: '減算', ins: 2, outs: 1 },
+  eq:    { label: '一致', glyph: 'A=B', btn: '一致', ins: 2, outs: 1, wrule: 'cmp' },
+  lt:    { label: '小なり', glyph: 'A<B', btn: '小なり', ins: 2, outs: 1, wrule: 'cmp' },
+  // 選択。上から順に 選択信号 (1 ビット) / 1 のとき / 0 のとき
+  mux:   { label: '選択', glyph: 'MUX', btn: '選択', ins: 3, outs: 1, wrule: 'mux' },
   // 保存した回路をまるごと 1 個の部品にしたもの。端子の数は中身で決まる (insOf / outsOf)
   block: { label: '回路部品', glyph: 'BLOCK', ins: 0, outs: 0, block: true },
   // 平坦化のときだけ作る内部部品。ブロックの端子と中身をつなぐ中継で assign x = y; になる
@@ -60,6 +75,22 @@ export const clampValue = (value, w) => {
   const v = Number(value);
   if (!Number.isInteger(v) || v < 0) return 0;
   return w >= 32 ? v >>> 0 : v % (2 ** w);
+};
+
+/** ビット取り出しの「何ビット目か」。value を幅ではなく添字として読む */
+export const bitIndex = (node) => {
+  const v = Number(node.value);
+  return Number.isInteger(v) && v >= 0 && v < MAX_WIDTH ? v : 0;
+};
+
+/**
+ * ノードの value を正規化する。ふつうは幅に収める値だが、ビット取り出しの
+ * value は添字なので幅で丸めてはいけない (幅 1 扱いで 0/1 に潰れてしまう)。
+ */
+const normValue = (node) => {
+  if (node.type === 'block') return node.value ? 1 : 0;
+  if (PARTS[node.type]?.indexed) return bitIndex(node);
+  return clampValue(node.value ?? 0, widthOf(node));
 };
 
 // 保存形式の上限。サンプルの組み立てより先に評価される必要がある
@@ -112,7 +143,7 @@ export function packCircuit(graph) {
     nodes: graph.nodes.map((n) => {
       const w = widthOf(n);
       const tail = [
-        n.type === 'block' ? (n.value ? 1 : 0) : clampValue(n.value ?? 0, w),
+        normValue(n),
         n.name ?? null,
         n.type === 'block' ? { ref: n.ref ?? null, def: n.def } : null,
         w > 1 ? w : null,
@@ -163,12 +194,12 @@ export function expandCircuit(c, depth = 0) {
     if (PARTS[type].internal) throw new Error(`${type} は内部用の部品なので置けません`);
     ids.add(id);
     const node = {
-      id, type, x: coord(x), y: coord(y),
+      id, type, x: coord(x), y: coord(y), value,
       ...(typeof name === 'string' && name.length > 0 && name.length <= MAX_NAME ? { name } : {}),
     };
     // 幅は先に決める (値の丸めに使う)。未指定・範囲外は 1 に落ちる
     if (PARTS[type].sized) node.w = widthOf({ type, w });
-    node.value = type === 'block' ? (value ? 1 : 0) : clampValue(value ?? 0, widthOf(node));
+    node.value = normValue(node);
     if (type === 'block') {
       if (!extra || typeof extra !== 'object') throw new Error('回路部品に中身がありません');
       node.def = extra.def;
@@ -322,6 +353,14 @@ const EXPR = {
   nand: ([a, b]) => `~(${a} & ${b})`,
   nor:  ([a, b]) => `~(${a} | ${b})`,
   xnor: ([a, b]) => `~(${a} ^ ${b})`,
+  // 第 2 引数にノードを取るのは、ビット取り出しだけが添字を必要とするため
+  bit:  ([a], n) => `${a}[${bitIndex(n)}]`,
+  cat:  ([hi, lo]) => `{${hi}, ${lo}}`,
+  add:  ([a, b]) => `${a} + ${b}`,
+  sub:  ([a, b]) => `${a} - ${b}`,
+  eq:   ([a, b]) => `${a} == ${b}`,
+  lt:   ([a, b]) => `${a} < ${b}`,
+  mux:  ([s, a, b]) => `${s} ? ${a} : ${b}`,
 };
 
 const ALPHA = 'abcdefghijklmnopqrstuvwxyz';
@@ -407,24 +446,52 @@ function inferWidths(nodes, driver) {
     if (PARTS[n.type].sized) width.set(n.id, widthOf(n));
   }
 
-  // 伝播はループ (dff の帰還) を含みうるので、変化が止まるまで回す
+  // 伝播はループ (dff の帰還) を含みうるので、変化が止まるまで回す。
+  // 部品ごとの規則:
+  //   same … 入力は全部同じ幅で、出力もその幅 (ゲート・出力・中継)
+  //   one  … 出力は 1 ビット。入力の幅は問わない (ビット取り出し)
+  //   sum  … 出力は入力の幅の合計 (連接)
+  //   cmp  … 入力は同じ幅で、出力は 1 ビット (一致・小なり)
+  //   mux  … 1 本目は 1 ビット、残りは同じ幅で、出力はその幅 (選択)
   for (let changed = true; changed;) {
     changed = false;
     for (const n of nodes) {
       if (PARTS[n.type].sized) continue;          // 自分で持っている
+      const rule = PARTS[n.type].wrule ?? 'same';
       const ins = [];
       for (let p = 0; p < insOf(n); p++) {
         const from = driver.get(`${n.id}:${p}`);
-        if (from) ins.push(width.get(from.node));
+        ins.push(from ? width.get(from.node) : undefined);
       }
-      const known = ins.filter((w) => w !== undefined);
-      if (known.length === 0) continue;
-      if (known.some((w) => w !== known[0])) {
+      const bad = () => {
         if (!mismatch.has(n.id)) { mismatch.add(n.id); changed = true; }
-        continue;
+      };
+
+      let out;
+      if (rule === 'one') {
+        out = 1;
+      } else if (rule === 'sum') {
+        if (ins.some((w) => w === undefined)) continue;   // 全部そろってから決める
+        out = ins.reduce((a, b) => a + b, 0);
+        if (out > MAX_WIDTH) { bad(); continue; }
+      } else {
+        const data = rule === 'mux' ? ins.slice(1) : ins;
+        const known = data.filter((w) => w !== undefined);
+        if (rule === 'mux' && ins[0] !== undefined && ins[0] !== 1) { bad(); continue; }
+        if (known.length === 0) continue;
+        if (known.some((w) => w !== known[0])) { bad(); continue; }
+        out = rule === 'cmp' ? 1 : known[0];
       }
-      if (width.get(n.id) !== known[0]) { width.set(n.id, known[0]); changed = true; }
+      if (width.get(n.id) !== out) { width.set(n.id, out); changed = true; }
     }
+  }
+
+  // ビット取り出しの添字が、繋いだバスの幅に収まっているか
+  for (const n of nodes) {
+    if (n.type !== 'bit') continue;
+    const from = driver.get(`${n.id}:0`);
+    const src = from && width.get(from.node);
+    if (src !== undefined && bitIndex(n) >= src) mismatch.add(n.id);
   }
 
   // dff は自分の幅を持つが、D 入力の幅が違っていたら黙って切り詰めたくない
@@ -544,7 +611,7 @@ export function toVerilog(graph, opts = {}) {
       continue;
     }
     const args = argsOf(n);
-    body.push(`  assign ${o.name} = ${n.type === 'out' ? args[0] : EXPR[n.type](args)};`);
+    body.push(`  assign ${o.name} = ${n.type === 'out' ? args[0] : EXPR[n.type](args, n)};`);
   }
   for (const o of regs) {
     body.push(`  always @(posedge ${CLOCK})`);

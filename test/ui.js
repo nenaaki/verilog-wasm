@@ -1109,6 +1109,58 @@ await sleep(500);
 ok((await js('__verilog()')).includes('input  a'), '幅: 1 に戻せる', await js('__verilog()'));
 ok(await js('__nodeText("a")') === 'a0', '幅: 戻すと値が丸まる', await js('__nodeText("a")'));
 
+// ==================================================== 幅を混ぜる / 算術の部品
+// サンプルを読んで、生成される Verilog と値が合っているかを見る
+await js('__preset("1 ビット取り出して")');
+await sleep(600);
+const ripV = await js('__verilog()');
+ok(ripV.includes('= a[0];'), '部品: ビット取り出しが部分選択になる', ripV);
+ok(ripV.includes('= a[3];'), '部品: 添字を変えられる', ripV);
+ok(/= \{\w+, \w+\};/.test(ripV), '部品: 連接が {hi, lo} になる', ripV);
+ok(ripV.includes('output [1:0] sw'), '部品: 連接で幅が足し算になる', ripV);
+ok((await js('__msg()')).includes('コンパイル成功'), '部品: コンパイルできる', await js('__msg()'));
+
+// a = 6 (0110) → {a[0], a[3]} = {0, 0} = 00
+ok(await js('__nodeText("sw")') === 'sw0', '部品: a=6 なら sw=0', await js('__nodeText("sw")'));
+// a を 9 (1001) にすると {1, 1} = 11 = 3
+await click(await js('__nodeCenter("a")'));
+await js('__typeValue("9")');
+await sleep(600);
+ok(await js('__nodeText("sw")') === 'sw3', '部品: a=9 なら sw=3', await js('__nodeText("sw")'));
+
+// ビット取り出しの添字はクリックで変えられる (10 進)
+const bitNodes = await js(`[...document.querySelectorAll('#gNodes .node')]
+  .filter(g => g.querySelector('text.idx')).map(g => g.querySelector('text.idx').textContent).join(',')`);
+ok(bitNodes === '[0],[3]', '部品: 添字が箱に出る', bitNodes);
+await js(`(() => {
+  const g = [...document.querySelectorAll('#gNodes .node')].find(x => x.querySelector('text.idx')?.textContent === '[0]');
+  const r = g.getBoundingClientRect();
+  window.__bitPoint = [r.x + r.width / 2, r.y + r.height / 2];
+  return 1;
+})()`);
+await click(await js('__bitPoint'));
+ok(await js('__valueBoxOpen()'), '部品: ビット取り出しをクリックすると箱が出る');
+await js('__typeValue("1")');
+await sleep(600);
+ok((await js('__verilog()')).includes('= a[1];'), '部品: 添字を 1 に変えられる', await js('__verilog()'));
+
+await js('__preset("加算器と比較")');
+await sleep(600);
+const addV = await js('__verilog()');
+ok(addV.includes('= a + b;'), '部品: 加算が + になる', addV);
+ok(addV.includes('= a < b;'), '部品: 小なりが < になる', addV);
+ok(addV.includes('output [3:0] sum'), '部品: 加算の出力は入力と同じ幅', addV);
+ok(addV.includes('output less') && !addV.includes('output [3:0] less'),
+  '部品: 比較の出力は 1 ビット', addV);
+ok(await js('__nodeText("sum")') === 'sumE', '部品: 9 + 5 = E', await js('__nodeText("sum")'));
+ok(await js('__nodeText("less")') === 'less0', '部品: 9 < 5 は 0', await js('__nodeText("less")'));
+
+// パレットに新しい部品のボタンが並んでいる
+const btns = await js(`[...document.querySelectorAll('#palette button')].map(b => b.textContent).join(',')`);
+for (const label of ['ビット', '連接', '加算', '減算', '一致', '小なり', '選択']) {
+  ok(btns.includes(label), `部品: パレットに「${label}」がある`, btns);
+}
+
 // ------------------------------------------------------------------ 結果
 console.log(`${passed} 件成功, ${failures.length} 件失敗`);
 for (const f of failures) console.log(`  × ${f}`);
