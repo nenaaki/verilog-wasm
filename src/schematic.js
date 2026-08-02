@@ -368,12 +368,24 @@ export function encodeCircuit(graph) {
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-/** encodeCircuit の逆。壊れていれば例外 */
-export function decodeCircuit(text) {
+/** リンクの文字列を JSON に戻すところまで。base64 として壊れていれば例外 */
+function linkJson(text) {
   const bin = atob(String(text).replace(/-/g, '+').replace(/_/g, '/'));
-  const bytes = Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
-  return expandCircuit(JSON.parse(new TextDecoder().decode(bytes)));
+  return JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, (ch) => ch.charCodeAt(0))));
 }
+
+/**
+ * encodeCircuit の逆。**圧縮形式のまま**返す。中身の検査は済ませてあるので、
+ * 通れば expandCircuit に渡せる = サンプルや .json と同じ入口に流し込める。
+ */
+export function decodeCircuitData(text) {
+  const data = linkJson(text);
+  expandCircuit(data);        // 知らない部品や壊れた座標があればここで例外
+  return data;
+}
+
+/** encodeCircuit の逆。展開したグラフを返す。壊れていれば例外 */
+export const decodeCircuit = (text) => expandCircuit(linkJson(text));
 
 const EXPR = {
   alias: ([a]) => a,          // 回路部品の端子をつなぐ中継

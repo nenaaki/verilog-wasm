@@ -142,8 +142,10 @@
   .node text.konst.wide { font-family: var(--mono); font-size: 12px; }
   /* ビット取り出しの添字。クリックで変えられるので定数と同じ色にする */
   .node text.idx { font-family: var(--mono); font-size: 14px; font-weight: 700; fill: var(--amber); }
-  /* 1 ビットでない部品の右上に出す幅の札。値と紛れないよう小さく別の色にする */
-  .node text.bw { font-size: 8.5px; fill: #7fd6b8; text-anchor: end; }
+  /* 1 ビットでない端子のそばに出す幅。単位は付けず、位置で「幅」だと分かるようにする */
+  .node text.bw { font-size: 9px; fill: #7fd6b8; }
+  .node text.bw.l { text-anchor: start; }
+  .node text.bw.r { text-anchor: end; }
   .node.reg rect.body { fill: #1f2836; stroke: #3d5f8f; }
   .node.reg text.name { fill: var(--blue); }
   .node.konst rect.body { fill: #2a2519; stroke: #6b5a2a; }
@@ -286,9 +288,9 @@
 import { compile, CompileError } from '../src/compile.js';
 import { WasmSimulator } from '../src/sim.js';
 import {
-  CLOCK, MAX_WIDTH, MIN_PINS, PARTS, bitIndex, blockPorts, checkName, clampValue, decodeCircuit,
-  encodeCircuit, expandCircuit, insOf, outsOf, packCircuit, sizeOfPart, sliceOf, toVerilog,
-  widthOf,
+  CLOCK, MAX_WIDTH, MIN_PINS, PARTS, bitIndex, blockPorts, checkName, clampValue,
+  decodeCircuitData, encodeCircuit, expandCircuit, insOf, outsOf, packCircuit, sizeOfPart,
+  sliceOf, toVerilog, widthOf,
 } from '../src/schematic.js';
 import { SAMPLE_CIRCUITS } from '../src/samples.js';
 import { el, hel, $ } from './dom.js';
@@ -913,6 +915,16 @@ function setMsg(text, cls) {
 /** 画面に出すときの幅 */
 const dispWidth = (n) => plan?.widthOf?.get(n.id) ?? widthOf(n);
 
+/**
+ * その出力端子が運ぶ幅。ふつうは部品の幅だが、回路部品 (block) は端子ごとに違うので
+ * outletOf で中身のノードに引き直してから幅を見る。
+ */
+function pinWidth(n, port) {
+  const flat = plan?.outletOf?.get(`${n.id}:${port}`);
+  if (flat !== undefined) return plan?.widthOf?.get(flat) ?? 1;
+  return dispWidth(n);
+}
+
 /** 幅 1 は 0/1、広いときは 16 進 (桁数は幅から決める) */
 function fmtValue(v, w) {
   if (v === null || v === undefined) return '';
@@ -1006,9 +1018,20 @@ function render() {
       el('text', { x: size.w / 2, y: size.h / 2 }, g).textContent = spec(n).glyph;
     }
 
-    // バスは一目で分かったほうがいいので、1 ビットでない部品は右上に幅を出す。
-    // 「4b」にしてあるのは、ビット取り出しの `[3:0]` (どのビットか) と読み違えないため。
-    if (wOf > 1) el('text', { class: 'bw', x: size.w - 5, y: 8 }, g).textContent = `${wOf}b`;
+    // バスを運ぶ端子のそばに、その幅を数字だけで出す (幅 1 には出さない)。
+    // 「4b」のように単位を付けると字が増えて密度が上がるので、単位は置き場所に持たせた
+    // ＝ 端子のすぐ上に浮いている数字は幅、箱の中の数字は値。
+    const bwAt = (w, q, side) => {
+      if (w <= 1) return;
+      const x = side === 'l' ? q.x + 4 : q.x - 4;
+      el('text', { class: `bw ${side}`, x, y: q.y - 10 }, g).textContent = String(w);
+    };
+    // 幅を運ぶのは出力端子。出力ポートだけは出力端子が無いので、入ってくる左の端子に付ける
+    if (outsOf(n) > 0) {
+      for (let p = 0; p < outsOf(n); p++) bwAt(pinWidth(n, p), outPin(n, p), 'l');
+    } else if (insOf(n) > 0) {
+      bwAt(wOf, inPin(n, 0), 'r');
+    }
 
     for (let p = 0; p < insOf(n); p++) {
       const q = inPin(n, p);
@@ -1163,7 +1186,8 @@ function startRename(id) {
   document.getElementById('renameBox')?.remove();
 
   const g = $('gNodes').querySelector(`[data-id="${id}"]`);
-  const r = g.getBoundingClientRect();
+  // 箱の外に出ている飾り (端子・幅の数字) を含めないよう、本体の矩形にだけ重ねる
+  const r = g.querySelector('rect.body').getBoundingClientRect();
   const wrap = $('canvasWrap').getBoundingClientRect();
   const inp = document.createElement('input');
   inp.id = 'renameBox';
@@ -1214,7 +1238,8 @@ function startValueEdit(id) {
   document.getElementById('renameBox')?.remove();
 
   const g = $('gNodes').querySelector(`[data-id="${id}"]`);
-  const r = g.getBoundingClientRect();
+  // 箱の外に出ている飾り (端子・幅の数字) を含めないよう、本体の矩形にだけ重ねる
+  const r = g.querySelector('rect.body').getBoundingClientRect();
   const wrap = $('canvasWrap').getBoundingClientRect();
   const inp = document.createElement('input');
   inp.id = 'renameBox';                     // CSS と後片付けを名前の箱と共用する
@@ -1665,7 +1690,8 @@ async function openInitial() {
   let failed = null;
   if (shared) {
     try {
-      await loadGraph(decodeCircuit(shared), '', '');
+      // loadGraph は圧縮形式を受け取って自分で展開するので、展開済みを渡してはいけない
+      await loadGraph(decodeCircuitData(shared), '', '');
       return;
     } catch (e) {
       // 理由は代わりの回路を読んだ後に出す (rebuild がメッセージを上書きするため)

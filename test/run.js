@@ -11,7 +11,7 @@ import { compile, CompileError } from '../src/compile.js';
 import { WasmSimulator } from '../src/sim.js';
 import { RefSimulator } from '../src/interp.js';
 import {
-  blockPorts, checkName, decodeCircuit, encodeCircuit, expandCircuit,
+  blockPorts, checkName, decodeCircuit, decodeCircuitData, encodeCircuit, expandCircuit,
   flattenGraph, insOf, outsOf, packCircuit, toVerilog,
 } from '../src/schematic.js';
 import { SAMPLE_CIRCUITS } from '../src/samples.js';
@@ -2596,6 +2596,10 @@ async function testSaveFormat() {
     eqs(JSON.stringify(round), JSON.stringify(g), `保存形式: ${name} が往復して一致する`);
     eqs(JSON.stringify(decodeCircuit(encodeCircuit(g))), JSON.stringify(g),
       `保存形式: ${name} がリンク経由でも一致する`);
+    // decodeCircuitData は圧縮形式のまま返す。エディタはサンプルや .json と同じ入口に
+    // 流し込むのでこちらを使う (展開済みを渡すと二重展開になって開けない)
+    eqs(JSON.stringify(expandCircuit(decodeCircuitData(encodeCircuit(g)))), JSON.stringify(g),
+      `保存形式: ${name} がリンクから圧縮形式のまま戻せる`);
   }
   ok(encodeCircuit(expandCircuit(SAMPLE_CIRCUITS['AND ゲート'])).length < 200,
     '保存形式: 小さい回路のリンクは短い',

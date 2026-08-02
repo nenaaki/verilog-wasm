@@ -17,6 +17,8 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+// 共有リンクを作るためだけに使う (ブラウザに渡す回路をこちらで組み立てる)
+import { encodeCircuit, expandCircuit } from '../src/schematic.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.PORT ?? 8123);
@@ -181,15 +183,22 @@ const type = async (text) => { await send('Input.insertText', { text }); await s
 // -------------------------------------------------- ページ内のヘルパ関数
 // 部品や配線の位置は SVG の中にあるので、client 座標への変換はページ側でやる。
 const HELPERS = `
-  // 右上の幅の札 (「4b」) は飾りなので、部品の文字としては読まない
+  // 端子のそばに出る幅の数字は飾りなので、部品の文字としては読まない
   window.__partText = (g) => [...g.querySelectorAll('text')]
     .filter((t) => !t.classList.contains('bw')).map((t) => t.textContent).join('').trim();
-  window.__bwOf = (prefix) => __nodeAt(prefix)?.querySelector('text.bw')?.textContent ?? null;
+  // 端子ごとに出るので、部品 1 個ぶんをまとめて取る
+  window.__bwOf = (prefix) => {
+    const g = __nodeAt(prefix);
+    if (!g) return null;
+    const ws = [...g.querySelectorAll('text.bw')].map((t) => t.textContent);
+    return ws.length ? ws.join(',') : null;
+  };
   window.__nodeAt = (prefix) => [...document.querySelectorAll('#gNodes .node')]
     .find((g) => __partText(g).startsWith(prefix));
   window.__center = (elm) => { const r = elm.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; };
   window.__btn = (id) => __center(document.getElementById(id));
-  window.__nodeCenter = (prefix) => __center(__nodeAt(prefix));
+  // 幅の数字は箱の外に出ているので、中心は本体の矩形から取る
+  window.__nodeCenter = (prefix) => __center(__nodeAt(prefix).querySelector('rect.body'));
   window.__pinCenter = (prefix, i) => { const ps = [...__nodeAt(prefix).querySelectorAll('.pin')];
     return __center(i < 0 ? ps[ps.length - 1] : ps[i]); };
   window.__button = (text) => __center([...document.querySelectorAll('#palette button')]
@@ -770,6 +779,9 @@ ok((await js('__hash()')).startsWith('#c='), 'リンク: URL に回路が入る'
 const link = await js('__hash()');
 
 await reopen(link);
+// 自動保存にも同じ回路が入っているので、部品の数だけ見るとリンクが読めていなくても通ってしまう。
+// 「読めなかった」と言っていないことまで確かめる (実際にここで読めていない不具合を見落とした)
+ok(!(await js('__msg()')).includes('読めませんでした'), 'リンク: 読めたと言っている', await js('__msg()'));
 ok(await js('__nodeCount()') === savedNodes, 'リンク: 開くと同じ回路', String(await js('__nodeCount()')));
 ok(await js('__verilog()') === savedVerilog, 'リンク: Verilog も同じ', await js('__verilog()'));
 ok(await js('__selected()') === '', 'リンク: リストは未選択', await js('__selected()'));
@@ -1233,30 +1245,79 @@ await js('__setWidth(1)');
 await sleep(600);
 ok(await js('__widthBox()') === '2', '連接: 本数 1 は 2 に上がる', String(await js('__widthBox()')));
 
-// ==================================================== 幅の札
-// 1 ビットでない部品は右上に幅を出す。1 ビットのものには何も出ない
+// ==================================================== 端子に出す幅
+// 1 ビットでないバスは、それを運ぶ端子のそばに数字だけで出る
 await js('__preset("上下に割って")');
 await sleep(600);
-ok(await js('__bwOf("a")') === '8b', '幅の札: 8 ビットの入力に 8b が出る', String(await js('__bwOf("a")')));
-ok(await js('__bwOf("sw")') === '8b', '幅の札: 出力にも伝わった幅が出る', String(await js('__bwOf("sw")')));
+ok(await js('__bwOf("a")') === '8', '幅: 8 ビットの入力の端子に 8 が出る', String(await js('__bwOf("a")')));
+ok(await js('__bwOf("sw")') === '8', '幅: 出力ポートにも伝わった幅が出る', String(await js('__bwOf("sw")')));
 const slicebw = await js(`[...document.querySelectorAll('#gNodes .node')]
   .filter(g => g.querySelector('text.idx')).map(g => g.querySelector('text.bw')?.textContent).join(',')`);
-ok(slicebw === '4b,4b', '幅の札: 部分選択は取り出したビット数を出す', slicebw);
+ok(slicebw === '4,4', '幅: 部分選択は取り出したビット数を出す', slicebw);
+// 単位を付けずに数字だけ出す (密度を上げないため)
+const bwTexts = await js(`[...document.querySelectorAll('#gNodes text.bw')].map(t=>t.textContent).join(',')`);
+ok(/^[\d,]+$/.test(bwTexts), '幅: 数字だけで単位は付かない', bwTexts);
 
-// 1 ビットだけの回路には札が 1 枚も出ない
+// 出力を持つ部品は右の端子、出力ポートは左の端子 (幅が入ってくる側) に付く
+const bwSide = await js(`(() => {
+  const at = (p) => { const g = __nodeAt(p); const b = g.querySelector('rect.body');
+    return Number(g.querySelector('text.bw').getAttribute('x')) > Number(b.getAttribute('width')) / 2; };
+  return [at('a'), at('sw')].join(',');
+})()`);
+ok(bwSide === 'true,false', '幅: 入力は右の端子・出力ポートは左の端子に付く', bwSide);
+
+// 箱に重ねる入力欄が幅の数字に引っ張られていないか (本体の矩形に合っているか)
+await click(await js('__nodeCenter("a")'));
+ok(await js('__valueBoxOpen()'), '幅: 8 ビット入力をクリックすると値の箱が出る');
+const boxFit = await js(`(() => {
+  const r = document.getElementById('renameBox').getBoundingClientRect();
+  const b = __nodeAt('a').querySelector('rect.body').getBoundingClientRect();
+  return Math.round(Math.abs(r.x - b.x)) <= 1 && Math.round(Math.abs(r.height - b.height)) <= 1;
+})()`);
+ok(boxFit, '幅: 値の箱は部品の本体にぴったり重なる');
+await key('Escape', 'Escape', 27);
+
+// 1 ビットだけの回路には 1 個も出ない
 await js('__preset("AND")');
 await sleep(600);
 const bwCount = await js(`document.querySelectorAll('#gNodes text.bw').length`);
-ok(bwCount === 0, '幅の札: 1 ビットの回路には出ない', String(bwCount));
+ok(bwCount === 0, '幅: 1 ビットの回路には出ない', String(bwCount));
 
-// 幅を変えると札も変わる
+// 幅を変えると数字も変わる
 await click(await js('__nodeCenter("a")'));
 await js('__setWidth(4)');
 await sleep(600);
-ok(await js('__bwOf("a")') === '4b', '幅の札: 幅を変えると札も変わる', String(await js('__bwOf("a")')));
+ok(await js('__bwOf("a")') === '4', '幅: 幅を変えると数字も変わる', String(await js('__bwOf("a")')));
 await js('__setWidth(1)');
 await sleep(600);
-ok(await js('__bwOf("a")') === null, '幅の札: 1 ビットに戻すと札も消える', String(await js('__bwOf("a")')));
+ok(await js('__bwOf("a")') === null, '幅: 1 ビットに戻すと消える', String(await js('__bwOf("a")')));
+
+// 回路部品は端子ごとに幅が違うので、端子ごとに出す。中身は
+// 「4 ビット入力 → そのまま y4 (4 ビット)」と「→ 1 ビット取り出して y1」の 2 出力
+const busBlockLink = encodeCircuit(expandCircuit({
+  nodes: [
+    [1, 'in', 40, 120, 5, 'x', null, 4],
+    [2, 'block', 280, 100, 0, null, {
+      ref: '幅つき部品',
+      def: {
+        nodes: [[1, 'in', 40, 40, 0, 'a', null, 4], [2, 'out', 320, 20, 0, 'y4'],
+          [3, 'bit', 180, 150, 0], [4, 'out', 320, 150, 0, 'y1']],
+        wires: [[1, 0, 2, 0], [1, 0, 3, 0], [3, 0, 4, 0]],
+      },
+    }],
+    [3, 'out', 560, 60, 0, 'z4'], [4, 'out', 560, 200, 0, 'z1'],
+  ],
+  wires: [[1, 0, 2, 0], [2, 0, 3, 0], [2, 1, 4, 0]],
+}));
+await reopen(`#c=${busBlockLink}`);
+await sleep(600);
+ok((await js('__verilog()')).includes('output [3:0] z4'), '幅: 幅つきの部品を開けた', await js('__verilog()'));
+ok(await js('__bwOf("幅つき部品")') === '4', '幅: 回路部品は 4 ビットの端子だけに数字が出る',
+  String(await js('__bwOf("幅つき部品")')));
+ok(await js('__bwOf("z4")') === '4', '幅: 部品の 4 ビット出力を受けた出力ポートに 4 が出る',
+  String(await js('__bwOf("z4")')));
+ok(await js('__bwOf("z1")') === null, '幅: 1 ビット出力を受けた側には出ない',
+  String(await js('__bwOf("z1")')));
 
 // ------------------------------------------------------------------ 結果
 console.log(`${passed} 件成功, ${failures.length} 件失敗`);
