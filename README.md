@@ -59,10 +59,10 @@ WebAssembly.instantiate → sim.js
 | [src/leb128.js](src/leb128.js) | LEB128・セクションエンコーダ | 59 |
 | [src/wat.js](src/wat.js) | WAT 出力（デバッグ用バックエンド） | 85 |
 | [src/interp.js](src/interp.js) | JS 参照実装（差分テスト用） | 78 |
-| [src/schematic.js](src/schematic.js) | 回路グラフ → Verilog・保存形式・幅の推論・階層の平坦化（GUI エディタ用フロントエンド） | 590 |
+| [src/schematic.js](src/schematic.js) | 回路グラフ → Verilog・保存形式・幅の推論・階層の平坦化（GUI エディタ用フロントエンド） | 600 |
 | [src/samples.js](src/samples.js) | エディタのサンプル回路（データ） | 341 |
 | [src/sim.js](src/sim.js) / [src/signals.js](src/signals.js) / [src/compile.js](src/compile.js) | 実行時グルー・エントリ | 188 |
-| **合計（コメント込み）** | | **3,224** |
+| **合計（コメント込み）** | | **3,234** |
 
 エディタ側は [web/editor.html](web/editor.html) に状態と操作を置き、状態を持たない部分を分けてある。
 
@@ -560,7 +560,7 @@ ok   回路部品
 ok   保存形式
 ok   定数
 
-1716 件成功, 0 件失敗
+1733 件成功, 0 件失敗
 ```
 
 `GUI 回路グラフ` はエディタのサンプル回路（[src/schematic.js](src/schematic.js) の `SAMPLE_CIRCUITS`）を Verilog に変換して突き合わせる。回路部品は「半加算器 2 個で全加算器」「全加算器 2 個で 2 ビット加算器（入れ子）」「中にメモリを含む部品」を実際に走らせて確認している。組合せ回路は真理値表、メモリ入りの回路は入力を変えながらクロックを打った値の列で確認する。未配線の部品が下流ごと除外されること、フィードバック配線が組合せループとして弾かれる一方で**メモリを挟んだ帰還は通る**ことも見ている。
@@ -571,7 +571,7 @@ ok   定数
 
 ```text
 $ node test/ui.js
-316 件成功, 0 件失敗
+325 件成功, 0 件失敗
 ```
 
 ここも依存パッケージは足していない。Node 22 以降のグローバル `WebSocket` で CDP（Chrome DevTools Protocol）を直接話し、ブラウザはシステムに入っている Chrome を使う。静的サーバの起動から後片付けまで自前でやるので `node test/ui.js` だけで完結する。Chrome が見つからない環境ではスキップして正常終了する（`CHROME=/path/to/chrome` で場所を指定できる）。
