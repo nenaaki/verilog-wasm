@@ -1144,6 +1144,32 @@ await js('__typeValue("1")');
 await sleep(600);
 ok((await js('__verilog()')).includes('= a[1];'), '部品: 添字を 1 に変えられる', await js('__verilog()'));
 
+// 幅を付けると範囲になる (部分選択)
+await js('__preset("上下に割って")');
+await sleep(600);
+const sliceV = await js('__verilog()');
+ok(sliceV.includes('= a[3:0];'), '部分選択: 下半分が a[3:0] になる', sliceV);
+ok(sliceV.includes('= a[7:4];'), '部分選択: 上半分が a[7:4] になる', sliceV);
+ok(sliceV.includes('output [7:0] sw'), '部分選択: 束ね直して 8 ビットに戻る', sliceV);
+ok(await js('__nodeText("sw")') === 'sw5A', '部分選択: A5 の上下が入れ替わって 5A', await js('__nodeText("sw")'));
+
+// 添字の箱には範囲が出る
+const slices = await js(`[...document.querySelectorAll('#gNodes text.idx')].map(t=>t.textContent).join(',')`);
+ok(slices === '[3:0],[7:4]', '部分選択: 箱に範囲が出る', slices);
+
+// 「幅」の欄でビット取り出しの幅 (取り出すビット数) を変えられる
+await js(`(() => {
+  const g = [...document.querySelectorAll('#gNodes .node')].find(x => x.querySelector('text.idx')?.textContent === '[3:0]');
+  const r = g.getBoundingClientRect();
+  window.__slicePoint = [r.x + r.width / 2, r.y + 6];
+  return 1;
+})()`);
+await click(await js('__slicePoint'));
+ok(await js('__widthBox()') === '4', '部分選択: 幅の欄に取り出すビット数が出る', String(await js('__widthBox()')));
+await js('__setWidth(2)');
+await sleep(600);
+ok((await js('__verilog()')).includes('= a[1:0];'), '部分選択: 幅を 2 にすると a[1:0]', await js('__verilog()'));
+
 await js('__preset("加算器と比較")');
 await sleep(600);
 const addV = await js('__verilog()');

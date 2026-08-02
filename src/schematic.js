@@ -27,9 +27,10 @@ export const PARTS = {
   dff:   { label: 'メモリ', glyph: 'DFF', ins: 1, outs: 1, reg: true, named: true, sized: true },
 
   // ---- 幅を混ぜる部品 ----
-  // バスから 1 ビット取り出す。何ビット目かは value に入れる (幅ではないので indexed)
+  // バスから一部を取り出す。value = いちばん下のビット番号 (幅ではないので indexed)、
+  // w = 取り出すビット数 (= 出力の幅)。w が 1 なら a[2]、2 以上なら a[3:1] になる
   bit:   { label: 'ビット取り出し', glyph: '[i]', btn: 'ビット', ins: 1, outs: 1,
-    wrule: 'one', indexed: true },
+    indexed: true, sized: true },
   // 2 本を繋げて太いバスにする。上が上位ビット
   cat:   { label: '連接', glyph: '{ }', btn: '連接', ins: 2, outs: 1, wrule: 'sum' },
 
@@ -77,10 +78,20 @@ export const clampValue = (value, w) => {
   return w >= 32 ? v >>> 0 : v % (2 ** w);
 };
 
-/** ビット取り出しの「何ビット目か」。value を幅ではなく添字として読む */
+/** ビット取り出しの「いちばん下のビット番号」。value を幅ではなく添字として読む */
 export const bitIndex = (node) => {
   const v = Number(node.value);
   return Number.isInteger(v) && v >= 0 && v < MAX_WIDTH ? v : 0;
+};
+
+/**
+ * ビット取り出しの添字の書き方。1 ビットなら `[2]`、2 ビット以上なら `[3:1]`。
+ * 幅 (取り出すビット数) は widthOf、下端は bitIndex から来る。
+ */
+export const sliceOf = (node) => {
+  const lo = bitIndex(node);
+  const w = widthOf(node);
+  return w === 1 ? `[${lo}]` : `[${lo + w - 1}:${lo}]`;
 };
 
 /**
@@ -354,7 +365,7 @@ const EXPR = {
   nor:  ([a, b]) => `~(${a} | ${b})`,
   xnor: ([a, b]) => `~(${a} ^ ${b})`,
   // 第 2 引数にノードを取るのは、ビット取り出しだけが添字を必要とするため
-  bit:  ([a], n) => `${a}[${bitIndex(n)}]`,
+  bit:  ([a], n) => `${a}${sliceOf(n)}`,
   cat:  ([hi, lo]) => `{${hi}, ${lo}}`,
   add:  ([a, b]) => `${a} + ${b}`,
   sub:  ([a, b]) => `${a} - ${b}`,
@@ -486,12 +497,12 @@ function inferWidths(nodes, driver) {
     }
   }
 
-  // ビット取り出しの添字が、繋いだバスの幅に収まっているか
+  // 取り出す範囲が、繋いだバスの幅に収まっているか
   for (const n of nodes) {
     if (n.type !== 'bit') continue;
     const from = driver.get(`${n.id}:0`);
     const src = from && width.get(from.node);
-    if (src !== undefined && bitIndex(n) >= src) mismatch.add(n.id);
+    if (src !== undefined && bitIndex(n) + widthOf(n) > src) mismatch.add(n.id);
   }
 
   // dff は自分の幅を持つが、D 入力の幅が違っていたら黙って切り詰めたくない

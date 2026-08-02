@@ -2637,7 +2637,37 @@ async function testSaveFormat() {
     nodes: [[1, 'in', 0, 0, 0, 'a', null, 4], [2, 'bit', 200, 0, 2], [3, 'out', 400, 0, 0, 'y']],
     wires: [[1, 0, 2, 0], [2, 0, 3, 0]],
   }, [[{ a: 4 }, { y: 1 }], [{ a: 11 }, { y: 0 }], [{ a: 15 }, { y: 1 }]]);
-  ok(bitP.source.includes('= a[2];'), 'ビット取り出し: 部分選択になる', bitP.source);
+  ok(bitP.source.includes('= a[2];'), 'ビット取り出し: 1 ビットなら a[2] になる', bitP.source);
+
+  // 幅を付けると範囲になる (w = 取り出すビット数、value = いちばん下)
+  const sliceP = await build('部分選択', {
+    nodes: [[1, 'in', 0, 0, 0, 'a', null, 8], [2, 'bit', 200, 0, 2, null, null, 4],
+      [3, 'out', 400, 0, 0, 'y']],
+    wires: [[1, 0, 2, 0], [2, 0, 3, 0]],
+  }, [[{ a: 0b10110100 }, { y: 0b1101 }], [{ a: 255 }, { y: 15 }], [{ a: 0 }, { y: 0 }]]);
+  ok(sliceP.source.includes('= a[5:2];'), '部分選択: a[5:2] になる', sliceP.source);
+  ok(sliceP.source.includes('output [3:0] y'), '部分選択: 出力は取り出したビット数', sliceP.source);
+
+  // 全 256 通り
+  const sliceSim = await WasmSimulator.create(compile(sliceP.source));
+  let sliceBad = 0;
+  for (let a = 0; a < 256; a++) {
+    sliceSim.setInput('a', a).eval();
+    if (Number(sliceSim.get('y')) !== ((a >> 2) & 15)) sliceBad++;
+  }
+  eqs(sliceBad, 0, '部分選択: 8 ビットからの a[5:2] が全 256 通り正しい');
+
+  // はみ出す範囲は弾く
+  for (const [label, lo, w, srcW] of [
+    ['下端がはみ出す', 4, 1, 4], ['上端がはみ出す', 5, 4, 8], ['幅がはみ出す', 0, 8, 4],
+  ]) {
+    const p = toVerilog(expandCircuit({
+      nodes: [[1, 'in', 0, 0, 0, 'a', null, srcW], [2, 'bit', 200, 0, lo, null, null, w],
+        [3, 'out', 400, 0, 0, 'y']],
+      wires: [[1, 0, 2, 0], [2, 0, 3, 0]],
+    }));
+    ok(p.widthErrors.length > 0, `部分選択: ${label}範囲を弾く`, p.widthErrors.join(','));
+  }
   eq(expandCircuit(packCircuit(expandCircuit({
     nodes: [[1, 'bit', 0, 0, 3]], wires: [],
   }))).nodes[0].value, 3, 'ビット取り出し: 添字が往復して残る');
