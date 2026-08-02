@@ -2537,6 +2537,92 @@ async function testSaveFormat() {
   ok(!/[+/=]/.test(encodeCircuit(expandCircuit(SAMPLE_CIRCUITS['多数決 (3 入力のうち 2 つ以上が 1)']))),
     '保存形式: URL に置ける文字だけを使う');
 
+  // ---- 幅 (バス) ----
+  // 幅を持つのは in / const / dff だけ。ゲートと out は駆動元から伝播する。
+  const bus = expandCircuit({
+    nodes: [[1, 'in', 0, 0, 10, 'a', null, 4], [2, 'in', 0, 100, 3, 'b', null, 4],
+      [3, 'and', 200, 50], [4, 'out', 400, 50, 0, 'y']],
+    wires: [[1, 0, 3, 0], [2, 0, 3, 1], [3, 0, 4, 0]],
+  });
+  eq(bus.nodes[0].w, 4, '幅: 保存形式から幅が読める');
+  eq(bus.nodes[0].value, 10, '幅: 幅ぶんの値が残る');
+  eqs(JSON.stringify(expandCircuit(packCircuit(bus))), JSON.stringify(bus),
+    '幅: 幅つきの回路が往復して一致する');
+  eqs(JSON.stringify(decodeCircuit(encodeCircuit(bus))), JSON.stringify(bus),
+    '幅: リンク経由でも一致する');
+
+  const busPlan = toVerilog(bus);
+  ok(busPlan.source.includes('input  [3:0] a'), '幅: 入力ポートに幅が付く', busPlan.source);
+  ok(busPlan.source.includes('output [3:0] n3'), '幅: ゲートに幅が伝播する', busPlan.source);
+  ok(busPlan.source.includes('output [3:0] y'), '幅: 出力に幅が伝播する', busPlan.source);
+  ok(busPlan.source.includes('assign n3 = a & b;'),
+    '幅: 本体の式は 1 ビットのときと同じ (宣言だけが変わる)', busPlan.source);
+  eqs(busPlan.widthErrors.length, 0, '幅: 揃っていれば幅エラーなし');
+
+  // 幅が合わないゲートは未配線と同じく下流ごと外れる
+  const bad = toVerilog(expandCircuit({
+    nodes: [[1, 'in', 0, 0, 0, 'a', null, 4], [2, 'in', 0, 100, 0, 'b'],
+      [3, 'and', 200, 50], [4, 'out', 400, 50, 0, 'y']],
+    wires: [[1, 0, 3, 0], [2, 0, 3, 1], [3, 0, 4, 0]],
+  }));
+  eqs(bad.widthErrors.join(','), 'n3', '幅: 揃っていないゲートを報告する');
+  ok(bad.incomplete.has(3) && bad.incomplete.has(4),
+    '幅: 揃っていないゲートと下流が除外される', [...bad.incomplete].join(','));
+  ok(!bad.source.includes('assign'), '幅: 除外されたので式が出ない', bad.source);
+
+  // dff は自分で幅を持つ (帰還があると伝播で決まらないため)
+  const toggle = toVerilog(expandCircuit({
+    nodes: [[1, 'dff', 100, 0, 0, 'm', null, 4], [2, 'not', 300, 0], [3, 'out', 500, 0, 0, 'q']],
+    wires: [[1, 0, 2, 0], [2, 0, 1, 0], [1, 0, 3, 0]],
+  }));
+  ok(toggle.source.includes('output reg [3:0] m'), '幅: メモリに幅が付く', toggle.source);
+  ok(toggle.source.includes('output [3:0] n2'), '幅: 帰還の先にも伝播する', toggle.source);
+  eqs(toggle.widthErrors.length, 0, '幅: 帰還だけでも幅が決まる');
+
+  // 多ビット定数はサイズ付きリテラルになる
+  const konst = toVerilog(expandCircuit({
+    nodes: [[1, 'const', 0, 0, 10, null, null, 4], [2, 'out', 200, 0, 0, 'y']],
+    wires: [[1, 0, 2, 0]],
+  }));
+  ok(/assign \w+ = 4'd10;/.test(konst.source), '幅: 多ビット定数は 4\'d10 になる', konst.source);
+
+  // 幅 1 は今までどおり (角括弧も 1'b も変わらない)
+  const one = toVerilog(expandCircuit({
+    nodes: [[1, 'const', 0, 0, 1], [2, 'out', 200, 0, 0, 'y']],
+    wires: [[1, 0, 2, 0]],
+  }));
+  ok(!one.source.includes('['), '幅: 幅 1 なら [0:0] を書かない', one.source);
+  ok(one.source.includes("1'b1"), '幅: 幅 1 の定数は 1\'b1 のまま', one.source);
+
+  // 生成した Verilog を実際に走らせて値を確かめる
+  const busSim = await WasmSimulator.create(compile(busPlan.source));
+  let busBad = 0;
+  for (let a = 0; a < 16; a++) {
+    for (let b = 0; b < 16; b++) {
+      busSim.setInput('a', a).setInput('b', b).eval();
+      if (Number(busSim.get('y')) !== (a & b)) busBad++;
+    }
+  }
+  eqs(busBad, 0, '幅: 4 ビットの AND が全 256 通り正しい');
+
+  // 4 ビットのトグル (メモリ + NOT の帰還)
+  const toggleSim = await WasmSimulator.create(compile(toggle.source));
+  toggleSim.reset();
+  toggleSim.step();
+  eq(toggleSim.get('q'), 15, '幅: 4 ビットのトグルは 1 クロックで F');
+  toggleSim.step();
+  eq(toggleSim.get('q'), 0, '幅: もう 1 クロックで 0 に戻る');
+
+  // 幅を超える値は丸める / 範囲外の幅は 1 に落ちる
+  const clamped = expandCircuit({
+    nodes: [[1, 'in', 0, 0, 999, 'a', null, 4], [2, 'in', 0, 100, 1, 'b', null, 999],
+      [3, 'in', 0, 200, 1, 'c', null, 0]],
+    wires: [],
+  });
+  eq(clamped.nodes[0].value, 999 % 16, '幅: 幅に収まらない値は丸める');
+  eq(clamped.nodes[1].w, 1, '幅: 大きすぎる幅は 1 に落ちる');
+  eq(clamped.nodes[2].w, 1, '幅: 0 以下の幅も 1 に落ちる');
+
   // ---- .json ファイル経由の往復 ----
   // エディタが書き出す形は packCircuit に name を足しただけ。expandCircuit は
   // name を見ないので、リンクと .json が相互に行き来できる。

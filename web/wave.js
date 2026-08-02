@@ -10,10 +10,14 @@ import { el, $ } from './dom.js';
 // 横にずれて読みづらいので、常に確保しておく。
 export const WAVE = { colW: 26, rowH: 24, top: 16, nameW: 116, valW: 24, max: 256 };
 
-/** カーソル位置での値の表示 (0 / 1 / x) */
-const cell = (frame, name) => {
-  const v = frame.v[name];
-  return v === null || v === undefined ? 'x' : String(v);
+/** 幅 1 は 0/1、広いときは 16 進 (画面の部品や表と揃える) */
+const fmt = (v, w) => (w <= 1 ? String(v ? 1 : 0)
+  : Number(v).toString(16).toUpperCase().padStart(Math.ceil(w / 4), '0'));
+
+/** カーソル位置での値の表示 (不明なら x) */
+const cell = (frame, row) => {
+  const v = frame.v[row.name];
+  return v === null || v === undefined ? 'x' : fmt(v, row.width ?? 1);
 };
 
 /**
@@ -50,14 +54,15 @@ export function renderWave(frames, rows, { perClock, ready, cursor = null }) {
 
   rows.forEach((r, i) => {
     const y = WAVE.top + i * WAVE.rowH;
-    el('text', { class: r.kind, x: 8, y: y + WAVE.rowH / 2 }, names).textContent = r.name;
+    el('text', { class: r.kind, x: 8, y: y + WAVE.rowH / 2 }, names).textContent =
+      (r.width ?? 1) > 1 ? `${r.name}[${r.width - 1}:0]` : r.name;
     el('line', { class: 'lane', x1: 0, y1: y, x2: cols * WAVE.colW, y2: y }, svg);
     // カーソル位置の値を名前の右に出す (data-val はテストと動作確認から読むため)
     if (cur !== null) {
       el('text', {
         class: `val ${r.kind}`, x: WAVE.nameW + WAVE.valW - 7, y: y + WAVE.rowH / 2,
-        'data-sig': r.name, 'data-val': cell(frames[cur], r.name),
-      }, names).textContent = cell(frames[cur], r.name);
+        'data-sig': r.name, 'data-val': cell(frames[cur], r),
+      }, names).textContent = cell(frames[cur], r);
     }
   });
 
@@ -78,19 +83,40 @@ export function renderWave(frames, rows, { perClock, ready, cursor = null }) {
     }
   }
 
-  // 各信号の階段波形。値が不明な区間は破線で中央に引く
+  // 幅 1 は階段波形、幅 2 以上は列ごとに値の箱を並べる (階段では表せないため)。
+  // data-bits / data-vals は目で見る用ではなく、テストと動作確認から値を読むためのもの。
   rows.forEach((r, i) => {
     const y = WAVE.top + i * WAVE.rowH;
-    const hi = y + 5, lo = y + WAVE.rowH - 7, mid = (hi + lo) / 2;
+    const w = r.width ?? 1;
     const at = (c) => frames[c].v[r.name];
-    const level = (c) => (at(c) === null || at(c) === undefined ? mid : at(c) ? hi : lo);
     const unknown = frames.some((f) => f.v[r.name] === null || f.v[r.name] === undefined);
 
+    if (w > 1) {
+      const top = y + 4, boxH = WAVE.rowH - 10;
+      for (let c = 0; c < cols; c++) {
+        const v = at(c);
+        const g = el('g', { class: `busg ${v === null || v === undefined ? 'unknown' : ''}` }, svg);
+        el('rect', {
+          class: 'bus', x: c * WAVE.colW + 1, y: top, width: WAVE.colW - 2, height: boxH, rx: 3,
+        }, g);
+        el('text', {
+          class: 'busval', x: c * WAVE.colW + WAVE.colW / 2, y: top + boxH / 2,
+        }, g).textContent = v === null || v === undefined ? 'x' : fmt(v, w);
+      }
+      el('path', {
+        class: 'sig bus-marker', d: `M 0 ${y + WAVE.rowH / 2}`,
+        'data-sig': r.name,
+        'data-vals': frames.map((f) => (f.v[r.name] ?? null) === null ? 'x' : fmt(f.v[r.name], w)).join(','),
+      }, svg);
+      return;
+    }
+
+    const hi = y + 5, lo = y + WAVE.rowH - 7, mid = (hi + lo) / 2;
+    const level = (c) => (at(c) === null || at(c) === undefined ? mid : at(c) ? hi : lo);
     let d = `M 0 ${level(0)}`;
     for (let c = 0; c < cols; c++) {
       d += ` L ${c * WAVE.colW} ${level(c)} L ${(c + 1) * WAVE.colW} ${level(c)}`;
     }
-    // data-bits は目で見る用ではなく、テストと動作確認から値を読むためのもの
     el('path', {
       class: `sig ${unknown ? 'unknown' : ''}`, d,
       'data-sig': r.name,

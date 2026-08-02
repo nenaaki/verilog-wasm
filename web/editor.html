@@ -114,6 +114,13 @@
   #waveSvg .edge { stroke: #232833; stroke-width: 1; }
   #waveSvg path.sig { fill: none; stroke: var(--green); stroke-width: 1.8; stroke-linejoin: round; }
   #waveSvg path.sig.unknown { stroke: #4b5262; stroke-dasharray: 3 3; }
+  /* 幅 2 以上は階段では表せないので、列ごとに値の箱を出す */
+  #waveSvg rect.bus { fill: #16281f; stroke: var(--green); stroke-width: 1; }
+  #waveSvg text.busval { font-family: var(--mono); font-size: 8.5px; fill: #b8e6cd;
+    text-anchor: middle; dominant-baseline: central; }
+  #waveSvg .busg.unknown rect.bus { fill: #1a1d24; stroke: #4b5262; stroke-dasharray: 2 2; }
+  #waveSvg .busg.unknown text.busval { fill: #6b7382; }
+  #waveSvg path.bus-marker { stroke: none; }
   #waveSvg .note { font-family: var(--mono); font-size: 11px; fill: var(--dim); }
 
   #msg { padding: 8px 12px; border-top: 1px solid var(--line); font-family: var(--mono);
@@ -130,6 +137,9 @@
   .node text.name { font-size: 11px; fill: var(--dim); }
   .node text.val { font-size: 11px; fill: var(--dim); }
   .node text.val.on { fill: #0c1a12; font-weight: 700; }
+  /* 多ビットは 16 進なので桁が増える。等幅で少し小さく出す */
+  .node text.val.wide { font-family: var(--mono); font-size: 9.5px; }
+  .node text.konst.wide { font-family: var(--mono); font-size: 12px; }
   .node.reg rect.body { fill: #1f2836; stroke: #3d5f8f; }
   .node.reg text.name { fill: var(--blue); }
   .node.konst rect.body { fill: #2a2519; stroke: #6b5a2a; }
@@ -189,6 +199,9 @@
   <button id="pasteBtn" title="貼り付け (Ctrl+V)">貼り付け</button>
   <button id="del">削除 (Del)</button>
   <button id="renameBtn">名前 (F2)</button>
+  <span class="label">幅</span>
+  <input type="number" id="bitWidth" value="1" min="1" max="32"
+    title="選んだ 入力 / 定数 / メモリ のビット幅。ゲートと出力は繋いだ先から決まる">
   <button id="openBlock" title="選んだ回路部品の中身を開いて編集する (ダブルクリックでも開く)">部品の中へ</button>
   <button id="clear">全部消す</button>
   <button id="fit">表示リセット</button>
@@ -269,8 +282,8 @@
 import { compile, CompileError } from '../src/compile.js';
 import { WasmSimulator } from '../src/sim.js';
 import {
-  CLOCK, PARTS, blockPorts, checkName, decodeCircuit, encodeCircuit,
-  expandCircuit, insOf, outsOf, packCircuit, toVerilog,
+  CLOCK, MAX_WIDTH, PARTS, blockPorts, checkName, clampValue, decodeCircuit,
+  encodeCircuit, expandCircuit, insOf, outsOf, packCircuit, toVerilog, widthOf,
 } from '../src/schematic.js';
 import { SAMPLE_CIRCUITS } from '../src/samples.js';
 import { el, hel, $ } from './dom.js';
@@ -481,6 +494,14 @@ function updateEditUI() {
 
   const one = selection.size === 1 ? byId([...selection][0]) : null;
   $('openBlock').disabled = one?.type !== 'block';
+
+  // 幅の欄は、幅を持てる部品を選んでいるときだけ触れる
+  const sized = sizedSelection();
+  $('bitWidth').disabled = sized.length === 0;
+  if (sized.length > 0) {
+    const ws = new Set(sized.map((n) => widthOf(n)));
+    $('bitWidth').value = ws.size === 1 ? [...ws][0] : '';
+  }
 
   // 部品の中にいるあいだは「回路そのもの」を相手にする操作を止める。
   // 中身に別の部品を置くのは階層として筋が通るので、そちらは触らない。
@@ -765,11 +786,14 @@ async function rebuild() {
     $('stats').textContent = `nets=${st.nets} gates=${st.gates} regs=${st.regs} `
       + `state=${st.stateBytes}B wasm=${st.wasmBytes}B`;
     const dead = deadCount();
+    // 幅の合わない所は未配線と同じく除外されるので、理由を分けて伝える
+    const wErr = plan.widthErrors ?? [];
     setMsg(`コンパイル成功 — ${st.gates} ゲート`
       + (st.regs ? ` / ${st.regs} ビットのメモリ` : '')
       + `を ${st.wasmBytes} バイトの WASM に変換`
+      + (wErr.length ? ` / 幅が合わない部品 (${wErr.join(', ')}) は回路から除外しました` : '')
       + (dead ? ` / 未配線の部品が ${dead} 個あるので回路から除外しました` : ''),
-      dead ? 'warn' : 'ok');
+      dead || wErr.length ? 'warn' : 'ok');
   } catch (e) {
     if (my !== seq) return;
     sim = compiled = null;
@@ -814,7 +838,7 @@ function refreshValues() {
   values = new Map();
   pinVals = new Map();
   if (sim) {
-    for (const i of plan.inputs) sim.setInput(i.name, byId(i.node).value ? 1 : 0);
+    for (const i of plan.inputs) sim.setInput(i.name, byId(i.node).value ?? 0);
     sim.eval();
     const known = new Set(compiled.layout.signalTable.map((s) => s.name));
     const read = (id) => {
@@ -834,8 +858,8 @@ function refreshValues() {
       }
     }
   } else {
-    // コンパイルできていない間も入力の 0/1 だけは見せる
-    for (const n of graph.nodes) values.set(n.id, n.type === 'in' ? (n.value ? 1 : 0) : null);
+    // コンパイルできていない間も入力の値だけは見せる
+    for (const n of graph.nodes) values.set(n.id, n.type === 'in' ? (n.value ?? 0) : null);
   }
 }
 
@@ -874,6 +898,25 @@ function setMsg(text, cls) {
   $('msg').textContent = text;
   $('msg').className = cls;
 }
+
+// ---------------------------------------------------------- 幅と値の見せ方
+//
+// 幅を自分で持つのは 入力 / 定数 / メモリ だけ。ゲートと出力は駆動元から
+// 伝播した幅 (plan.widthOf) を使う — 表示のためだけなので、コンパイルできて
+// いないときは宣言値に落とす。
+
+/** 画面に出すときの幅 */
+const dispWidth = (n) => plan?.widthOf?.get(n.id) ?? widthOf(n);
+
+/** 幅 1 は 0/1、広いときは 16 進 (桁数は幅から決める) */
+function fmtValue(v, w) {
+  if (v === null || v === undefined) return '';
+  if (w <= 1) return String(v ? 1 : 0);
+  return Number(v).toString(16).toUpperCase().padStart(Math.ceil(w / 4), '0');
+}
+
+/** 選んでいる部品のうち幅を持てるもの */
+const sizedSelection = () => [...selection].map(byId).filter((n) => n && spec(n).sized);
 
 // ---------------------------------------------------------------- 描画
 function render() {
@@ -915,25 +958,31 @@ function render() {
     const size = sizeOf(n);
     el('rect', { class: 'body', x: 0, y: 0, width: size.w, height: size.h, rx: 7 }, g);
 
+    // 幅 1 は 0/1、広いときは 16 進。ランプは「0 でないか」で点ける
+    const wOf = dispWidth(n);
+    const label = (x) => (x === null || x === undefined ? '' : fmtValue(x, wOf));
+    const lit = (x) => (x !== null && x !== undefined && x !== 0 ? 'one' : '');
+
     if (n.type === 'in') {
       el('text', { x: 22, y: H / 2 }, g).textContent = plan?.signalOf.get(n.id) ?? '?';
-      el('circle', { class: `lamp ${n.value ? 'one' : ''}`, cx: W - 20, cy: H / 2, r: 11 }, g);
-      el('text', { class: `val ${n.value ? 'on' : ''}`, x: W - 20, y: H / 2 }, g)
-        .textContent = n.value ? '1' : '0';
+      el('circle', { class: `lamp ${lit(n.value)}`, cx: W - 20, cy: H / 2, r: 11 }, g);
+      el('text', { class: `val ${lit(n.value) ? 'on' : ''} ${wOf > 1 ? 'wide' : ''}`, x: W - 20, y: H / 2 }, g)
+        .textContent = label(n.value);
     } else if (n.type === 'const') {
       // 定数はポートではないので名前は出さず、値だけを大きく出す
-      el('text', { class: 'konst', x: W / 2, y: H / 2 }, g).textContent = n.value ? '1' : '0';
+      el('text', { class: `konst ${wOf > 1 ? 'wide' : ''}`, x: W / 2, y: H / 2 }, g)
+        .textContent = label(n.value);
     } else if (n.type === 'out') {
       el('text', { class: 'name', x: 22, y: H / 2 }, g).textContent = plan?.signalOf.get(n.id) ?? 'y';
-      el('circle', { class: `lamp ${v === 1 ? 'one' : ''}`, cx: W - 20, cy: H / 2, r: 11 }, g);
-      el('text', { class: `val ${v === 1 ? 'on' : ''}`, x: W - 20, y: H / 2 }, g)
-        .textContent = v === null ? '' : v;
+      el('circle', { class: `lamp ${lit(v)}`, cx: W - 20, cy: H / 2, r: 11 }, g);
+      el('text', { class: `val ${lit(v) ? 'on' : ''} ${wOf > 1 ? 'wide' : ''}`, x: W - 20, y: H / 2 }, g)
+        .textContent = label(v);
     } else if (n.type === 'dff') {
       // メモリは中身が見えないと意味がないので、Q の値をランプで出す
       el('text', { class: 'name', x: 20, y: H / 2 }, g).textContent = n.name || 'DFF';
-      el('circle', { class: `lamp ${v === 1 ? 'one' : ''}`, cx: W - 18, cy: H / 2, r: 10 }, g);
-      el('text', { class: `val ${v === 1 ? 'on' : ''}`, x: W - 18, y: H / 2 }, g)
-        .textContent = v === null ? '' : v;
+      el('circle', { class: `lamp ${lit(v)}`, cx: W - 18, cy: H / 2, r: 10 }, g);
+      el('text', { class: `val ${lit(v) ? 'on' : ''} ${wOf > 1 ? 'wide' : ''}`, x: W - 18, y: H / 2 }, g)
+        .textContent = label(v);
     } else if (n.type === 'block') {
       // 中身は見せず、名前と端子の名札だけ出す
       el('text', { class: 'blkname', x: size.w / 2, y: 15 }, g).textContent = n.ref ?? '回路部品';
@@ -1047,12 +1096,16 @@ function waveRows() {
     ...plan.regs,
     // 回路部品の出力端子。中身は見えないので、端子の値は既定で出す
     ...[...plan.outletOf.values()]
-      .map((flat) => ({ node: flat, name: plan.signalOf.get(flat), kind: 'block' }))
+      .map((flat) => ({
+        node: flat, name: plan.signalOf.get(flat), kind: 'block',
+        width: plan.widthOf?.get(flat) ?? 1,
+      }))
       .filter((r) => r.name),
     ...plan.outputs.filter((o) => o.kind === 'out'),
   ];
   if ($('waveGates').checked) rows.push(...plan.outputs.filter((o) => o.kind === 'gate'));
-  return rows;
+  // width は plan.inputs / outputs には入っているが、念のため落とさないよう埋める
+  return rows.map((r) => ({ ...r, width: r.width ?? plan.widthOf?.get(r.node) ?? 1 }));
 }
 
 // 波形のカーソル。列番号 (frames の添字) か null。
@@ -1129,6 +1182,59 @@ function startRename(id) {
   };
   inp.addEventListener('keydown', (e) => {
     e.stopPropagation();                                 // Space / Del を回路側に流さない
+    if (e.key === 'Enter') commit();
+    if (e.key === 'Escape') close();
+  });
+  inp.addEventListener('blur', commit);
+}
+
+/**
+ * 幅 2 以上の 入力 / 定数 の値を打ち込む。名前の入力と同じ仕組みの箱を部品に重ねる。
+ * 16 進で受け、`0x` も 10 進も通す。幅に収まらない値は丸める。
+ */
+function startValueEdit(id) {
+  const n = byId(id);
+  if (!n || (n.type !== 'in' && n.type !== 'const')) return;
+  const w = widthOf(n);
+  document.getElementById('renameBox')?.remove();
+
+  const g = $('gNodes').querySelector(`[data-id="${id}"]`);
+  const r = g.getBoundingClientRect();
+  const wrap = $('canvasWrap').getBoundingClientRect();
+  const inp = document.createElement('input');
+  inp.id = 'renameBox';                     // CSS と後片付けを名前の箱と共用する
+  inp.type = 'text';
+  inp.spellcheck = false;
+  inp.value = fmtValue(n.value ?? 0, w);
+  inp.title = `${w} ビットの値を 16 進で入れる (0x を付けても可)`;
+  Object.assign(inp.style, {
+    left: `${r.x - wrap.x}px`, top: `${r.y - wrap.y}px`,
+    width: `${Math.max(r.width, 84)}px`, height: `${r.height}px`,
+  });
+  $('canvasWrap').appendChild(inp);
+  inp.focus();
+  inp.select();
+
+  let done = false;
+  const close = () => { done = true; inp.remove(); };
+  const commit = () => {
+    if (done) return;
+    const text = inp.value.trim();
+    close();
+    if (text === '') return;
+    // 表示が 16 進なので入力も 16 進で読む (0x は付けても付けなくてもよい)
+    const m = /^(?:0[xX])?([0-9a-fA-F]+)$/.exec(text);
+    if (!m) { setMsg(`16 進の値として読めません: ${text}`, 'err'); return; }
+    const parsed = Number.parseInt(m[1], 16);
+    const v = clampValue(parsed, w);
+    if (v === (n.value ?? 0)) return;
+    if (n.type === 'const') pushUndo();
+    n.value = v;
+    n.type === 'in' ? inputChanged() : rebuild();
+    if (v !== parsed) setMsg(`${w} ビットに収めて ${fmtValue(v, w)} にしました`, 'warn');
+  };
+  inp.addEventListener('keydown', (e) => {
+    e.stopPropagation();
     if (e.key === 'Enter') commit();
     if (e.key === 'Escape') close();
   });
@@ -1230,11 +1336,17 @@ svg.addEventListener('pointerup', (e) => {
       pushUndo(drag.snap);                         // 動かす前の状態を積む
       autoSave();
     }
-    // 動かさずに離した = クリック → 入力なら 0/1 反転
+    // 動かさずに離した = クリック → 入力と定数の値を変える。
+    // 1 ビットならその場で反転、広いときは値を打ち込む箱を出す (16 進で何度も
+    // クリックさせるのは現実的でないため)
     if (!drag.moved && (n?.type === 'in' || n?.type === 'const')) {
-      if (n.type === 'const') pushUndo();
-      n.value = n.value ? 0 : 1;
-      n.type === 'in' ? inputChanged() : rebuild();   // 定数はリテラルなので作り直す
+      if (widthOf(n) > 1) {
+        startValueEdit(n.id);
+      } else {
+        if (n.type === 'const') pushUndo();
+        n.value = n.value ? 0 : 1;
+        n.type === 'in' ? inputChanged() : rebuild();   // 定数はリテラルなので作り直す
+      }
     }
   }
   svg.releasePointerCapture?.(e.pointerId);
@@ -1464,6 +1576,20 @@ $('pasteBtn').onclick = paste;
 $('fit').onclick = resetView;
 $('placeBlock').onclick = () => placeBlock($('blockPick').value);
 $('syncBlocks').onclick = syncBlocks;
+$('bitWidth').onchange = () => {
+  const sized = sizedSelection();
+  if (sized.length === 0) return;
+  const w = Math.max(1, Math.min(MAX_WIDTH, Math.round(Number($('bitWidth').value) || 1)));
+  if (sized.every((n) => widthOf(n) === w)) return;
+  pushUndo();
+  for (const n of sized) {
+    n.w = w;
+    n.value = clampValue(n.value ?? 0, w);   // 幅を狭めたら値も収める
+  }
+  rebuild();
+  setMsg(`${sized.length} 個の部品を ${w} ビットにしました`, 'ok');
+};
+
 $('openBlock').onclick = () => enterBlock();
 $('blockDone').onclick = () => leaveBlock(true);
 $('blockCancel').onclick = () => leaveBlock(false);

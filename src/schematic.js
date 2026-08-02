@@ -12,10 +12,10 @@
 
 /** 部品の仕様。GUI の描画とネットリスト生成の両方がここを見る */
 export const PARTS = {
-  in:    { label: '入力',   glyph: 'IN',    btn: '入力', ins: 0, outs: 1, named: true },
+  in:    { label: '入力',   glyph: 'IN',    btn: '入力', ins: 0, outs: 1, named: true, sized: true },
   out:   { label: '出力',   glyph: 'OUT',   btn: '出力', ins: 1, outs: 0, named: true },
-  // 0 か 1 に固定された値。ポートではなくリテラル (1'b0 / 1'b1) になる
-  const: { label: '定数',   glyph: 'CONST', btn: '定数', ins: 0, outs: 1, konst: true },
+  // 固定された値。ポートではなくリテラル (1'b0 / 4'd10 など) になる
+  const: { label: '定数',   glyph: 'CONST', btn: '定数', ins: 0, outs: 1, konst: true, sized: true },
   not:   { label: 'NOT',    glyph: 'NOT',  ins: 1, outs: 1 },
   and:   { label: 'AND',    glyph: 'AND',  ins: 2, outs: 1 },
   or:    { label: 'OR',     glyph: 'OR',   ins: 2, outs: 1 },
@@ -23,8 +23,8 @@ export const PARTS = {
   nand:  { label: 'NAND',   glyph: 'NAND', ins: 2, outs: 1 },
   nor:   { label: 'NOR',    glyph: 'NOR',  ins: 2, outs: 1 },
   xnor:  { label: 'XNOR',   glyph: 'XNOR', ins: 2, outs: 1 },
-  // 1 ビットのメモリ (D フリップフロップ)。クロックは 1 本を全体で共有するので端子には出さない
-  dff:   { label: '1 ビットメモリ', glyph: 'DFF', ins: 1, outs: 1, reg: true, named: true },
+  // メモリ (D フリップフロップ)。クロックは 1 本を全体で共有するので端子には出さない
+  dff:   { label: 'メモリ', glyph: 'DFF', ins: 1, outs: 1, reg: true, named: true, sized: true },
   // 保存した回路をまるごと 1 個の部品にしたもの。端子の数は中身で決まる (insOf / outsOf)
   block: { label: '回路部品', glyph: 'BLOCK', ins: 0, outs: 0, block: true },
   // 平坦化のときだけ作る内部部品。ブロックの端子と中身をつなぐ中継で assign x = y; になる
@@ -41,6 +41,26 @@ export const outsOf = (node) =>
 
 /** メモリを 1 個でも使うときに生える暗黙のクロック入力 */
 export const CLOCK = 'clk';
+
+/** 幅を持てる部品の上限。値の表示が長くなりすぎないところで切る */
+export const MAX_WIDTH = 32;
+
+/**
+ * その部品の出力の幅。幅を自分で決められるのは in / const / dff だけで、
+ * ゲートと out は駆動元から伝播させる (inferWidths)。
+ */
+export const widthOf = (node) => {
+  if (!PARTS[node.type]?.sized) return 1;
+  const w = Number(node.w);
+  return Number.isInteger(w) && w >= 1 && w <= MAX_WIDTH ? w : 1;
+};
+
+/** 幅 w に収まるように値を丸める */
+export const clampValue = (value, w) => {
+  const v = Number(value);
+  if (!Number.isInteger(v) || v < 0) return 0;
+  return w >= 32 ? v >>> 0 : v % (2 ** w);
+};
 
 // 保存形式の上限。サンプルの組み立てより先に評価される必要がある
 const MAX_NODES = 500;
@@ -85,17 +105,20 @@ export function checkName(name, taken = new Set()) {
 
 
 /** 編集中のグラフを圧縮形式にする */
+// 1 行の並びは [id, 種類, x, y, 値, 端子名, 中身(部品だけ), 幅]。
+// 末尾の空きは落として短くするので、古い保存 (幅なし) はそのまま読める = 幅 1。
 export function packCircuit(graph) {
   return {
     nodes: graph.nodes.map((n) => {
-      const row = [n.id, n.type, Math.round(n.x), Math.round(n.y)];
-      if (n.type === 'block') {
-        row.push(n.value ? 1 : 0, n.name ?? null, { ref: n.ref ?? null, def: n.def });
-      } else {
-        if (n.value || n.name) row.push(n.value ? 1 : 0);
-        if (n.name) row.push(n.name);
-      }
-      return row;
+      const w = widthOf(n);
+      const tail = [
+        n.type === 'block' ? (n.value ? 1 : 0) : clampValue(n.value ?? 0, w),
+        n.name ?? null,
+        n.type === 'block' ? { ref: n.ref ?? null, def: n.def } : null,
+        w > 1 ? w : null,
+      ];
+      while (tail.length && !tail[tail.length - 1]) tail.pop();
+      return [n.id, n.type, Math.round(n.x), Math.round(n.y), ...tail];
     }),
     wires: graph.wires.map((w) => [w.from.node, w.from.port, w.to.node, w.to.port]),
   };
@@ -133,16 +156,19 @@ export function expandCircuit(c, depth = 0) {
   const ids = new Set();
   for (const row of c.nodes) {
     if (!Array.isArray(row)) throw new Error('部品データの形が違います');
-    const [id, type, x, y, value, name, extra] = row;
+    const [id, type, x, y, value, name, extra, w] = row;
     if (!Number.isInteger(id) || id <= 0) throw new Error(`部品の id が不正です: ${id}`);
     if (ids.has(id)) throw new Error(`部品の id が重複しています: ${id}`);
     if (!PARTS[type]) throw new Error(`知らない部品です: ${type}`);
     if (PARTS[type].internal) throw new Error(`${type} は内部用の部品なので置けません`);
     ids.add(id);
     const node = {
-      id, type, x: coord(x), y: coord(y), value: value ? 1 : 0,
+      id, type, x: coord(x), y: coord(y),
       ...(typeof name === 'string' && name.length > 0 && name.length <= MAX_NAME ? { name } : {}),
     };
+    // 幅は先に決める (値の丸めに使う)。未指定・範囲外は 1 に落ちる
+    if (PARTS[type].sized) node.w = widthOf({ type, w });
+    node.value = type === 'block' ? (value ? 1 : 0) : clampValue(value ?? 0, widthOf(node));
     if (type === 'block') {
       if (!extra || typeof extra !== 'object') throw new Error('回路部品に中身がありません');
       node.def = extra.def;
@@ -361,6 +387,57 @@ function assignNames(nodes) {
  * @returns {{source: string|null, signalOf: Map<number,string>, inputs: Array,
  *            outputs: Array, regs: Array, incomplete: Set<number>}}
  */
+/**
+ * 各ノードの出力の幅を決める。
+ *
+ * 幅を自分で持つのは in / const / dff だけで、ゲートと out・中継は駆動元から
+ * 伝播させる。dff が自分で持つのが要点で、そうしないと「dff → NOT → dff」の
+ * ような帰還で幅を決める手がかりが無くなる (循環して決まらない)。
+ *
+ * ゲートは入力の幅が揃っていないと意味が決まらないので、揃っていないノードを
+ * mismatch として返す。呼び出し側は未配線と同じ扱い (下流ごと除外) にする。
+ *
+ * @returns {{widthOf: Map<number, number>, mismatch: Set<number>}}
+ */
+function inferWidths(nodes, driver) {
+  const width = new Map();
+  const mismatch = new Set();
+
+  for (const n of nodes) {
+    if (PARTS[n.type].sized) width.set(n.id, widthOf(n));
+  }
+
+  // 伝播はループ (dff の帰還) を含みうるので、変化が止まるまで回す
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const n of nodes) {
+      if (PARTS[n.type].sized) continue;          // 自分で持っている
+      const ins = [];
+      for (let p = 0; p < insOf(n); p++) {
+        const from = driver.get(`${n.id}:${p}`);
+        if (from) ins.push(width.get(from.node));
+      }
+      const known = ins.filter((w) => w !== undefined);
+      if (known.length === 0) continue;
+      if (known.some((w) => w !== known[0])) {
+        if (!mismatch.has(n.id)) { mismatch.add(n.id); changed = true; }
+        continue;
+      }
+      if (width.get(n.id) !== known[0]) { width.set(n.id, known[0]); changed = true; }
+    }
+  }
+
+  // dff は自分の幅を持つが、D 入力の幅が違っていたら黙って切り詰めたくない
+  for (const n of nodes) {
+    if (!PARTS[n.type].reg) continue;
+    const from = driver.get(`${n.id}:0`);
+    const w = from && width.get(from.node);
+    if (w !== undefined && w !== width.get(n.id)) mismatch.add(n.id);
+  }
+
+  return { widthOf: width, mismatch };
+}
+
 export function toVerilog(graph, opts = {}) {
   const top = opts.top ?? 'sketch';
   // 回路部品があれば先に中身を取り込んで平坦にする。以降はブロックを知らなくて済む
@@ -377,8 +454,11 @@ export function toVerilog(graph, opts = {}) {
     driver.set(`${w.to.node}:${w.to.port}`, w.from);
   }
 
+  // 幅を決める。揃っていない所は未配線と同じ扱いにして下流ごと外す
+  const { widthOf: widths, mismatch } = inferWidths(nodes, driver);
+
   // 未配線の入力端子を持つノードを起点に、下流へ「未完成」を伝播させる
-  const incomplete = new Set();
+  const incomplete = new Set(mismatch);
   for (const n of nodes) {
     for (let p = 0; p < insOf(n); p++) {
       if (!driver.has(`${n.id}:${p}`)) { incomplete.add(n.id); break; }
@@ -417,16 +497,31 @@ export function toVerilog(graph, opts = {}) {
     }
   }
 
+  // 幅は plan に載せる。エディタ側が値の表示・波形・表で使う
+  for (const r of [...inputs, ...outputs]) r.width = widths.get(r.node) ?? 1;
+
   const regs = outputs.filter((o) => o.kind === 'reg');
-  if (inputs.length === 0 && outputs.length === 0) {
-    return { source: null, signalOf, inputs, outputs, regs, incomplete, outletOf };
-  }
+  const widthErrors = [...mismatch]
+    .map((id) => signalOf.get(id))
+    .filter(Boolean)
+    .sort();
+  const plan = {
+    signalOf, inputs, outputs, regs, incomplete, outletOf,
+    widthOf: widths, widthErrors,
+  };
+  if (inputs.length === 0 && outputs.length === 0) return { source: null, ...plan };
+
+  // 幅 1 のときは [0:0] を書かない (生成される Verilog を読みやすく保つ)
+  const range = (n) => {
+    const w = widths.get(n) ?? 1;
+    return w > 1 ? `[${w - 1}:0] ` : '';
+  };
 
   // メモリを 1 個でも使うなら暗黙のクロックが生える。エッジは step() が打つので端子には出さない
   const ports = [
     ...(regs.length ? [`  input  ${CLOCK}`] : []),
-    ...inputs.map((i) => `  input  ${i.name}`),
-    ...outputs.map((o) => `  output ${o.kind === 'reg' ? 'reg ' : ''}${o.name}`),
+    ...inputs.map((i) => `  input  ${range(i.node)}${i.name}`),
+    ...outputs.map((o) => `  output ${o.kind === 'reg' ? 'reg ' : ''}${range(o.node)}${o.name}`),
   ];
 
   const argsOf = (n) => {
@@ -442,7 +537,10 @@ export function toVerilog(graph, opts = {}) {
     if (o.kind === 'reg') continue;
     const n = byId.get(o.node);
     if (o.kind === 'const') {
-      body.push(`  assign ${o.name} = 1'b${n.value ? 1 : 0};`);
+      const w = widths.get(n.id) ?? 1;
+      // 幅 1 は従来どおり 1'b0 / 1'b1。広いときは 10 進で書く
+      const lit = w === 1 ? `1'b${n.value ? 1 : 0}` : `${w}'d${clampValue(n.value, w)}`;
+      body.push(`  assign ${o.name} = ${lit};`);
       continue;
     }
     const args = argsOf(n);
@@ -455,5 +553,5 @@ export function toVerilog(graph, opts = {}) {
 
   const decl = `module ${top}(\n${ports.join(',\n')}\n);\n`;
   const source = `${decl}${body.map((l) => `${l}\n`).join('')}endmodule\n`;
-  return { source, signalOf, inputs, outputs, regs, incomplete, outletOf };
+  return { source, ...plan };
 }

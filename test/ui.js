@@ -221,6 +221,24 @@ const HELPERS = `
   window.__memText = () => [...document.querySelectorAll('#gNodes .node.reg')]
     .map((g) => g.textContent.trim())[0] ?? null;
   window.__nodeText = (prefix) => __nodeAt(prefix)?.textContent.trim() ?? null;
+  // 幅 (バス)
+  window.__widthBox = () => {
+    const w = document.getElementById('bitWidth');
+    return w.disabled ? null : w.value;
+  };
+  window.__setWidth = async (v) => {
+    const w = document.getElementById('bitWidth');
+    w.value = String(v);
+    await w.onchange();
+  };
+  window.__valueBoxOpen = () => !!document.getElementById('renameBox');
+  window.__typeValue = (text) => {
+    const b = document.getElementById('renameBox');
+    b.value = text;
+    b.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  };
+  window.__busVals = () => [...document.querySelectorAll('#waveSvg path[data-vals]')]
+    .map((p) => p.dataset.sig + '=' + p.dataset.vals).join(' ');
   window.__nodeCount = () => document.querySelectorAll('#gNodes .node').length;
   window.__wireCount = () => document.querySelectorAll('#gWires .wgroup').length;
   window.__selCount = () => document.querySelectorAll('#gNodes .node.sel').length;
@@ -1037,6 +1055,59 @@ ok(await js('__pinLabels()') === 'a,b,sum,carry', '部品を更新: 端子は残
 await ctrlKey('z');
 await sleep(400);
 ok(await js('__verilog()') === blockVerilog, '部品を更新: Undo で戻せる', await js('__verilog()'));
+
+// ==================================================== 幅 (バス)
+await js('__preset("AND")');
+await sleep(500);
+ok(await js('__widthBox()') === null, '幅: 何も選んでいなければ欄は無効');
+ok(!(await js('__verilog()')).includes('['), '幅: 既定は 1 ビット', await js('__verilog()'));
+
+await click(await js('__nodeCenter("a")'));
+ok(await js('__widthBox()') === '1', '幅: 入力を選ぶと欄が 1 になる', String(await js('__widthBox()')));
+await js('__setWidth(4)');
+await sleep(500);
+ok((await js('__verilog()')).includes('input  [3:0] a'), '幅: 入力に幅が付く', await js('__verilog()'));
+ok((await js('__msg()')).includes('幅が合わない'), '幅: 揃っていないと理由が出る', await js('__msg()'));
+
+await click(await js('__nodeCenter("b")'));
+await js('__setWidth(4)');
+await sleep(500);
+const busV = await js('__verilog()');
+ok(busV.includes('input  [3:0] b'), '幅: もう一方にも付く', busV);
+ok(busV.includes('output [3:0] n3'), '幅: ゲートに伝播する', busV);
+ok(busV.includes('output [3:0] y0'), '幅: 出力に伝播する', busV);
+ok(busV.includes('assign n3 = a & b;'), '幅: 式は 1 ビットのときと同じ', busV);
+ok((await js('__msg()')).includes('コンパイル成功') && !(await js('__msg()')).includes('幅が合わない'),
+  '幅: 揃えば警告が消える', await js('__msg()'));
+
+// 多ビットの入力はクリックで値の箱が出る (1 ビットのときは反転だった)
+await click(await js('__nodeCenter("a")'));
+ok(await js('__valueBoxOpen()'), '幅: 多ビット入力をクリックすると値の箱が出る');
+await js('__typeValue("A")');
+await sleep(500);
+ok(!(await js('__valueBoxOpen()')), '幅: Enter で箱が閉じる');
+ok(await js('__nodeText("a")') === 'aA', '幅: 16 進で値が入る', await js('__nodeText("a")'));
+
+await click(await js('__nodeCenter("b")'));
+await js('__typeValue("C")');
+await sleep(500);
+ok(await js('__nodeText("b")') === 'bC', '幅: もう一方にも入る', await js('__nodeText("b")'));
+ok(await js('__nodeText("y0")') === 'y08', '幅: A & C = 8 が出力に出る', await js('__nodeText("y0")'));
+
+ok((await js('document.getElementById("truth").textContent')).includes('8 ビット'),
+  '幅: 8 ビットは真理値表に収まらない旨を出す',
+  await js('document.getElementById("truth").textContent'));
+
+ok((await js('__busVals()')).includes('a=') && (await js('__busVals()')).includes('A'),
+  '幅: 波形が多ビット行を値で描く', await js('__busVals()'));
+ok(await js('__wave("a")') === null, '幅: 多ビット行は階段波形にならない');
+
+// 幅を戻すと値も丸まる
+await click(await js('__nodeCenter("a")'));
+await js('__setWidth(1)');
+await sleep(500);
+ok((await js('__verilog()')).includes('input  a'), '幅: 1 に戻せる', await js('__verilog()'));
+ok(await js('__nodeText("a")') === 'a0', '幅: 戻すと値が丸まる', await js('__nodeText("a")'));
 
 // ------------------------------------------------------------------ 結果
 console.log(`${passed} 件成功, ${failures.length} 件失敗`);

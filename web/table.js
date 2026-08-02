@@ -31,18 +31,26 @@ export function renderTable(plan, sim, inputValue) {
     note(t, sim ? '出力部品かメモリを置くと表が出ます' : '');
     return;
   }
-  const dims = [...plan.inputs, ...regs];      // 表の行を決める 1 ビットの軸
-  if (dims.length > MAX_TABLE_BITS) {
-    note(t, `入力とメモリで ${dims.length} ビット `
+  // 表の軸。1 軸が 1 ビットとは限らないので、幅ぶんのビット位置を割り振る
+  const dims = [...plan.inputs, ...regs].map((d) => ({ ...d, w: d.width ?? 1 }));
+  let off = 0;
+  for (const d of dims) {
+    d.off = off;
+    d.mask = (1 << d.w) - 1;
+    off += d.w;
+  }
+  const bits = off;
+  if (bits > MAX_TABLE_BITS) {
+    note(t, `入力とメモリで ${bits} ビット `
       + `(64 レーンに収まるのは ${MAX_TABLE_BITS} ビットまで)`);
     return;
   }
 
   const saved = regs.map((r) => Number(sim.get(r.name)));
-  const rows = 1 << dims.length;
+  const rows = 1 << bits;
   for (let lane = 0; lane < LANES; lane++) {
     const pat = lane < rows ? lane : 0;
-    dims.forEach((d, b) => sim.setInputLane(d.name, lane, (pat >> b) & 1));
+    for (const d of dims) sim.setInputLane(d.name, lane, (pat >> d.off) & d.mask);
   }
   sim.eval();
   const outCols = outs.map((o) => sim.getLanes(o.name));      // 現在の状態での出力
@@ -53,31 +61,39 @@ export function renderTable(plan, sim, inputValue) {
     nextCols = regs.map((r) => sim.getLanes(r.name));         // クロック後の Q
   }
 
+  // 幅 1 は 0/1、広いときは 16 進 (画面の部品の見せ方と揃える)
+  const fmt = (v, w) => (w <= 1 ? String(v ? 1 : 0)
+    : v.toString(16).toUpperCase().padStart(Math.ceil(w / 4), '0'));
+  const label = (name, w) => (w > 1 ? `${name}[${w - 1}:0]` : name);
+
   const head = hel('tr', t);
-  for (const d of dims) hel('th', head).textContent = d.name;
+  for (const d of dims) hel('th', head).textContent = label(d.name, d.w);
   hel('th', head, 'gap');
-  for (const r of regs) hel('th', head).textContent = `${r.name}'`;
-  for (const o of outs) hel('th', head).textContent = o.name;
+  for (const r of regs) hel('th', head).textContent = `${label(r.name, r.width ?? 1)}'`;
+  for (const o of outs) hel('th', head).textContent = label(o.name, o.width ?? 1);
 
   // 今の入力とメモリの値が何行目かを求めて、その行に印を付ける
   let now = 0;
-  dims.forEach((d, b) => {
-    const v = regs.includes(d) ? saved[regs.indexOf(d)] : inputValue(d.node);
-    if (v) now |= 1 << b;
-  });
+  for (const d of dims) {
+    const v = regs.some((r) => r.node === d.node)
+      ? saved[regs.findIndex((r) => r.node === d.node)]
+      : inputValue(d.node);
+    now |= (v & d.mask) << d.off;
+  }
 
   let nowRow = null;
   for (let r = 0; r < rows; r++) {
     const tr = hel('tr', t, r === now ? 'now' : '');
     if (r === now) nowRow = tr;
-    dims.forEach((_, b) => {
-      const v = (r >> b) & 1;
-      hel('td', tr, v ? 'one' : 'zero').textContent = v;
-    });
+    for (const d of dims) {
+      const v = (r >> d.off) & d.mask;
+      hel('td', tr, v ? 'one' : 'zero').textContent = fmt(v, d.w);
+    }
     hel('td', tr, 'gap');
-    for (const lanes of [...nextCols, ...outCols]) {
+    for (const [i, lanes] of [...nextCols, ...outCols].entries()) {
+      const w = (i < nextCols.length ? regs[i] : outs[i - nextCols.length])?.width ?? 1;
       const v = Number(lanes[r]);
-      hel('td', tr, v ? 'one' : 'zero').textContent = v;
+      hel('td', tr, v ? 'one' : 'zero').textContent = fmt(v, w);
     }
   }
   nowRow?.scrollIntoView({ block: 'nearest' });   // 64 行あると印が画面外に行くので
