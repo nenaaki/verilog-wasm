@@ -233,6 +233,29 @@ endmodule`,
   assign exactly = (a && !b && !c) || (!a && b && !c) || (!a && !b && c);
 endmodule`,
 
+  'priority8 — 優先順位エンコーダ (casez)': `module priority8(
+  input clk,
+  input [7:0] req,
+  output reg [2:0] sel,     // 立っている中で最上位のビット番号
+  output reg       any
+);
+  // casez はラベルの ? (= z) の桁を比較しない。上から順に最初に一致したものが勝つ
+  always @(posedge clk) begin
+    casez (req)
+      8'b1???_????: sel <= 3'd7;
+      8'b01??_????: sel <= 3'd6;
+      8'b001?_????: sel <= 3'd5;
+      8'b0001_????: sel <= 3'd4;
+      8'b0000_1???: sel <= 3'd3;
+      8'b0000_01??: sel <= 3'd2;
+      8'b0000_001?: sel <= 3'd1;
+      8'b0000_0001: sel <= 3'd0;
+      default:      sel <= 3'd0;
+    endcase
+    any <= |req;
+  end
+endmodule`,
+
   'seqdet — "1011" 検出 FSM (case + if)': `module seqdet(
   input clk,
   input din,

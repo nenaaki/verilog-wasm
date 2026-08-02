@@ -130,7 +130,8 @@ export function parse(src) {
 
     if (t.type === 'num') {
       next();
-      return { type: 'num', width: t.width, bits: t.bits, line: t.line };
+      // mask は casez のラベルで「比較しない桁」。それ以外の場所では elaborate が断る
+      return { type: 'num', width: t.width, bits: t.bits, mask: t.mask ?? 0n, line: t.line };
     }
 
     if (eat('(')) {
@@ -256,10 +257,10 @@ export function parse(src) {
 
   function parseStmt() {
     if (at('if')) return parseIf();
-    if (at('case')) return parseCase();
-    if (at('casez') || at('casex')) {
-      throw err(`${peek().value} は未対応 (x / z を扱わないので case を使う)`);
-    }
+    if (at('case') || at('casez')) return parseCase();
+    // casex は x も don't care にする。x を値として持たないので z との差が出ず、
+    // 「x なら何でも一致」を装うことになるので断る (casez なら z / ? で足りる)
+    if (at('casex')) throw err('casex は未対応 (x を値として扱わない。casez を使う)');
     const line = peek().line;
     const lhs = parseLValue();
     if (at('=')) throw err('always ブロック内ではノンブロッキング代入 <= を使う');
@@ -281,7 +282,10 @@ export function parse(src) {
   }
 
   function parseCase() {
-    const line = expect('case').line;
+    // casez はラベルの z / ? をその桁だけ比較から外す。式の側は 2 値しか無いので
+    // 「ラベルの don't care」だけを見れば Verilog と同じ結果になる
+    const casez = at('casez');
+    const line = next().line;
     expect('(');
     const sel = parseExpr();
     expect(')');
@@ -307,7 +311,7 @@ export function parse(src) {
     }
     expect('endcase');
     if (items.length === 0 && !dflt) throw err('case の中身が空');
-    return { type: 'case', sel, items, default: dflt, line };
+    return { type: 'case', casez, sel, items, default: dflt, line };
   }
 
   /** posedge x / negedge x。どちらがクロックでどちらがリセットかは elaborate が決める */

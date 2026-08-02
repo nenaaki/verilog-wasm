@@ -1695,6 +1695,154 @@ endmodule`);
   }
 }
 
+// ------------------------------------------------------------------ casez
+// casez はラベルに書いた z / ? の桁を比較から外す。式の側は 2 値しか無いので、
+// 「ラベルの don't care」だけを見れば Verilog と同じ結果になる。
+async function testCasez() {
+  // 優先順位エンコーダ。casez の代表的な使いどころ
+  const pri = await bothSims(`module pri(input clk, input [3:0] req, output reg [2:0] grant);
+  always @(posedge clk)
+    casez (req)
+      4'b1???: grant <= 3'd3;
+      4'b01??: grant <= 3'd2;
+      4'b001?: grant <= 3'd1;
+      4'b0001: grant <= 3'd0;
+      default: grant <= 3'd7;
+    endcase
+endmodule`);
+  const model = (req) => (req & 8 ? 3 : req & 4 ? 2 : req & 2 ? 1 : req & 1 ? 0 : 7);
+  let bad = null;
+  for (const sim of pri.all) {
+    for (let req = 0; req < 16; req++) {
+      sim.setInput('req', req).step();
+      if (Number(sim.get('grant')) !== model(req) && !bad) {
+        bad = `${sim.constructor.name} req=${req}: 期待 ${model(req)} / 実際 ${sim.get('grant')}`;
+      }
+    }
+  }
+  ok(!bad, 'casez: 優先順位エンコーダが全 16 通り正しい', bad ?? '');
+
+  // 同じ表を case でラベルを並べて書いたものと突き合わせる。結果は同じで回路は小さい
+  const labels = [];
+  for (let r = 1; r < 16; r++) labels.push(`      4'd${r}: grant <= 3'd${model(r)};`);
+  const plain = await bothSims(`module pri(input clk, input [3:0] req, output reg [2:0] grant);
+  always @(posedge clk)
+    case (req)
+${labels.join('\n')}
+      default: grant <= 3'd7;
+    endcase
+endmodule`);
+  let mismatch = null;
+  for (let req = 0; req < 16; req++) {
+    plain.wasm.setInput('req', req).step();
+    pri.wasm.setInput('req', req).step();
+    if (String(plain.wasm.get('grant')) !== String(pri.wasm.get('grant')) && !mismatch) {
+      mismatch = `req=${req}`;
+    }
+  }
+  ok(!mismatch, 'casez: ラベルを 15 個並べた case と同じ結果', mismatch ?? '');
+  ok(pri.compiled.stats.gates < plain.compiled.stats.gates,
+    'casez: 比較する桁が減るので回路も小さい',
+    `casez=${pri.compiled.stats.gates} case=${plain.compiled.stats.gates}`);
+
+  // 16 進の z (1 桁 = 4 ビット)、全桁 z (常に一致)、部分 z の混在
+  const mix = await bothSims(`module m(input clk, input [7:0] a, output reg [3:0] y);
+  always @(posedge clk)
+    casez (a)
+      8'hz0:        y <= 4'd1;
+      8'b1zzz_zzzz: y <= 4'd2;
+      8'bzzzz_zzzz: y <= 4'd3;
+    endcase
+endmodule`);
+  const want = (a) => ((a & 0x0f) === 0 ? 1 : (a & 0x80) ? 2 : 3);
+  let mbad = null;
+  for (const sim of mix.all) {
+    for (const a of [0x00, 0x30, 0x81, 0x7f, 0xf0, 0xff, 0x01, 0x80]) {
+      sim.setInput('a', a).step();
+      if (Number(sim.get('y')) !== want(a) && !mbad) {
+        mbad = `${sim.constructor.name} a=0x${a.toString(16)}: 期待 ${want(a)} / 実際 ${sim.get('y')}`;
+      }
+    }
+  }
+  ok(!mbad, 'casez: 16 進の z・全桁 z・混在が正しい', mbad ?? '');
+
+  // 全桁 don't care のラベルは常に一致するので、その後ろの項目と default は死ぬ
+  const allZ = compile(`module m(input clk, input [3:0] a, output reg [3:0] y);
+  always @(posedge clk)
+    casez (a)
+      4'bzzzz: y <= 4'h5;
+      4'b0000: y <= 4'h6;
+      default: y <= 4'h7;
+    endcase
+endmodule`);
+  const sim = await WasmSimulator.create(allZ);
+  sim.setInput('a', 0).step();
+  eq(sim.get('y'), 5, 'casez: 全桁 z は常に一致する (後ろの項目は届かない)');
+  // 常に一致なら比較器も mux も残らない = 無条件代入と同じ回路になる
+  const flat = compile(`module m(input clk, input [3:0] a, output reg [3:0] y);
+  always @(posedge clk) y <= 4'h5;
+endmodule`);
+  eqs(allZ.stats.gates, flat.stats.gates,
+    'casez: 常に一致なら無条件代入と同じゲート数');
+
+  // don't care は幅を広げた側には広がらない (Verilog の規則)。上位は 0 として比較する
+  const ext = await bothSims(`module m(input clk, input [7:0] a, output reg y);
+  always @(posedge clk)
+    casez (a)
+      4'b1??? : y <= 1'b1;
+      default : y <= 1'b0;
+    endcase
+endmodule`);
+  let ebad = null;
+  for (const sim2 of ext.all) {
+    // 8 ビットに揃うと 4'b1??? は 8'b0000_1??? になる = 上位 4 ビットは 0 でなければ不一致
+    for (const [a, w] of [[0x08, 1], [0x0f, 1], [0x18, 0], [0x80, 0], [0x07, 0]]) {
+      sim2.setInput('a', a).step();
+      if (Number(sim2.get('y')) !== w && !ebad) {
+        ebad = `${sim2.constructor.name} a=0x${a.toString(16)}: 期待 ${w} / 実際 ${sim2.get('y')}`;
+      }
+    }
+  }
+  ok(!ebad, 'casez: don\'t care は幅を広げた上位には広がらない', ebad ?? '');
+
+  // 複数ラベル・default 無しの保持も case と同じように通る
+  const multi = await bothSims(`module m(input clk, input [3:0] a, output reg [3:0] y);
+  always @(posedge clk)
+    casez (a)
+      4'b00?0, 4'b11?1: y <= 4'hA;
+    endcase
+endmodule`);
+  let nbad = null;
+  for (const sim3 of multi.all) {
+    sim3.reset();
+    const hit = (a) => (a & 0b1101) === 0b0000 || (a & 0b1101) === 0b1101;
+    let last = 0;
+    for (const a of [0, 1, 2, 5, 13, 15, 7]) {
+      sim3.setInput('a', a).step();
+      if (hit(a)) last = 0xa;
+      if (Number(sim3.get('y')) !== last && !nbad) {
+        nbad = `${sim3.constructor.name} a=${a}: 期待 ${last} / 実際 ${sim3.get('y')}`;
+      }
+    }
+  }
+  ok(!nbad, 'casez: 複数ラベルと default 無しの保持', nbad ?? '');
+
+  // 8 入力の優先順位エンコーダを全 256 通り
+  const p8 = await bothSims(example('priority8.v'));
+  let pbad = null;
+  for (const sim4 of p8.all) {
+    for (let req = 0; req < 256; req++) {
+      sim4.setInput('req', req).step();
+      const wantSel = req === 0 ? 0 : 31 - Math.clz32(req);
+      if ((Number(sim4.get('sel')) !== wantSel || Number(sim4.get('any')) !== (req ? 1 : 0)) && !pbad) {
+        pbad = `${sim4.constructor.name} req=${req}: sel=${sim4.get('sel')} (期待 ${wantSel})`
+          + ` any=${sim4.get('any')}`;
+      }
+    }
+  }
+  ok(!pbad, 'casez: priority8.v が全 256 通り正しい', pbad ?? '');
+}
+
 // ------------------------------------------------------------------- FSM
 async function testSeqDet() {
   const { compiled, all } = await bothSims(example('seqdet.v'));
@@ -2076,10 +2224,28 @@ async function testErrors() {
     ['always_comb は未対応',
       `module m(input a, output reg y); always_comb y = ~a; endmodule`,
       /'always_comb' は未対応/],
-    ['casez は未対応',
+    ['casex は未対応',
       `module m(input clk, input [1:0] s, output reg q);
-       always @(posedge clk) casez (s) 2'b00: q <= 1'b1; endcase endmodule`,
-      /casez は未対応/],
+       always @(posedge clk) casex (s) 2'b0?: q <= 1'b1; endcase endmodule`,
+      /casex は未対応/],
+    // z / ? は casez のラベルでだけ意味がある。他の場所で黙って 0 にすると
+    // 回路が静かに変わるので断る
+    ['z を式の中に書いたら断る',
+      `module m(output [3:0] y); assign y = 4'b1?01; endmodule`,
+      /casez のラベルでしか使えない/],
+    ['casez でない case のラベルの z は断る',
+      `module m(input clk, input [3:0] a, output reg y);
+       always @(posedge clk) case (a) 4'b1???: y <= 1'b1; default: y <= 1'b0; endcase endmodule`,
+      /casez のラベルでしか使えない/],
+    ['parameter の z も断る',
+      `module m #(parameter W = 4'bz1) (output y); assign y = 1'b0; endmodule`,
+      /casez のラベルでしか使えない/],
+    ['x は値として断る',
+      `module m(output [3:0] y); assign y = 4'bx1; endmodule`,
+      /x は未対応/],
+    ["10 進の z は断る",
+      `module m(output [3:0] y); assign y = 4'dz; endmodule`,
+      /10 進のリテラルでは z \/ \? は使えない/],
     ['endcase 忘れ',
       `module m(input clk, input [1:0] s, output reg q);
        always @(posedge clk) case (s) 2'b00: q <= 1'b1; endmodule`,
@@ -2198,6 +2364,13 @@ function randomDesign(rng, nWires) {
       const els = rng() < 0.5 ? ` else begin ${stmt(depth - 1)} end` : '';
       return `if (${expr(2)}) ${then}${els}`;
     }
+    // 半分は casez にして、ラベルの一部を don't care にする。式の側は 2 値なので
+    // 「その桁を比較しない」だけの違いになり、両実装で同じ結果になるはず
+    if (rng() < 0.5) {
+      const arms = [`2'b0?: begin ${stmt(depth - 1)} end`, `2'b1?: begin ${stmt(depth - 1)} end`];
+      if (rng() < 0.5) arms.push(`default: begin ${stmt(depth - 1)} end`);
+      return `casez (${expr(1)}) ${arms.join(' ')} endcase`;
+    }
     const arms = [`2'd0: begin ${stmt(depth - 1)} end`, `2'd1: begin ${stmt(depth - 1)} end`];
     if (rng() < 0.7) arms.push(`default: begin ${stmt(depth - 1)} end`);
     return `case (${expr(1)}) ${arms.join(' ')} endcase`;
@@ -2261,7 +2434,7 @@ async function testRandomDiff() {
 
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
   const seen = {
-    'if': 0, 'case': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0,
+    'if': 0, 'case': 0, 'casez': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0,
     '非同期リセット': 0, '階層': 0, 'parameter': 0, 'リダクション': 0,
   };
 
@@ -2269,6 +2442,7 @@ async function testRandomDiff() {
     const src = randomDesign(rng, 6);
     if (/\bif \(/.test(src)) seen['if']++;
     if (/\bcase \(/.test(src)) seen['case']++;
+    if (/\bcasez \(/.test(src)) seen['casez']++;
     if (/[-+] /.test(src)) seen['+ / -']++;
     if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
     if (/(<<|>>)/.test(src)) seen['シフト']++;
@@ -3044,6 +3218,7 @@ const suites = [
   ['シフト', testShift],
   ['シフト回路', testShifter],
   ['if / case', testIfCase],
+  ['casez', testCasez],
   ['FSM (列検出)', testSeqDet],
   ['モジュール階層', testHierarchy],
   ['parameter', testParams],

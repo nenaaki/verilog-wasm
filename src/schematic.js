@@ -133,7 +133,8 @@ const MAX_FLAT_NODES = 4000;  // 平坦化した後のノード数
 const IDENT = /^[A-Za-z_][A-Za-z0-9_$]*$/;
 const RESERVED = new Set([
   CLOCK, 'module', 'endmodule', 'input', 'output', 'inout', 'wire', 'reg', 'assign',
-  'always', 'posedge', 'negedge', 'begin', 'end', 'if', 'else', 'case', 'endcase',
+  'always', 'posedge', 'negedge', 'begin', 'end', 'if', 'else',
+  'case', 'casez', 'casex', 'endcase', 'default',
   'and', 'or', 'not', 'nand', 'nor', 'xor', 'xnor', 'buf',
 ]);
 

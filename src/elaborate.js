@@ -28,6 +28,10 @@ import { GATE_PRIMITIVES } from './parser.js';
 
 const MAX_DEPTH = 16;   // インスタンスの入れ子の上限
 
+// z / ? は「その桁を比較しない」印としてだけ扱う。値としての z は持たないので、
+// casez のラベル以外の場所に出てきたら断る (黙って 0 にすると回路が静かに変わる)
+const DONT_CARE_ONLY_IN_CASEZ = 'z / ? は casez のラベルでしか使えない (値としての z は扱わない)';
+
 /**
  * @param {object} mod    top にする module の AST
  * @param {object[]} [all] インスタンス解決に使う module 一覧 (省略時は階層なし)
@@ -173,6 +177,7 @@ export function elaborate(mod, all = [mod]) {
     const bool = (b) => (b ? 1n : 0n);
     switch (e.type) {
       case 'num':
+        if (e.mask) throw new CompileError(DONT_CARE_ONLY_IN_CASEZ, e.line);
         return e.bits & ((1n << BigInt(e.width)) - 1n);      // 自分の幅で切る
       case 'ref': {
         const v = params.get(scope + e.name);
@@ -385,6 +390,30 @@ export function elaborate(mod, all = [mod]) {
    * a == b / a != b。差分ビットを OR リダクションして 1 ビットにする。
    * XNOR の AND リダクションでも同じだが、こちらは基本ゲートだけで済む。
    */
+  /**
+   * case のラベル 1 個と式の一致。casez のときはラベルに書いた z / ? の桁を
+   * 比較から外す。ラベルを幅 cw に伸ばしたときの上位は 0 で埋まる (don't care は
+   * 広がらない) ので、そこは比較する ― Verilog の規則どおり。
+   *
+   * don't care は**リテラルに書いたものだけ**を見る。式で作った z は無いので、
+   * ラベルがリテラル以外なら普通の一致になる。
+   */
+  function matchLabel(sel, label, cw, casez) {
+    const mask = casez && label.type === 'num' ? label.mask : 0n;
+    if (!mask) return equalBits(sel, evalExpr(label, cw), '==')[0];
+    // mask を落としたリテラルとして評価する (don't care の桁は 0 が入っている)
+    const bits = evalExpr({ ...label, mask: 0n }, cw);
+    const diffs = [];
+    for (let i = 0; i < cw; i++) {
+      if ((mask >> BigInt(i)) & 1n) continue;
+      diffs.push(newGate('xor', [sel[i], bits[i]]));
+    }
+    if (diffs.length === 0) return CONST1;        // 全桁 don't care = 常に一致
+    let diff = diffs[0];
+    for (let i = 1; i < diffs.length; i++) diff = newGate('or', [diff, diffs[i]]);
+    return newGate('not', [diff]);
+  }
+
   function equalBits(a, b, op) {
     const w = Math.max(a.length, b.length);
     const aa = resize(a, w);
@@ -549,6 +578,7 @@ export function elaborate(mod, all = [mod]) {
 
     switch (e.type) {
       case 'num': {
+        if (e.mask) throw new CompileError(DONT_CARE_ONLY_IN_CASEZ, e.line);
         const out = [];
         for (let b = 0; b < w; b++) {
           // 自分の幅より上は 0。ここでマスクしないと 4'hFF が 255 のまま広がる
@@ -718,7 +748,7 @@ export function elaborate(mod, all = [mod]) {
           const it = st.items[k];
           let cond = null;
           for (const label of it.labels) {
-            const hit = equalBits(sel, evalExpr(label, cw), '==')[0];
+            const hit = matchLabel(sel, label, cw, st.casez);
             cond = cond === null ? hit : newGate('or', [cond, hit]);
           }
           acc = mergeStates(cond, runStmts(it.stmts, new Map(cur)), acc, cur);

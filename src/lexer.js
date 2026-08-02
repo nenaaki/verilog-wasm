@@ -5,8 +5,10 @@
 import { CompileError } from './errors.js';
 
 // 's は符号付きリテラル (4'sd5)。扱わないが、基数の前に来るので読めないと
-// 「解釈できない文字 '''」になってしまう。読んでから名指しで断る
-const RE_SIZED = /(\d+)?'([sS]?)([bodhBODH])([0-9a-fA-F_]+)/y;
+// 「解釈できない文字 '''」になってしまう。読んでから名指しで断る。
+// z / Z / ? は casez のラベルで「その桁を比較しない」印として使う。x / X は
+// 値としての x なので断るが、これも読めないと理由が伝わらないので桁に含める。
+const RE_SIZED = /(\d+)?'([sS]?)([bodhBODH])([0-9a-fA-F_xXzZ?]+)/y;
 const RE_DEC = /\d[\d_]*/y;
 const RE_IDENT = /[A-Za-z_][A-Za-z0-9_$]*/y;
 
@@ -75,15 +77,28 @@ export function lex(src) {
       }
       const radix = RADIX[baseChar.toLowerCase()];
       const digits = digitsRaw.replace(/_/g, '');
+      // mask は「比較しない桁」。1 桁が基数ぶんのビットになるので、value と同じ
+      // 桁上げで積めば z / ? の位置がそのままビットに広がる (4'hz なら 4 ビット)
       let value = 0n;
+      let mask = 0n;
       for (const d of digits) {
-        const v = parseInt(d, radix);
+        const dontCare = d === 'z' || d === 'Z' || d === '?';
+        if (d === 'x' || d === 'X') {
+          throw new CompileError(
+            `${raw} の x は未対応 (x を値として扱わない。比較しない桁なら z か ? を使う)`, line);
+        }
+        if (dontCare && radix === 10) {
+          throw new CompileError(`${raw}: 10 進のリテラルでは z / ? は使えない`, line);
+        }
+        const v = dontCare ? 0 : parseInt(d, radix);
         if (Number.isNaN(v)) throw new CompileError(`基数 ${radix} に対して不正な桁 '${d}'`, line);
         value = value * BigInt(radix) + BigInt(v);
+        mask = mask * BigInt(radix) + (dontCare ? BigInt(radix - 1) : 0n);
       }
       const width = widthStr ? parseInt(widthStr, 10) : UNSIZED_WIDTH;
       if (width < 1 || width > 4096) throw new CompileError(`ビット幅 ${width} が不正`, line);
-      tokens.push({ type: 'num', value: raw, line, width, bits: value });
+      const wm = (1n << BigInt(width)) - 1n;
+      tokens.push({ type: 'num', value: raw, line, width, bits: value & wm, mask: mask & wm });
       i += raw.length;
       continue;
     }
