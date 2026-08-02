@@ -163,6 +163,19 @@
     background: #0c0e12; color: var(--fg); border: 2px solid var(--blue); border-radius: 7px;
     padding: 0 4px; outline: none;
   }
+  /* 右クリックで部品のすぐ下 (下段) に出す幅の欄。端子に出る幅の数字と同じ色にして
+     「値の箱」と間違えないようにする */
+  #partWidthRow {
+    position: absolute; display: flex; align-items: center; gap: 5px; height: 22px;
+    box-sizing: border-box; white-space: nowrap; padding: 0 5px; border-radius: 7px;
+    background: #0c0e12; border: 2px solid #4f9c80;
+    font-family: var(--mono); font-size: 10px; color: #7fd6b8;
+  }
+  #partWidthRow input {
+    flex: 1; min-width: 26px; width: 100%; padding: 0; border: none; outline: none;
+    background: transparent; text-align: center;
+    font-family: var(--mono); font-size: 12px; color: var(--fg);
+  }
   .node.dead rect.body { stroke-dasharray: 4 3; }
   .node.dead text { fill: #5b626f; }
   .node { cursor: grab; }
@@ -207,7 +220,7 @@
   <button id="renameBtn">名前 (F2)</button>
   <span class="label">幅</span>
   <input type="number" id="bitWidth" value="1" min="1" max="32"
-    title="選んだ 入力 / 定数 / メモリ のビット幅（ビット取り出しでは取り出すビット数、連接では入力の本数）。ゲートと出力は繋いだ先から決まる">
+    title="選んだ 入力 / 定数 / メモリ のビット幅（ビット取り出しでは取り出すビット数、連接では入力の本数）。ゲートと出力は繋いだ先から決まる。1 個だけなら部品を右クリックしてそのすぐ下で打つほうが速い">
   <button id="openBlock" title="選んだ回路部品の中身を開いて編集する (ダブルクリックでも開く)">部品の中へ</button>
   <button id="clear">全部消す</button>
   <button id="fit">表示リセット</button>
@@ -936,6 +949,41 @@ function fmtValue(v, w) {
 const sizedSelection = () =>
   [...selection].map(byId).filter((n) => n && (spec(n).sized || spec(n).pins));
 
+/**
+ * 部品の幅 (連接なら入力の本数) を w にする。何も変わらなければ false を返す。
+ * ツールバーの「幅」と右クリックの下段が同じここを通る。
+ */
+function applyWidth(nodes, w) {
+  // 連接だけは「幅」ではなく入力の本数なので、下限が違う
+  const sizeFor = (n) => (spec(n).pins ? Math.max(MIN_PINS, w) : w);
+  if (nodes.every((n) => sizeOfPart(n) === sizeFor(n))) return false;
+  pushUndo();
+  for (const n of nodes) {
+    n.w = sizeFor(n);
+    n.value = clampValue(n.value ?? 0, widthOf(n));   // 幅を狭めたら値も収める
+  }
+  // 端子が減ったら、その先に繋がっていた配線は行き場が無くなる
+  graph.wires = graph.wires.filter((wire) => {
+    const to = byId(wire.to.node);
+    return !to || wire.to.port < insOf(to);
+  });
+  rebuild();
+  return true;
+}
+
+/** 幅を変えたときの知らせ。連接は「幅」ではなく「入力の本数」なので言い方を変える */
+function widthMsg(nodes, w) {
+  const unit = (pins) => (pins ? `${Math.max(MIN_PINS, w)} 入力` : `${w} ビット`);
+  if (nodes.length === 1) {
+    const n = nodes[0];
+    return `${n.name || spec(n).label} を ${unit(spec(n).pins)} にしました`;
+  }
+  const pins = nodes.filter((n) => spec(n).pins).length;
+  if (pins === nodes.length) return `${pins} 個の連接を ${unit(true)} にしました`;
+  if (pins === 0) return `${nodes.length} 個の部品を ${unit(false)} にしました`;
+  return `${nodes.length} 個の部品を ${w} にしました (連接は入力の本数)`;
+}
+
 // ---------------------------------------------------------------- 描画
 function render() {
   const gw = $('gWires'), gn = $('gNodes');
@@ -1088,7 +1136,7 @@ function render() {
       e.preventDefault();
       e.stopPropagation();
       selection = new Set([n.id]);
-      startRename(n.id);
+      startPartEdit(n.id);
     });
   }
   $('rubber').setAttribute('d', '');
@@ -1174,7 +1222,99 @@ function renderTable() {
   drawTable(plan, sim, (nodeId) => (byId(nodeId)?.value ? 1 : 0));
 }
 
-// ------------------------------------------------------ 端子の名前を変える
+// ------------------------------------------------------ 部品に重ねる入力欄
+//
+// 上段 (部品の本体にぴったり重なる) が名前と値、下段 (すぐ下) が幅。
+// Enter で確定して閉じ、Escape で取り消し、フォーカスを外しても確定する。
+
+/** 部品に重ねている欄を片付ける */
+function closePartInputs() {
+  document.getElementById('renameBox')?.remove();
+  document.getElementById('partWidthRow')?.remove();
+}
+
+/** 部品の本体の矩形。箱の外に出ている飾り (端子・幅の数字) は含めない */
+function bodyRect(id) {
+  const g = $('gNodes').querySelector(`[data-id="${id}"]`);
+  if (!g) return null;
+  const r = g.querySelector('rect.body').getBoundingClientRect();
+  const wrap = $('canvasWrap').getBoundingClientRect();
+  return { x: r.x - wrap.x, y: r.y - wrap.y, width: r.width, height: r.height };
+}
+
+/**
+ * 右クリックで開く部品の設定。名前が付けられるなら上段に名前、幅を持てるなら下段に幅。
+ * 幅の欄をツールバーから部品のそばへ持ってくるのが目的 — 離れていると打ちにくい。
+ */
+function startPartEdit(id) {
+  const n = byId(id);
+  if (!n) return;
+  const canName = spec(n).named;
+  const canSize = spec(n).sized || spec(n).pins;
+  if (!canName && !canSize) {
+    setMsg(`${spec(n).label} に決めるものはありません (幅は繋いだ先から決まります)`, 'warn');
+    return;
+  }
+  closePartInputs();
+  // 下段を先に置く。焦点は名前があれば上段、なければ下段。
+  // startWidthEdit は焦点を取らない — 取ると上段が焦点を奪った時点で blur → 確定 → 消滅する
+  if (canSize) startWidthEdit(id);
+  if (canName) startRename(id);
+  else {
+    const inp = document.getElementById('partWidthBox');
+    inp?.focus();
+    inp?.select();
+  }
+}
+
+/**
+ * 下段の幅の欄。ツールバーの「幅」と同じことを部品のそばでできるようにする。
+ * 連接だけは中身が「入力の本数」なので見出しも変える。
+ */
+function startWidthEdit(id) {
+  const n = byId(id);
+  const r = bodyRect(id);
+  if (!n || !r) return;
+  const isPins = spec(n).pins;
+
+  const row = document.createElement('div');
+  row.id = 'partWidthRow';
+  const lab = document.createElement('span');
+  lab.textContent = isPins ? '本数' : '幅';
+  const inp = document.createElement('input');
+  inp.id = 'partWidthBox';
+  inp.type = 'text';
+  inp.spellcheck = false;
+  inp.value = String(sizeOfPart(n));
+  inp.title = isPins
+    ? `連接の入力の本数 (${MIN_PINS}〜${MAX_WIDTH})`
+    : `${spec(n).label}のビット幅 (1〜${MAX_WIDTH})`;
+  row.append(lab, inp);
+  Object.assign(row.style, {
+    left: `${r.x}px`, top: `${r.y + r.height + 4}px`, width: `${Math.max(r.width, 84)}px`,
+  });
+  $('canvasWrap').appendChild(row);
+
+  let done = false;
+  const close = () => { done = true; row.remove(); };
+  const commit = () => {
+    if (done) return;
+    const text = inp.value.trim();
+    close();
+    if (text === '') return;
+    if (!/^[0-9]+$/.test(text)) { setMsg(`幅として読めません: ${text}`, 'err'); return; }
+    const w = Math.max(1, Math.min(MAX_WIDTH, Number.parseInt(text, 10)));
+    if (applyWidth([n], w)) setMsg(widthMsg([n], w), 'ok');
+    else updateEditUI();          // 連接に 1 を入れた等、変わらなかったとき
+  };
+  inp.addEventListener('keydown', (e) => {
+    e.stopPropagation();                                 // Space / Del を回路側に流さない
+    if (e.key === 'Enter') { commit(); closePartInputs(); }
+    if (e.key === 'Escape') closePartInputs();
+  });
+  inp.addEventListener('blur', commit);
+}
+
 // 部品の上に input を重ねて出す。Enter で確定・Escape で取り消し・空にすると自動名に戻る。
 function startRename(id) {
   const n = byId(id);
@@ -1185,17 +1325,15 @@ function startRename(id) {
   }
   document.getElementById('renameBox')?.remove();
 
-  const g = $('gNodes').querySelector(`[data-id="${id}"]`);
-  // 箱の外に出ている飾り (端子・幅の数字) を含めないよう、本体の矩形にだけ重ねる
-  const r = g.querySelector('rect.body').getBoundingClientRect();
-  const wrap = $('canvasWrap').getBoundingClientRect();
+  const r = bodyRect(id);
+  if (!r) return;
   const inp = document.createElement('input');
   inp.id = 'renameBox';
   inp.type = 'text';
   inp.spellcheck = false;
   inp.value = n.name ?? plan?.signalOf.get(id) ?? '';
   Object.assign(inp.style, {
-    left: `${r.x - wrap.x}px`, top: `${r.y - wrap.y}px`,
+    left: `${r.x}px`, top: `${r.y}px`,
     width: `${Math.max(r.width, 84)}px`, height: `${r.height}px`,
   });
   $('canvasWrap').appendChild(inp);
@@ -1219,8 +1357,9 @@ function startRename(id) {
   };
   inp.addEventListener('keydown', (e) => {
     e.stopPropagation();                                 // Space / Del を回路側に流さない
-    if (e.key === 'Enter') commit();
-    if (e.key === 'Escape') close();
+    // 下段の幅の欄が出ていることもあるので、確定・取り消しはまとめて閉じる
+    if (e.key === 'Enter') { commit(); closePartInputs(); }
+    if (e.key === 'Escape') { close(); closePartInputs(); }
   });
   inp.addEventListener('blur', commit);
 }
@@ -1235,12 +1374,10 @@ function startValueEdit(id) {
   // ビット取り出しは「何ビット目か」なので 10 進で受ける。値とは意味が違う
   const isIndex = n.type === 'bit';
   const w = widthOf(n);
-  document.getElementById('renameBox')?.remove();
+  closePartInputs();
 
-  const g = $('gNodes').querySelector(`[data-id="${id}"]`);
-  // 箱の外に出ている飾り (端子・幅の数字) を含めないよう、本体の矩形にだけ重ねる
-  const r = g.querySelector('rect.body').getBoundingClientRect();
-  const wrap = $('canvasWrap').getBoundingClientRect();
+  const r = bodyRect(id);
+  if (!r) return;
   const inp = document.createElement('input');
   inp.id = 'renameBox';                     // CSS と後片付けを名前の箱と共用する
   inp.type = 'text';
@@ -1250,7 +1387,7 @@ function startValueEdit(id) {
     ? `取り出す範囲のいちばん下のビット番号 (10 進)。幅は「幅」の欄で決める`
     : `${w} ビットの値を 16 進で入れる (0x を付けても可)`;
   Object.assign(inp.style, {
-    left: `${r.x - wrap.x}px`, top: `${r.y - wrap.y}px`,
+    left: `${r.x}px`, top: `${r.y}px`,
     width: `${Math.max(r.width, 84)}px`, height: `${r.height}px`,
   });
   $('canvasWrap').appendChild(inp);
@@ -1631,25 +1768,9 @@ $('bitWidth').onchange = () => {
   const sized = sizedSelection();
   if (sized.length === 0) return;
   const w = Math.max(1, Math.min(MAX_WIDTH, Math.round(Number($('bitWidth').value) || 1)));
-  // 連接だけは「幅」ではなく入力の本数なので、下限が違う
-  const sizeFor = (n) => (spec(n).pins ? Math.max(MIN_PINS, w) : w);
   // 何も変わらないとき (連接に 1 を入れた等) は、欄を実際の値に戻して終わり
-  if (sized.every((n) => sizeOfPart(n) === sizeFor(n))) { updateEditUI(); return; }
-  pushUndo();
-  for (const n of sized) {
-    n.w = sizeFor(n);
-    n.value = clampValue(n.value ?? 0, widthOf(n));   // 幅を狭めたら値も収める
-  }
-  // 端子が減ったら、その先に繋がっていた配線は行き場が無くなる
-  graph.wires = graph.wires.filter((wire) => {
-    const to = byId(wire.to.node);
-    return !to || wire.to.port < insOf(to);
-  });
-  rebuild();
-  const pins = sized.filter((n) => spec(n).pins).length;
-  if (pins === sized.length) setMsg(`${pins} 個の連接を ${Math.max(MIN_PINS, w)} 入力にしました`, 'ok');
-  else if (pins === 0) setMsg(`${sized.length} 個の部品を ${w} ビットにしました`, 'ok');
-  else setMsg(`${sized.length} 個の部品を ${w} にしました (連接は入力の本数)`, 'ok');
+  if (!applyWidth(sized, w)) { updateEditUI(); return; }
+  setMsg(widthMsg(sized, w), 'ok');
 };
 
 $('openBlock').onclick = () => enterBlock();

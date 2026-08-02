@@ -247,6 +247,31 @@ const HELPERS = `
     return document.getElementById('msg').textContent;
   };
   window.__valueBoxOpen = () => !!document.getElementById('renameBox');
+  // 右クリックで出る下段の幅の欄
+  window.__widthRow = () => document.getElementById('partWidthRow');
+  window.__widthRowOpen = () => !!__widthRow();
+  window.__widthRowLabel = () => __widthRow()?.querySelector('span').textContent ?? null;
+  window.__widthRowValue = () => document.getElementById('partWidthBox')?.value ?? null;
+  window.__focusId = () => document.activeElement?.id ?? '';
+  /** 下段が部品の本体の真下・左端そろえで出ているか */
+  window.__widthRowBelow = (prefix) => {
+    const b = __nodeAt(prefix).querySelector('rect.body').getBoundingClientRect();
+    const r = __widthRow().getBoundingClientRect();
+    return r.top >= b.bottom && r.top - b.bottom < 12 && Math.abs(r.left - b.left) <= 1;
+  };
+  // 返り値は「その場のメッセージ」。この後のコンパイル結果に上書きされるので先に取る
+  window.__typeWidth = (text) => {
+    const b = document.getElementById('partWidthBox');
+    b.value = text;
+    b.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    return document.getElementById('msg').textContent;
+  };
+  window.__rightClick = (prefix) => {
+    const g = __nodeAt(prefix);
+    const r = g.getBoundingClientRect();
+    g.dispatchEvent(new MouseEvent('contextmenu',
+      { bubbles: true, clientX: r.x + 5, clientY: r.y + 5 }));
+  };
   window.__typeValue = (text) => {
     const b = document.getElementById('renameBox');
     b.value = text;
@@ -1318,6 +1343,84 @@ ok(await js('__bwOf("z4")') === '4', '幅: 部品の 4 ビット出力を受け�
   String(await js('__bwOf("z4")')));
 ok(await js('__bwOf("z1")') === null, '幅: 1 ビット出力を受けた側には出ない',
   String(await js('__bwOf("z1")')));
+
+// ==================================================== 右クリックの下段で幅を打つ
+// ツールバーの「幅」は部品から離れていて打ちにくいので、部品のすぐ下にも出す
+await js('__preset("上下に割って")');
+await sleep(600);
+
+// 名前も幅もある部品 (入力) は 2 段になる
+await js('__rightClick("a")');
+await sleep(200);
+ok(await js('__renameBoxOpen()') === true, '下段: 名前の欄が上段に出る');
+ok(await js('__widthRowOpen()') === true, '下段: 幅の欄が一緒に出る');
+ok(await js('__widthRowValue()') === '8', '下段: いまの幅が入っている', String(await js('__widthRowValue()')));
+ok(await js('__widthRowLabel()') === '幅', '下段: 見出しは「幅」', String(await js('__widthRowLabel()')));
+ok(await js('__widthRowBelow("a")'), '下段: 部品の本体の真下に出る');
+ok(await js('__focusId()') === 'renameBox', '下段: 焦点は上段 (名前) にある', String(await js('__focusId()')));
+
+// Escape で 2 段まとめて消える
+await key('Escape', 'Escape', 27);
+ok(await js('__renameBoxOpen()') === false, '下段: Escape で上段が消える');
+ok(await js('__widthRowOpen()') === false, '下段: Escape で下段も消える');
+
+// 下段に打ち込むと幅が変わる。ツールバーを触らずに済む
+await js('__rightClick("a")');
+await sleep(200);
+const wMsg = await js('__typeWidth("4")');
+ok(wMsg.includes('4 ビット') && wMsg.includes('a'), '下段: 何をしたか言う', wMsg);
+await sleep(600);
+ok(await js('__bwOf("a")') === '4', '下段: 打ち込んだ幅になる', String(await js('__bwOf("a")')));
+ok(await js('__widthRowOpen()') === false, '下段: Enter で閉じる');
+ok((await js('__verilog()')).includes('input  [3:0] a'), '下段: Verilog も変わる', await js('__verilog()'));
+await js('__rightClick("a")');
+await sleep(200);
+await js('__typeWidth("8")');            // 元に戻す
+await sleep(600);
+
+// 上段から下段へマウスで移るとき、上段が焦点を外して確定するのに下段は生き残ること。
+// (下段が自分で焦点を取る作りだと、上段に奪われた瞬間に blur → 確定 → 消滅していた)
+await js('__rightClick("a")');
+await sleep(200);
+await click(await js('(() => { const r = __widthRow().getBoundingClientRect();'
+  + ' return [r.x + r.width - 12, r.y + r.height / 2]; })()'));
+await sleep(150);
+ok(await js('__renameBoxOpen()') === false, '下段: 下段を触ると上段は確定して閉じる');
+ok(await js('__widthRowOpen()') === true, '下段: 下段は残る');
+ok(await js('__focusId()') === 'partWidthBox', '下段: 焦点が下段に移る', String(await js('__focusId()')));
+ok((await js('__nodeText("a")')).startsWith('a'), '下段: 名前は変わっていない', await js('__nodeText("a")'));
+await key('Escape', 'Escape', 27);
+
+// 名前が付けられない部品 (ビット取り出し) は下段だけ出て、そこに焦点が来る
+await js(`(() => {
+  const g = [...document.querySelectorAll('#gNodes .node')].find(x => x.querySelector('text.idx'));
+  const r = g.getBoundingClientRect();
+  g.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: r.x + 5, clientY: r.y + 5 }));
+})()`);
+await sleep(200);
+ok(await js('__renameBoxOpen()') === false, '下段: 名前を付けられない部品では上段が出ない');
+ok(await js('__widthRowOpen()') === true, '下段: 幅の欄だけ出る');
+ok(await js('__focusId()') === 'partWidthBox', '下段: 焦点は下段に来る', String(await js('__focusId()')));
+await js('__typeWidth("2")');
+await sleep(600);
+ok((await js('__verilog()')).includes('a[1:0]'), '下段: 取り出すビット数も下段で変えられる', await js('__verilog()'));
+
+// 連接は「幅」ではなく「本数」
+await js('__rightClick("{ }")');
+await sleep(200);
+ok(await js('__widthRowLabel()') === '本数', '下段: 連接の見出しは「本数」', String(await js('__widthRowLabel()')));
+const pMsg = await js('__typeWidth("3")');
+ok(pMsg.includes('3 入力'), '下段: 連接は入力の本数として扱う', pMsg);
+await sleep(600);
+
+// 幅も名前も無い部品 (ゲート) は理由を出して何も出さない
+await js('__preset("AND")');
+await sleep(600);
+await js('__rightClick("AND")');
+await sleep(200);
+ok(await js('__renameBoxOpen()') === false, '下段: ゲートでは上段が出ない');
+ok(await js('__widthRowOpen()') === false, '下段: ゲートでは下段も出ない');
+ok((await js('__msg()')).includes('繋いだ先から決まります'), '下段: ゲートには理由を出す', await js('__msg()'));
 
 // ------------------------------------------------------------------ 結果
 console.log(`${passed} 件成功, ${failures.length} 件失敗`);
