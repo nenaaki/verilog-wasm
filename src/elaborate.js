@@ -471,12 +471,22 @@ export function elaborate(mod, all = [mod]) {
     return cur;
   }
 
-  function reduceOr(bits, line) {
-    if (bits.length === 0) return CONST0;
+  /**
+   * リダクション: 全ビットを 1 個のゲート列に畳んで 1 ビットにする。
+   * 空なら単位元 (and は 1、or / xor は 0) を返す。
+   */
+  function reduce(bits, op) {
+    if (bits.length === 0) return op === 'and' ? CONST1 : CONST0;
     let acc = bits[0];
-    for (let i = 1; i < bits.length; i++) acc = newGate('or', [acc, bits[i]]);
+    for (let i = 1; i < bits.length; i++) acc = newGate(op, [acc, bits[i]]);
     return acc;
   }
+
+  const reduceOr = (bits) => reduce(bits, 'or');
+
+  // 前置に書いたときのリダクション。~& / ~| は `~` と割れても
+  // 「1 ビットの結果を反転」になるので、ここでは扱わなくてよい。
+  const REDUCE = { '&': 'and', '|': 'or', '^': 'xor' };
 
   // ---- 自己決定幅 (文脈依存幅の 1 段目) --------------------------------------
   //
@@ -510,7 +520,9 @@ export function elaborate(mod, all = [mod]) {
         if (params.has(scope + e.name)) return PARAM_WIDTH;
         return refBits(e).length;        // refBits は純粋 (既存のネット ID を返すだけ)
       case 'un':
-        return e.op === '!' ? 1 : selfWidth(e.a);
+        // 論理否定とリダクションは 1 ビット。残り (~ 単項 -) はオペランドの幅
+        if (e.op === '!' || REDUCE[e.op] || e.op === '~^' || e.op === '^~') return 1;
+        return selfWidth(e.a);
       case 'bin':
         if (e.op === '&&' || e.op === '||') return 1;
         if (e.op === '==' || e.op === '!=' || CMP[e.op]) return 1;
@@ -558,7 +570,14 @@ export function elaborate(mod, all = [mod]) {
           // 論理否定は「全ビット 0 か」なので OR リダクションの反転。結果は 1 ビット。
           // ビットごとに反転する ~ と違うのはここ (~4'b0010 は 4'b1101、!4'b0010 は 0)。
           // 中身は自己決定なので文脈を渡さない。
-          return resize([newGate('not', [reduceOr(evalExpr(e.a), e.line)])], w);
+          return resize([newGate('not', [reduceOr(evalExpr(e.a))])], w);
+        }
+        // リダクションも結果 1 ビット。中身は自己決定
+        if (REDUCE[e.op]) {
+          return resize([reduce(evalExpr(e.a), REDUCE[e.op])], w);
+        }
+        if (e.op === '~^' || e.op === '^~') {
+          return resize([newGate('not', [reduce(evalExpr(e.a), 'xor')])], w);
         }
         const a = evalExpr(e.a, w);        // ~ と単項 - は文脈依存
         if (e.op === '~') return a.map((n) => newGate('not', [n]));
@@ -575,8 +594,8 @@ export function elaborate(mod, all = [mod]) {
           // 両辺を「0 でないか」に潰してからゲート 1 個。
           // 短絡評価は無い (ハードウェアなので両辺とも常に評価される)。式に副作用が
           // 無いので観測できる違いにはならない。
-          const l = reduceOr(evalExpr(e.a), e.line);
-          const r = reduceOr(evalExpr(e.b), e.line);
+          const l = reduceOr(evalExpr(e.a));
+          const r = reduceOr(evalExpr(e.b));
           return resize([newGate(e.op === '&&' ? 'and' : 'or', [l, r])], w);
         }
         if (e.op === '==' || e.op === '!=' || CMP[e.op]) {
@@ -603,12 +622,16 @@ export function elaborate(mod, all = [mod]) {
         const a = evalExpr(e.a, w);
         const b = evalExpr(e.b, w);
         if (e.op === '+' || e.op === '-') return addSub(a, b, e.op);
+        // 中置の ~^ / ^~ はビットごとの XNOR
+        if (e.op === '~^' || e.op === '^~') {
+          return a.map((n, i) => newGate('not', [newGate('xor', [n, b[i]])]));
+        }
         const op = { '&': 'and', '|': 'or', '^': 'xor' }[e.op];
         if (!op) throw new CompileError(`未対応の二項演算子 '${e.op}'`, e.line);
         return a.map((n, i) => newGate(op, [n, b[i]]));
       }
       case 'tern': {
-        const sel = reduceOr(evalExpr(e.sel), e.line);   // 条件は自己決定
+        const sel = reduceOr(evalExpr(e.sel));   // 条件は自己決定
         const a = evalExpr(e.a, w);
         const b = evalExpr(e.b, w);
         return a.map((n, i) => newGate('mux', [sel, n, b[i]]));
@@ -672,7 +695,7 @@ export function elaborate(mod, all = [mod]) {
       }
 
       if (st.type === 'if') {
-        const cond = reduceOr(evalExpr(st.cond), st.line);
+        const cond = reduceOr(evalExpr(st.cond));
         const thenState = runStmts(st.then, new Map(cur));
         const elseState = st.else ? runStmts(st.else, new Map(cur)) : new Map(cur);
         cur = mergeStates(cond, thenState, elseState, cur);
@@ -770,7 +793,7 @@ export function elaborate(mod, all = [mod]) {
 
     return {
       clkName: clkEdge.name,
-      rstCond: reduceOr(evalExpr(st.cond), st.line),
+      rstCond: reduceOr(evalExpr(st.cond)),
       rstStmts: st.then,
       body: st.else ?? [],          // else が無ければ「リセット以外では保持」
     };

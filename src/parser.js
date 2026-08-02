@@ -1,7 +1,8 @@
 // Verilog サブセット → AST
 //
 // 式の優先順位 (低い順):
-//   ?:  ||  &&  |  ^  &  == !=  < <= > >=  << >>  + -  単項 (~ - + !)  primary
+//   ?:  ||  &&  |  ^ ~^ ^~  &  == !=  < <= > >=  << >>  + -
+//   単項 (~ - + ! & | ^ ~^ ^~)  primary
 // これは Verilog 本来の優先順位と一致する。論理演算子 (|| &&) はビット演算より
 // 弱く、等価 (== !=) は関係 (< など) より弱く、関係はシフトより弱く、シフトは
 // 算術より弱い。
@@ -14,6 +15,12 @@ import { lex } from './lexer.js';
 import { CompileError } from './errors.js';
 
 const GATE_PRIMITIVES = new Set(['and', 'or', 'not', 'nand', 'nor', 'xor', 'xnor', 'buf']);
+// module 本体に書けそうで書けないもの。名前を出して断る。こうしないと
+// 「<モジュール名> <インスタンス名>」に見えて、遠いところでエラーになる
+const UNSUPPORTED_ITEMS = new Set([
+  'initial', 'generate', 'endgenerate', 'function', 'task', 'defparam', 'specify',
+  'always_comb', 'always_ff', 'always_latch', 'genvar', 'integer', 'real', 'time',
+]);
 const DIRECTIONS = new Set(['input', 'output']);
 const NET_KINDS = new Set(['wire', 'reg']);
 
@@ -83,14 +90,21 @@ export function parse(src) {
   const parseRel = binaryLevel(['<=', '>=', '<', '>'], parseShift);
   const parseEq = binaryLevel(['==', '!='], parseRel);
   const parseAnd = binaryLevel('&', parseEq);
-  const parseXor = binaryLevel('^', parseAnd);
+  const parseXor = binaryLevel(['^', '~^', '^~'], parseAnd);
   const parseOr = binaryLevel('|', parseXor);
   const parseLogAnd = binaryLevel('&&', parseOr);
   const parseLogOr = binaryLevel('||', parseLogAnd);
 
+  // 前置に置ける演算子。& | ^ ~^ ^~ はリダクション (全ビットを 1 個に畳む)。
+  // 中置にも出てくる記号だが、オペランドが来る位置に現れたら必ずリダクション。
+  // `~&a` `~|a` は `~` と `&` に割れても `~(&a)` になり、結果が 1 ビットなので
+  // NAND / NOR として正しく落ちる (専用トークンは要らない)。
+  const PREFIX = ['~', '-', '!', '&', '|', '^', '~^', '^~'];
+
   function parseUnary() {
-    if (at('~') || at('-') || at('!')) {
-      const t = next();
+    const t = peek();
+    if (t.type === 'punct' && PREFIX.includes(t.value)) {
+      next();
       return { type: 'un', op: t.value, a: parseUnary(), line: t.line };
     }
     if (at('+')) {           // 単項 + は Verilog でも何もしない
@@ -414,6 +428,7 @@ export function parse(src) {
         items.push({ type: 'assign', lhs, rhs, line: aline });
       } else if (v === 'always') items.push(parseAlways());
       else if (GATE_PRIMITIVES.has(v)) items.push(parseGateInst());
+      else if (UNSUPPORTED_ITEMS.has(v)) throw err(`'${v}' は未対応`);
       else if (peek().type === 'ident' && (peek(1).type === 'ident' || peek(1).value === '#')) {
         // <モジュール名> [#( … )] <インスタンス名> ( … ) ;
         items.push(parseModuleInst());

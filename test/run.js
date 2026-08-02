@@ -1085,6 +1085,125 @@ endmodule`;
   eq(cw.get('s5'), 16, '文脈依存幅: 5 ビットなら桁上げが残って 16');
 }
 
+// ---------------------------------------------------------- リダクション演算子
+//
+// 全ビットを 1 個に畳むので、幅が奇数か偶数かで XNOR 系の答えが変わる。
+// そこを外さないように、幅 4 と幅 3 の両方を並べて JS と突き合わせる。
+async function testReduce() {
+  const src = `module red(
+  input [3:0] a,
+  input [2:0] b,
+  output rAnd, output rOr, output rXor,
+  output rNand, output rNor, output rXnor, output rXnorAlt,
+  output odd3, output xnor3,
+  output [3:0] bitXnor, output caretNot,
+  output [7:0] widened, output ofExpr, output single
+);
+  assign rAnd     = &a;
+  assign rOr      = |a;
+  assign rXor     = ^a;
+  assign rNand    = ~&a;
+  assign rNor     = ~|a;
+  assign rXnor    = ~^a;
+  assign rXnorAlt = ^~a;              // ~^ と同じ意味
+  assign odd3     = ^b;               // 奇数幅のパリティ
+  assign xnor3    = ~^b;
+  assign bitXnor  = a ~^ {1'b0, b};   // 中置の XNOR (ビットごと)
+  assign caretNot = a[0] ^ ~b[0];     // ^ ~ が 1 トークンに食われても同じ値
+  assign widened  = &a;               // 結果 1 ビットなのでゼロ拡張される
+  assign ofExpr   = ^(a & 4'h3);      // 式のリダクション
+  assign single   = ^a[0];            // 1 ビットのリダクションは素通し
+endmodule`;
+  const { compiled, wasm, ref } = await bothSims(src);
+
+  const par = (v, n) => {
+    let p = 0;
+    for (let i = 0; i < n; i++) p ^= (v >> i) & 1;
+    return p;
+  };
+
+  let bad = null;
+  for (let a = 0; a < 16 && !bad; a++) {
+    for (let b = 0; b < 8 && !bad; b++) {
+      for (const sim of [wasm, ref]) sim.setInput('a', a).setInput('b', b).eval();
+      const expect = {
+        rAnd: a === 15 ? 1 : 0,
+        rOr: a !== 0 ? 1 : 0,
+        rXor: par(a, 4),
+        rNand: a === 15 ? 0 : 1,
+        rNor: a !== 0 ? 0 : 1,
+        rXnor: 1 - par(a, 4),
+        rXnorAlt: 1 - par(a, 4),
+        odd3: par(b, 3),
+        xnor3: 1 - par(b, 3),
+        bitXnor: (~(a ^ b)) & 15,
+        caretNot: ((a & 1) ^ (~b & 1)) & 1,
+        widened: a === 15 ? 1 : 0,
+        ofExpr: par(a & 3, 4),
+        single: a & 1,
+      };
+      for (const [port, want] of Object.entries(expect)) {
+        for (const sim of [wasm, ref]) {
+          if (Number(sim.get(port)) !== want && !bad) {
+            bad = `${sim.constructor.name} ${port}: a=${a} b=${b} 期待 ${want} / 実際 ${sim.get(port)}`;
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, 'リダクション: 全 16×8 通り × 14 出力が JS と一致', bad ?? '');
+
+  // ~^ と ^~ が同じ回路になる (1 トークンとして扱えている証拠)
+  const wrapped = (body) => `module m(input [3:0] a, output y); assign y = ${body}; endmodule`;
+  eqs(compile(wrapped('~^a')).stats.gates, compile(wrapped('^~a')).stats.gates,
+    'リダクション: ~^ と ^~ が同じ回路になる');
+  // ^(~a) は幅が偶数だと ~^a と違う (別トークンに割れていないことの裏取り)
+  const asOne = await WasmSimulator.create(compile(wrapped('~^a')));
+  const asSplit = await WasmSimulator.create(compile(wrapped('^(~a)')));
+  asOne.setInput('a', 0b0001).eval();
+  asSplit.setInput('a', 0b0001).eval();
+  eq(asOne.get('y'), 0, 'リダクション: ~^4\'b0001 は 0');
+  eq(asSplit.get('y'), 1, 'リダクション: ^(~4\'b0001) は 1 (幅が偶数なので別物)');
+
+  // ゲート数: 4 ビットのリダクションは 3 個、8 ビットなら 7 個
+  const base = compile('module m(input [7:0] a, output y); assign y = a[0]; endmodule');
+  const r4 = compile('module m(input [7:0] a, output y); assign y = ^a[3:0]; endmodule');
+  const r8 = compile('module m(input [7:0] a, output y); assign y = ^a; endmodule');
+  eqs(r4.stats.gates - base.stats.gates, 3, 'リダクション: 4 ビットは xor 3 個',
+    `差分=${r4.stats.gates - base.stats.gates}`);
+  eqs(r8.stats.gates - base.stats.gates, 7, 'リダクション: 8 ビットは xor 7 個',
+    `差分=${r8.stats.gates - base.stats.gates}`);
+
+  // 例題
+  const { all: ps } = await bothSims(example('parity8.v'));
+  for (const sim of ps) {
+    const kind = sim.constructor.name;
+    let pbad = null;
+    for (let d = 0; d < 256; d++) {
+      sim.setInput('d', d).eval();
+      const p = par(d, 8);
+      if (Number(sim.get('odd')) !== p) pbad = `odd: d=${d} 期待 ${p}`;
+      else if (Number(sim.get('even')) !== 1 - p) pbad = `even: d=${d}`;
+      else if (Number(sim.get('allOnes')) !== (d === 255 ? 1 : 0)) pbad = `allOnes: d=${d}`;
+      else if (Number(sim.get('anyOne')) !== (d !== 0 ? 1 : 0)) pbad = `anyOne: d=${d}`;
+      else if (Number(sim.get('withParity')) !== (p << 8 | d)) pbad = `withParity: d=${d}`;
+      if (pbad) break;
+    }
+    ok(!pbad, `${kind} parity8: 全 256 通り一致`, pbad ?? '');
+  }
+
+  // 64 レーン
+  wasm.reset();
+  for (let lane = 0; lane < 64; lane++) wasm.setInputLane('a', lane, lane & 15);
+  wasm.eval();
+  const lanes = wasm.getLanes('rXor');
+  let laneBad = 0;
+  for (let lane = 0; lane < 64; lane++) {
+    if (Number(lanes[lane]) !== par(lane & 15, 4)) laneBad++;
+  }
+  ok(laneBad === 0, 'リダクション: 64 レーンが独立にパリティを出す', `${laneBad} レーン不一致`);
+}
+
 // -------------------------------------------------------------- 論理演算子
 //
 // ビットごとに働く ~ / & / | と混同しやすいので、両方を並べて JS と比べる。
@@ -1850,12 +1969,15 @@ async function testErrors() {
     ['>>> は未対応',
       `module m(input [3:0] a, output [3:0] y); assign y = a >>> 1; endmodule`,
       />>> は未対応/],
-    ['リダクション演算子は未対応',
-      `module m(input [3:0] a, output y); assign y = &a; endmodule`,
-      /式が必要/],
-    ['リダクション ^ も未対応',
-      `module m(input [3:0] a, output y); assign y = ^a; endmodule`,
-      /式が必要/],
+    ['initial は未対応',
+      `module m(output reg y); initial y = 1'b0; endmodule`,
+      /'initial' は未対応/],
+    ['generate は未対応',
+      `module m(input a, output y); generate assign y = ~a; endgenerate endmodule`,
+      /'generate' は未対応/],
+    ['always_comb は未対応',
+      `module m(input a, output reg y); always_comb y = ~a; endmodule`,
+      /'always_comb' は未対応/],
     ['casez は未対応',
       `module m(input clk, input [1:0] s, output reg q);
        always @(posedge clk) casez (s) 2'b00: q <= 1'b1; endcase endmodule`,
@@ -1933,9 +2055,14 @@ function randomDesign(rng, nWires) {
       return `(${expr(depth - 1)} ${lg} ${expr(depth - 1)})`;
     }
     if (r < 0.77) return `(!${expr(depth - 1)})`;
-    if (r < 0.79) return `(${expr(depth - 1)} + ${expr(depth - 1)})`;
-    if (r < 0.84) return `(${expr(depth - 1)} - ${expr(depth - 1)})`;
-    if (r < 0.86) return `(-${expr(depth - 1)})`;
+    if (r < 0.8) {
+      // リダクション。~& / ~| / ~^ も混ぜる
+      const red = ['&', '|', '^', '~&', '~|', '~^'][Math.floor(rng() * 6)];
+      return `(${red}${expr(depth - 1)})`;
+    }
+    if (r < 0.82) return `(${expr(depth - 1)} + ${expr(depth - 1)})`;
+    if (r < 0.85) return `(${expr(depth - 1)} - ${expr(depth - 1)})`;
+    if (r < 0.87) return `(-${expr(depth - 1)})`;
     if (r < 0.9) {
       const cmp = ['==', '!=', '<', '<=', '>', '>='][Math.floor(rng() * 6)];
       return `(${expr(depth - 1)} ${cmp} ${expr(depth - 1)})`;
@@ -2037,7 +2164,7 @@ async function testRandomDiff() {
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
   const seen = {
     'if': 0, 'case': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0,
-    '非同期リセット': 0, '階層': 0, 'parameter': 0,
+    '非同期リセット': 0, '階層': 0, 'parameter': 0, 'リダクション': 0,
   };
 
   for (let d = 0; d < 25 && !mismatch; d++) {
@@ -2051,6 +2178,7 @@ async function testRandomDiff() {
     if (/or posedge rst/.test(src)) seen['非同期リセット']++;
     if (/rndsub s0\(/.test(src)) seen['階層']++;
     if (/rndsub #\(\.SH\(/.test(src)) seen['parameter']++;
+    if (/\((&|\||\^|~&|~\||~\^)[(a-z]/.test(src)) seen['リダクション']++;
     let compiled;
     try {
       compiled = compile(src);
@@ -2567,6 +2695,7 @@ const suites = [
   ['畳み込み / CSE', testFoldCse],
   ['刈り取り', testPrune],
   ['比較器', testCompare],
+  ['リダクション', testReduce],
   ['論理演算子', testLogical],
   ['範囲判定', testWindow],
   ['シフト', testShift],
