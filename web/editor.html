@@ -199,6 +199,9 @@
   <button id="save">保存</button>
   <button id="delSave">保存を削除</button>
   <button id="share">リンクをコピー</button>
+  <button id="dlJson" title="回路を .json ファイルとして書き出す">.json を保存</button>
+  <button id="loadJson" title="書き出した .json ファイルを読み込む">.json を読み込む</button>
+  <input type="file" id="jsonFile" accept=".json,application/json" hidden>
   <button id="dlWasm" title="いまの回路をコンパイルした .wasm を保存">.wasm を保存</button>
   <span class="sep"></span>
   <span class="label">部品にする</span>
@@ -436,6 +439,7 @@ function updateEditUI() {
   $('del').disabled = selection.size === 0;
   $('renameBtn').disabled = selection.size !== 1;
   $('dlWasm').disabled = compiled === null;
+  $('dlJson').disabled = graph.nodes.length === 0;
 }
 
 // ------------------------------------------------------------ 編集操作
@@ -1225,6 +1229,48 @@ $('share').onclick = async () => {
     setMsg(`リンクをコピーしました (${url.length} 文字)`, 'ok');
   } catch {
     setMsg(`クリップボードが使えないので、アドレス欄からコピーしてください:\n${url}`, 'warn');
+  }
+};
+
+// ---- .json の書き出し / 読み込み -------------------------------------------
+//
+// 中身は共有リンクと同じ保存形式 (packCircuit) なので、リンクと相互に行き来できる。
+// 手で開いて読める / diff が取れるように、部品と配線は 1 行ずつ並べる。
+
+function circuitToJson(name) {
+  const c = packCircuit(graph);
+  const rows = (arr) => (arr.length
+    ? `[\n${arr.map((r) => `    ${JSON.stringify(r)}`).join(',\n')}\n  ]`
+    : '[]');
+  return `{\n  "name": ${JSON.stringify(name)},\n`
+    + `  "nodes": ${rows(c.nodes)},\n`
+    + `  "wires": ${rows(c.wires)}\n}\n`;
+}
+
+$('dlJson').onclick = () => {
+  if (graph.nodes.length === 0) { setMsg('書き出す回路がありません', 'warn'); return; }
+  const name = $('cname').value.trim();
+  const file = `${safeName(name, 'circuit')}.json`;
+  saveFile(file, circuitToJson(name), 'application/json');
+  setMsg(`${file} を保存しました `
+    + `(部品 ${graph.nodes.length} 個 / 配線 ${graph.wires.length} 本)`, 'ok');
+};
+
+$('loadJson').onclick = () => $('jsonFile').click();
+
+$('jsonFile').onchange = async () => {
+  const file = $('jsonFile').files[0];
+  if (!file) return;
+  $('jsonFile').value = '';          // 同じファイルをもう一度選んでも change が出るように
+  try {
+    const data = JSON.parse(await file.text());
+    // name は expandCircuit が見ない追加フィールド。あれば名前欄に入れる
+    const name = typeof data.name === 'string' ? data.name.slice(0, 32) : '';
+    await loadGraph(data, '', name);
+    setMsg(`${file.name} を読み込みました `
+      + `(部品 ${graph.nodes.length} 個 / 配線 ${graph.wires.length} 本)`, 'ok');
+  } catch (e) {
+    setMsg(`${file.name} を読み込めませんでした: ${e.message}`, 'err');
   }
 };
 

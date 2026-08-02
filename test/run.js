@@ -2271,6 +2271,34 @@ async function testSaveFormat() {
   ok(!/[+/=]/.test(encodeCircuit(expandCircuit(SAMPLE_CIRCUITS['多数決 (3 入力のうち 2 つ以上が 1)']))),
     '保存形式: URL に置ける文字だけを使う');
 
+  // ---- .json ファイル経由の往復 ----
+  // エディタが書き出す形は packCircuit に name を足しただけ。expandCircuit は
+  // name を見ないので、リンクと .json が相互に行き来できる。
+  for (const [name, c] of Object.entries(SAMPLE_CIRCUITS)) {
+    const g = expandCircuit(c);
+    const text = JSON.stringify({ name, ...packCircuit(g) });
+    eqs(JSON.stringify(expandCircuit(JSON.parse(text))), JSON.stringify(g),
+      `.json: ${name} がファイル経由で往復して一致する`);
+  }
+  // 余分なフィールドがあっても無視される
+  const extra = expandCircuit(JSON.parse(JSON.stringify({
+    name: 'x', note: 'これは無視される', version: 99,
+    ...packCircuit(expandCircuit(SAMPLE_CIRCUITS['AND ゲート'])),
+  })));
+  eq(extra.nodes.length, expandCircuit(SAMPLE_CIRCUITS['AND ゲート']).nodes.length,
+    '.json: 知らないフィールドは無視される');
+  // 回路部品を含む回路もファイル経由で往復する (中身が入れ子で入っている)
+  const withBlock = {
+    nodes: [
+      [1, 'in', 0, 0, 0, 'a'],
+      [2, 'block', 100, 0, 0, 'part', { ref: 'and2', def: packCircuit(expandCircuit(SAMPLE_CIRCUITS['AND ゲート'])) }],
+    ],
+    wires: [],
+  };
+  const blockRound = expandCircuit(JSON.parse(JSON.stringify({ name: 'b', ...withBlock })));
+  eqs(blockRound.nodes[1].type, 'block', '.json: 回路部品も往復する');
+  ok(blockRound.nodes[1]._ports !== undefined, '.json: 回路部品の端子が復元される');
+
   // 名前と値も残る
   const withName = expandCircuit(packCircuit({
     nodes: [{ id: 3, type: 'in', x: 10, y: 20, value: 1, name: 'sel' },
