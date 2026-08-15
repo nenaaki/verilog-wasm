@@ -23,12 +23,13 @@ const cell = (frame, row) => {
 /**
  * @param {Array} frames 列。[{ label, v: { 信号名: 0|1|null } }]
  * @param {Array} rows   行。[{ name, kind }] kind は in / reg / block / out / gate
- * @param {{perClock: boolean, ready: boolean, cursor: ?number}} opts
+ * @param {{perClock: boolean, ready: boolean, cursor: ?number, sel: ?{from,to}}} opts
  *   perClock … 1 列 = 1 クロックか (組合せ回路では入力の変更回数)
  *   ready    … コンパイルが通っているか (空のときの案内を出し分ける)
  *   cursor   … 値を読む列。null ならカーソルなし
+ *   sel      … ドラッグで選んだ区間 (両端を含む)。null なら選択なし
  */
-export function renderWave(frames, rows, { perClock, ready, cursor = null }) {
+export function renderWave(frames, rows, { perClock, ready, cursor = null, sel = null }) {
   const names = $('waveNames'), svg = $('waveSvg');
   names.textContent = svg.textContent = '';
   const cols = frames.length;
@@ -38,6 +39,8 @@ export function renderWave(frames, rows, { perClock, ready, cursor = null }) {
     ? `${cols} 列 / ${rows.length} 信号`
       + `${perClock ? '（1 列 = 1 クロック）' : '（1 列 = 入力を変えた回数）'}`
       + `${cur === null ? '' : `　カーソル: ${frames[cur].label}`}`
+      + `${sel === null ? '' : `　選択: ${frames[sel.from].label}〜${frames[sel.to].label}`
+        + `（${sel.to - sel.from + 1} 列）`}`
     : '';
 
   const h = WAVE.top + rows.length * WAVE.rowH + 6;
@@ -65,6 +68,15 @@ export function renderWave(frames, rows, { perClock, ready, cursor = null }) {
       }, names).textContent = cell(frames[cur], r);
     }
   });
+
+  // 選んだ区間の帯。カーソルより先に描いて、さらに背面に置く
+  if (sel !== null) {
+    el('rect', {
+      class: 'selband', x: sel.from * WAVE.colW, y: WAVE.top - 8,
+      width: (sel.to - sel.from + 1) * WAVE.colW, height: h - WAVE.top + 2,
+      'data-from': sel.from, 'data-to': sel.to,
+    }, svg);
+  }
 
   // カーソルの列。波形より先に描いて背面に置く
   if (cur !== null) {
@@ -124,6 +136,6 @@ export function renderWave(frames, rows, { perClock, ready, cursor = null }) {
     }, svg);
   });
 
-  // カーソルを置いているあいだは右端に飛ばさない (読んでいる列が逃げるので)
-  if (cur === null) $('waveScroll').scrollLeft = $('waveScroll').scrollWidth;
+  // カーソルや選択があるあいだは右端に飛ばさない (読んでいる列が逃げるので)
+  if (cur === null && sel === null) $('waveScroll').scrollLeft = $('waveScroll').scrollWidth;
 }

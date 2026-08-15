@@ -113,6 +113,10 @@
   table#truth .gap { border-top: 0; border-bottom: 0; background: var(--panel); }
   table#truth tr.now td { background: #223044; }        /* 今の入力・メモリの行 */
   table#truth tr.now td.gap { background: #223044; }
+  /* 区間の表。値が変わった所と、読めなかった所を目で追えるようにする */
+  table#truth td.cyc { color: var(--dim); }
+  table#truth td.unknown { color: #4b5262; font-style: italic; }
+  table#truth td.changed { border-left-color: var(--blue); font-weight: 600; }
 
   /* --- 波形パネル --- */
   #wavePanel { display: grid; grid-template-rows: auto 1fr; min-height: 0; background: #0c0e12; }
@@ -135,6 +139,9 @@
   /* カーソル位置の値。名前より目立たせる */
   #waveNames text.val { fill: var(--fg); text-anchor: end; font-size: 11.5px; }
   #waveSvg .cursor { fill: #5aa2ff; fill-opacity: .14; stroke: var(--blue); stroke-width: 1; }
+  /* ドラッグで選んだ区間。カーソルより薄くして、重なっても両方読めるようにする */
+  #waveSvg .selband { fill: #5aa2ff; fill-opacity: .07; stroke: #3d6ea8; stroke-width: 1;
+    stroke-dasharray: 3 2; }
   #waveSvg { cursor: crosshair; }
   #waveSvg .lane { stroke: #262b36; stroke-width: 1; }
   #waveSvg .cyc { font-family: var(--mono); font-size: 9.5px; fill: #6b7382; text-anchor: middle; }
@@ -353,7 +360,9 @@ import {
 import { readClip, readSaved, readWork, writeClip, writeSaved, writeWork } from './storage.js';
 import { saveFile, safeName } from './download.js';
 import { WAVE, renderWave as drawWave } from './wave.js';
-import { MAX_TABLE_BITS, renderTable as drawTable } from './table.js';
+import {
+  MAX_TABLE_BITS, renderRangeTable as drawRangeTable, renderTable as drawTable,
+} from './table.js';
 
 const svg = $('svg');
 
@@ -1218,7 +1227,18 @@ function sample(append) {
   const label = hasRegs() ? cycles : frames.length;
   if (append || frames.length === 0) frames.push({ label, v });
   else frames[frames.length - 1] = { label: frames[frames.length - 1].label, v };
-  if (frames.length > WAVE.max) frames.shift();
+  // 上限を超えたら前から落とす。列が 1 つずれるので、列番号で覚えているもの
+  // (カーソルと選択区間) も一緒にずらす — でないと同じ場所を指しているつもりで
+  // 別の列を読むことになる
+  if (frames.length > WAVE.max) {
+    frames.shift();
+    if (waveCursor !== null) waveCursor = waveCursor > 0 ? waveCursor - 1 : null;
+    if (waveSel !== null) {
+      waveSel = waveSel.from > 0
+        ? { from: waveSel.from - 1, to: waveSel.to - 1 }
+        : null;                        // 先頭が流れていったら区間ごと外す
+    }
+  }
 }
 
 /** 波形に出す信号。既定は入力・メモリ・出力だけ (ゲートは数が多いので任意) */
@@ -1245,12 +1265,19 @@ function waveRows() {
 // クロックを打つと列が増え、上限を超えると frames が前から落ちるので、
 // 範囲外になったら末尾に寄せる (何も無くなったら外す)。
 let waveCursor = null;
+// ドラッグで選んだ区間 { from, to } (両端を含む) か null。
+// 選んでいるあいだは右下の表が真理値表ではなく「その区間の表」になる。
+let waveSel = null;
 
 function renderWave() {
   if (waveCursor !== null && waveCursor >= frames.length) {
     waveCursor = frames.length ? frames.length - 1 : null;
   }
-  drawWave(frames, waveRows(), { perClock: hasRegs(), ready: !!sim, cursor: waveCursor });
+  // 列が前から落ちると添字がずれるので、範囲に収まらない選択は外す
+  if (waveSel !== null && waveSel.to >= frames.length) waveSel = null;
+  drawWave(frames, waveRows(), {
+    perClock: hasRegs(), ready: !!sim, cursor: waveCursor, sel: waveSel,
+  });
 }
 
 /** 波形の列を指す。範囲外なら何もしない。同じ列をもう一度指すと外す */
@@ -1261,6 +1288,13 @@ function setWaveCursor(col, toggle = false) {
   renderWave();
 }
 
+/** 区間を選ぶ / 外す (null で外す)。表の中身が入れ替わるので表も描き直す */
+function setWaveSel(sel) {
+  waveSel = sel;
+  renderWave();
+  renderTable();
+}
+
 // ------------------------------------------------ 真理値表 / 状態遷移表
 // どちらも 64 レーンのビットスライスで作る。全パターンをレーンに並べて
 // eval() を 1 回 (メモリがあれば step 相当を 1 回) 呼ぶだけで表が埋まる。
@@ -1268,6 +1302,12 @@ function setWaveCursor(col, toggle = false) {
 // メモリがある回路では「入力 + 現在の Q」を並べて、出力と次の Q を読む。
 // 出力は commit の前・次の Q は commit の後に読む必要があるので順番が要る。
 function renderTable() {
+  // 区間を選んでいるあいだは、あり得る入力の全通しではなく「実際に起きたこと」を出す。
+  // こちらはシミュレータを触らないので、レーンも状態も汚さない。
+  if (waveSel !== null && waveSel.to < frames.length) {
+    drawRangeTable(frames, waveRows(), waveSel, waveCursor);
+    return;
+  }
   drawTable(plan, sim, (nodeId) => (byId(nodeId)?.value ? 1 : 0));
 }
 
@@ -1779,6 +1819,7 @@ window.addEventListener('keydown', (e) => {
   }
 
   if (e.key === 'Escape') {
+    if (waveSel !== null) setWaveSel(null);      // 区間を外すと表は真理値表に戻る
     if (waveCursor !== null) { waveCursor = null; renderWave(); }
     armed = null; selection.clear(); render(); updateEditUI();
   }
@@ -1966,14 +2007,47 @@ $('renameBtn').onclick = () => {
 };
 $('clock').onclick = () => clockOnce(1);
 $('clockN').onclick = () => clockOnce(clamp(Number($('nclk').value) || 1, 1, 256));
-$('waveClear').onclick = () => { frames = []; waveCursor = null; evaluate('append'); };
+$('waveClear').onclick = () => {
+  frames = []; waveCursor = null; waveSel = null;
+  evaluate('append');
+};
 
-// 波形をクリックした列の値を読む。もう一度同じ列を押すとカーソルを外す
-$('waveSvg').addEventListener('pointerdown', (e) => {
+// 波形の操作は 2 つ。
+//   クリック          … その列にカーソルを置く (同じ列をもう一度押すと外す)
+//   横にドラッグ      … 区間を選ぶ。右下の表がその区間の表に変わる
+// どちらも押した時点では区別が付かないので、離した列が同じかどうかで決める。
+const waveCol = (clientX) => {
   const r = $('waveSvg').getBoundingClientRect();
-  setWaveCursor(Math.floor((e.clientX - r.left) / WAVE.colW), true);
+  return clamp(Math.floor((clientX - r.left) / WAVE.colW), 0, Math.max(0, frames.length - 1));
+};
+
+let waveDrag = null;              // ドラッグの始点の列。押していないあいだは null
+
+$('waveSvg').addEventListener('pointerdown', (e) => {
+  if (frames.length === 0) return;
+  waveDrag = waveCol(e.clientX);
+  $('waveSvg').setPointerCapture(e.pointerId);
 });
-$('waveGates').onchange = renderWave;
+
+$('waveSvg').addEventListener('pointermove', (e) => {
+  if (waveDrag === null) return;
+  const to = waveCol(e.clientX);
+  // 1 列のあいだは「まだクリックかもしれない」ので帯を出さない
+  if (to === waveDrag) { if (waveSel !== null) setWaveSel(null); return; }
+  setWaveSel({ from: Math.min(waveDrag, to), to: Math.max(waveDrag, to) });
+});
+
+$('waveSvg').addEventListener('pointerup', (e) => {
+  if (waveDrag === null) return;
+  const from = waveDrag;
+  waveDrag = null;
+  $('waveSvg').releasePointerCapture(e.pointerId);
+  if (waveCol(e.clientX) !== from) return;      // 区間はドラッグ中に確定済み
+  setWaveSel(null);                             // 掴み直しは選択を外してカーソルに戻す
+  setWaveCursor(from, true);
+});
+// 出す信号が変わると区間の表の列も変わるので、表も描き直す
+$('waveGates').onchange = () => { renderWave(); renderTable(); };
 $('zero').onclick = () => {
   if (!sim) return;
   sim.reset();                     // メモリを 0 に戻す (入力は evaluate が書き戻す)

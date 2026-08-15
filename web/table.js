@@ -13,6 +13,11 @@ import { LANES } from '../src/signals.js';
 
 export const MAX_TABLE_BITS = 6;   // 2^6 = 64 = レーン数。入力 + メモリの合計ビット数
 
+// 幅 1 は 0/1、広いときは 16 進 (画面の部品や波形の見せ方と揃える)
+const fmt = (v, w) => (w <= 1 ? String(v ? 1 : 0)
+  : Number(v).toString(16).toUpperCase().padStart(Math.ceil(w / 4), '0'));
+const label = (name, w) => (w > 1 ? `${name}[${w - 1}:0]` : name);
+
 /**
  * @param {object} plan  toVerilog の結果
  * @param {object} sim   WasmSimulator (未コンパイルなら null)
@@ -61,11 +66,6 @@ export function renderTable(plan, sim, inputValue) {
     nextCols = regs.map((r) => sim.getLanes(r.name));         // クロック後の Q
   }
 
-  // 幅 1 は 0/1、広いときは 16 進 (画面の部品の見せ方と揃える)
-  const fmt = (v, w) => (w <= 1 ? String(v ? 1 : 0)
-    : v.toString(16).toUpperCase().padStart(Math.ceil(w / 4), '0'));
-  const label = (name, w) => (w > 1 ? `${name}[${w - 1}:0]` : name);
-
   const head = hel('tr', t);
   for (const d of dims) hel('th', head).textContent = label(d.name, d.w);
   hel('th', head, 'gap');
@@ -102,6 +102,54 @@ export function renderTable(plan, sim, inputValue) {
   regs.forEach((r, i) => sim.setInput(r.name, saved[i]));
   for (const i of plan.inputs) sim.setInput(i.name, inputValue(i.node));
   sim.eval();
+}
+
+/**
+ * 波形で選んだ区間を表にする。真理値表と違って**シミュレータを触らない** ――
+ * 既に記録してある列 (frames) を並べ替えて出すだけなので、レーンも状態も汚さない。
+ *
+ * 真理値表が「あり得る入力を全部」なのに対し、こちらは「実際に起きたこと」を出す。
+ * カウンタや FSM のように、履歴そのものを読みたいときはこちらが要る。
+ *
+ * @param {Array} frames 波形の列
+ * @param {Array} rows   波形に出している信号 (そのまま表の列になる)
+ * @param {{from: number, to: number}} sel 選んだ区間 (両端を含む)
+ * @param {?number} cursor カーソルの列。区間の中にあればその行に印を付ける
+ */
+export function renderRangeTable(frames, rows, sel, cursor) {
+  const t = $('truth');
+  t.textContent = '';
+  const n = sel.to - sel.from + 1;
+  $('tableHead').textContent =
+    `波形の区間（${frames[sel.from].label} 〜 ${frames[sel.to].label} の ${n} 列）`;
+
+  if (rows.length === 0) {
+    note(t, '波形に出す信号がありません');
+    return;
+  }
+
+  const head = hel('tr', t);
+  hel('th', head).textContent = '列';
+  hel('th', head, 'gap');
+  for (const r of rows) hel('th', head).textContent = label(r.name, r.width ?? 1);
+
+  let curRow = null;
+  for (let c = sel.from; c <= sel.to; c++) {
+    const tr = hel('tr', t, c === cursor ? 'now' : '');
+    if (c === cursor) curRow = tr;
+    hel('td', tr, 'cyc').textContent = frames[c].label;
+    hel('td', tr, 'gap');
+    for (const r of rows) {
+      const v = frames[c].v[r.name];
+      const unknown = v === null || v === undefined;
+      // 直前の列から変わった所は目で追えるように印を付ける
+      const prev = c > sel.from ? frames[c - 1].v[r.name] : v;
+      const cls = unknown ? 'unknown' : v ? 'one' : 'zero';
+      hel('td', tr, `${cls}${c > sel.from && prev !== v ? ' changed' : ''}`).textContent =
+        unknown ? 'x' : fmt(v, r.width ?? 1);
+    }
+  }
+  curRow?.scrollIntoView({ block: 'nearest' });
 }
 
 function note(table, text) {

@@ -317,6 +317,13 @@ const HELPERS = `
     return [r.x + c * 26 + 13, r.y + r.height / 2];
   };
   window.__waveH = () => document.getElementById('wavePanel').getBoundingClientRect().height;
+  // ドラッグで選んだ区間。'from,to' か '' (選んでいない)
+  window.__waveSel = () => {
+    const r = document.querySelector('#waveSvg rect.selband');
+    return r ? r.dataset.from + ',' + r.dataset.to : '';
+  };
+  // 区間の表で、値が変わった所に付く印
+  window.__changed = () => [...document.querySelectorAll('#truth td.changed')].length;
   // 表示範囲とパネル
   window.__viewBox = () => document.getElementById('svg').getAttribute('viewBox');
   window.__viewW = () => Number(__viewBox().split(' ')[2]);
@@ -650,9 +657,57 @@ ok(await js('__waveVals()') === 'q=1,out=1,n2=0', 'カーソル: 内部の配線
 await js('document.getElementById("waveGates").click()');
 await sleep(200);
 
+// ---- 区間の選択 (ドラッグした範囲だけを表にする) ----
+//
+// 真理値表が「あり得る入力の全通し」なのに対し、区間の表は「実際に起きたこと」。
+// トグルの回路なので q は 010101… で、区間を切り出すとそのまま列に並ぶはず。
+ok(await js('__waveSel()') === '', '区間: 最初は選ばれていない');
+ok((await js('__tableHead()')).includes('状態遷移表'), '区間: 選ぶ前は状態遷移表', await js('__tableHead()'));
+
+await dragTo(await js('__waveColPoint(2)'), await js('__waveColPoint(5)'));
+ok(await js('__waveSel()') === '2,5', '区間: ドラッグした範囲に帯が出る', await js('__waveSel()'));
+ok((await js('__tableHead()')).includes('区間'), '区間: 表が区間の表に変わる', await js('__tableHead()'));
+ok((await js('__truth()')).split('/').length === 1 + 4, '区間: 選んだ 4 列ぶんの行になる', await js('__truth()'));
+// 見出しは「列 / (すきま) / 信号名…」、各行は「列番号 / (すきま) / 値…」。
+// q は偶数列が 0 なので 2:00 3:11 4:00 5:11 と並ぶ
+ok(await js('__truth()') === '列qout/200/311/400/511',
+  '区間: 各列の値がそのまま並ぶ', await js('__truth()'));
+// q も out も毎列変わるので、先頭の行を除く 3 行 × 2 信号に印が付く
+ok(await js('__changed()') === 6, '区間: 前の列から変わった所に印が付く', String(await js('__changed()')));
+
+// 右から左へドラッグしても同じ区間になる
+await dragTo(await js('__waveColPoint(5)'), await js('__waveColPoint(2)'));
+ok(await js('__waveSel()') === '2,5', '区間: 右から左へドラッグしても同じ', await js('__waveSel()'));
+
+// 内部の配線を出すと区間の表の列も増える
+await js('document.getElementById("waveGates").click()');
+await sleep(200);
+ok(await js('__truth()') === '列qoutn2/2001/3110/4001/5110',
+  '区間: 出す信号を増やすと列も増える', await js('__truth()'));
+await js('document.getElementById("waveGates").click()');
+await sleep(200);
+
+// 1 列だけ押すと区間が外れてカーソルに戻る (直前のカーソルは 3 列目にあるので別の列を押す)
+await click(await js('__waveColPoint(5)'));
+ok(await js('__waveSel()') === '', '区間: 1 列を押すと区間が外れてカーソルになる', await js('__waveSel()'));
+ok(await js('__waveCursor()') === 5, '区間: 押した列にカーソルが移る', String(await js('__waveCursor()')));
+ok((await js('__tableHead()')).includes('状態遷移表'), '区間: 外すと表も元に戻る', await js('__tableHead()'));
+
+// カーソルが区間の中にあると、その行に印が付く
+await click(await js('__waveColPoint(3)'));
+await dragTo(await js('__waveColPoint(1)'), await js('__waveColPoint(4)'));
+ok(await js('__waveCursor()') === 3, '区間: ドラッグしてもカーソルは動かない', String(await js('__waveCursor()')));
+ok(await js('__nowRow()') === 2, '区間: 区間の中のカーソルの行に印が付く', String(await js('__nowRow()')));
+
+await key('Escape', 'Escape', 27);
+ok(await js('__waveSel()') === '', '区間: Escape で外れる', await js('__waveSel()'));
+ok((await js('__tableHead()')).includes('状態遷移表'), '区間: Escape で表も戻る', await js('__tableHead()'));
+
+
 await click(await js('__btn("waveClear")'));
 ok(await js('__wave("q")') === '1', '波形: クリアすると今の値だけになる', await js('__wave("q")'));
 ok(await js('__waveCursor()') === -1, 'カーソル: 波形をクリアすると外れる', String(await js('__waveCursor()')));
+ok(await js('__waveSel()') === '', '区間: 波形をクリアすると外れる', await js('__waveSel()'));
 
 const wh0 = await js('__waveH()');
 const splitW = await js('__btn("splitW")');
@@ -663,6 +718,19 @@ ok(await js('__waveH()') - wh0 > 60, '波形: 区切りをつまんで高くで�
 await click(await js('__btn("zero")'));
 ok(await js('__memText()') === 'q0', 'クリア: メモリが 0 に戻る', await js('__memText()'));
 ok(await js('__cyc()') === 'cyc=0', 'クリア: カウンタも戻る', await js('__cyc()'));
+
+// 区間の表はバスも扱う。波形と同じく 16 進で、4 ビットまとめて反転するので 0 → F → 0 …
+await js('__preset("4 ビットメモリのトグル (バス)")');
+await sleep(700);
+await js('document.getElementById("nclk").value = 5');
+await click(await js('__btn("clockN")'));
+await sleep(400);
+await dragTo(await js('__waveColPoint(1)'), await js('__waveColPoint(4)'));
+ok(await js('__waveSel()') === '1,4', '区間: バスの回路でも選べる', await js('__waveSel()'));
+ok(await js('__truth()') === '列q[3:0]out[3:0]/1FF/200/3FF/400',
+  '区間: バスは 16 進で出る', await js('__truth()'));
+ok(await js('__changed()') === 6, '区間: バスも変わった所に印が付く', String(await js('__changed()')));
+await key('Escape', 'Escape', 27);
 
 // ======================================== 書き込みイネーブル付きメモリ (保持)
 await js('__preset("イネーブル")');
