@@ -204,6 +204,11 @@ export function emitWasm(netlist, order, layout) {
     [evalBody, commitBody, stepBody, runBody].map((b) => [...uleb(b.length), ...b]),
   ));
 
+  // initial を書いた回路だけデータセクションが付く。これでモジュール単体が
+  // 初期状態を運ぶので、instantiate しただけで正しい値から始まる (他のホストでも)。
+  // 何も書いていない回路のバイト列はこれまでと 1 バイトも変わらない。
+  const dataSec = layout.initWords.length ? section(11, vec(initSegments(layout))) : [];
+
   return new Uint8Array([
     0x00, 0x61, 0x73, 0x6d, // \0asm
     0x01, 0x00, 0x00, 0x00, // version 1
@@ -212,5 +217,33 @@ export function emitWasm(netlist, order, layout) {
     ...memSec,
     ...exportSec,
     ...codeSec,
+    ...dataSec,
   ]);
+}
+
+/**
+ * 初期状態のデータセグメント。1 個のセグメントは
+ *   0x00 (memory 0 に置く) + オフセット式 (i32.const N / end) + 長さ付きバイト列。
+ * 続きのスロットは 1 個にまとめる ―― セグメントの前置きだけで 12 バイトほどあるので、
+ * 32 ビットのレジスタを 1 ビットずつ出すと本体より前置きの方が大きくなる。
+ */
+function initSegments(layout) {
+  const words = [...layout.initWords].sort((a, b) => a[0] - b[0]);
+  const runs = [];
+  for (const [off, value] of words) {
+    const last = runs[runs.length - 1];
+    if (last && off === last.off + last.bytes.length) last.bytes.push(...leBytes(value));
+    else runs.push({ off, bytes: leBytes(value) });
+  }
+  return runs.map((r) => [
+    0x00, OP.i32_const, ...sleb(r.off), OP.end, ...uleb(r.bytes.length), ...r.bytes,
+  ]);
+}
+
+/** i64 をリトルエンディアンの 8 バイトに */
+function leBytes(value) {
+  const out = [];
+  let v = BigInt(value);
+  for (let i = 0; i < 8; i++) { out.push(Number(v & 0xffn)); v >>= 8n; }
+  return out;
 }

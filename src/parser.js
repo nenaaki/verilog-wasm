@@ -18,7 +18,7 @@ const GATE_PRIMITIVES = new Set(['and', 'or', 'not', 'nand', 'nor', 'xor', 'xnor
 // module 本体に書けそうで書けないもの。名前を出して断る。こうしないと
 // 「<モジュール名> <インスタンス名>」に見えて、遠いところでエラーになる
 const UNSUPPORTED_ITEMS = new Set([
-  'initial', 'task', 'defparam', 'specify',
+  'task', 'defparam', 'specify',
   'always_comb', 'always_ff', 'always_latch', 'real', 'time',
 ]);
 const DIRECTIONS = new Set(['input', 'output']);
@@ -488,6 +488,16 @@ export function parse(src) {
     return { type: 'for', name, init, cond, step, body: parseStmtBlock(ctx), line };
   }
 
+  /**
+   * initial。この処理系は時間を持たない cycle-based なので、手続きとしては走らせない。
+   * 合成できる形 ―― **レジスタの電源投入時の値** ―― として読み、定数の代入だけを受ける。
+   * それ以外 (if / case / 信号を読む右辺) は elaborate 側で名指しで断る。
+   */
+  function parseInitial() {
+    const line = expect('initial').line;
+    return { type: 'initial', stmts: parseStmtBlock('initial'), line };
+  }
+
   /** integer の宣言。信号ではなく「elaborate 時の整数」= for のループ変数になる */
   function parseIntDecl() {
     const line = expect('integer').line;
@@ -729,6 +739,7 @@ export function parse(src) {
       items.push({ type: 'assign', lhs, rhs, line: aline });
     } else if (v === 'always') items.push(parseAlways());
     else if (v === 'integer') items.push(parseIntDecl());
+    else if (v === 'initial') items.push(parseInitial());
     else if (v === 'genvar') items.push(parseGenvarDecl());
     else if (v === 'function') {
       if (!params) throw err('generate の中の function は未対応 (module の直下で宣言してください)');
@@ -739,7 +750,7 @@ export function parse(src) {
       // <モジュール名> [#( … )] <インスタンス名> ( … ) ;
       items.push(parseModuleInst());
     } else if (peek().type === 'ident') {
-      throw err(`'${v}' は未対応 (always_comb・initial などは未実装)`);
+      throw err(`'${v}' は未対応 (always_comb・always_ff などは未実装)`);
     } else throw err(`予期しないトークン '${v}'`);
   }
 

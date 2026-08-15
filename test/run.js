@@ -377,6 +377,119 @@ endmodule`;
   }
 }
 
+// ------------------------------------------------------------------ initial
+//
+// initial は「電源投入時のレジスタの値」として読む。値そのものより、
+// **どこから始まっても同じ状態になる**ことが本題:
+//   instantiate しただけ / reset() のあと / 生バイト列を他所で読んだとき
+async function testInitial() {
+  const src = `module seeded(input clk, output reg [7:0] q, output reg [3:0] r, output reg f);
+    initial q = 8'hA5;
+    initial r = 4'h3;
+    initial f = 1'b1;
+    always @(posedge clk) begin
+      q <= q + 1;
+      r <= r - 1;
+      f <= ~f;
+    end
+  endmodule`;
+  const { compiled, wasm, ref, all } = await bothSims(src);
+
+  // 1. instantiate / new しただけで初期値から始まる (reset を呼ばずに)
+  for (const sim of all) {
+    eq(sim.get('q'), 0xa5, `initial: ${sim.constructor.name} は最初から初期値`);
+    eq(sim.get('r'), 3, `initial: ${sim.constructor.name} の 2 本目`);
+    eq(sim.get('f'), 1, `initial: ${sim.constructor.name} の 1 ビット`);
+  }
+
+  // 2. 回してから reset() で戻る
+  for (const sim of all) {
+    sim.run(5);
+    eq(sim.get('q'), 0xaa, 'initial: 5 クロック回ると進む');
+    sim.reset();
+    eq(sim.get('q'), 0xa5, 'initial: reset() は 0 ではなく初期値に戻す');
+    eq(sim.get('r'), 3, 'initial: reset() は全部戻す');
+  }
+
+  // 3. 生の .wasm を直に instantiate しても同じ ―― モジュールが初期状態を運ぶ。
+  //    シミュレータのラッパを通さないので、他のホストから読んでも成り立つ性質
+  const { instance } = await WebAssembly.instantiate(compiled.bytes, {});
+  const mem = new BigInt64Array(instance.exports.memory.buffer);
+  const qSig = compiled.layout.signalTable.find((s) => s.name === 'q');
+  let raw = 0;
+  qSig.offsets.forEach((off, b) => { if (mem[off >> 3] & 1n) raw |= 1 << b; });
+  eqs(raw, 0xa5, 'initial: 生の .wasm を instantiate しただけで初期値が入っている');
+
+  // 4. initial を書かなければバイト列は今までどおり (データセクションが付かない)
+  const plain = compile(`module m(input clk, output reg [7:0] q);
+    always @(posedge clk) q <= q + 1; endmodule`);
+  const withInit = compile(`module m(input clk, output reg [7:0] q);
+    initial q = 8'h00;
+    always @(posedge clk) q <= q + 1; endmodule`);
+  eqs(withInit.bytes.length, plain.bytes.length,
+    'initial: 値が 0 ならデータセクションは付かない');
+  eqs(withInit.layout.initWords.length, 0, 'initial: 0 のビットは初期状態に出さない');
+
+  // 5. 階層と generate の中でも効く (完全修飾名でレジスタを引くため)
+  const hier = await bothSims(`module cell #(parameter S = 1) (input clk, output reg [3:0] v);
+    initial v = S;
+    always @(posedge clk) v <= v + 1;
+  endmodule
+  module top(input clk, output [3:0] a, output [3:0] b, output [3:0] c);
+    cell #(.S(4'h7)) u0 (.clk(clk), .v(a));
+    genvar i;
+    for (i = 0; i < 2; i = i + 1) begin : g
+      if (i == 0) cell #(.S(i + 1)) u (.clk(clk), .v(b));
+      else        cell #(.S(i + 1)) u (.clk(clk), .v(c));
+    end
+  endmodule`, 'top');
+  for (const sim of hier.all) {
+    // 子の Q は初期値を持っているが、top の出力ポートはその下流の組合せ配線なので
+    // eval() を 1 回通すまで追いつかない (レジスタ下流の出力と同じ事情)
+    sim.eval();
+    eq(sim.get('a'), 7, 'initial: 子 module の中の initial が効く');
+    eq(sim.get('b'), 1, 'initial: generate 0 段目の初期値');
+    eq(sim.get('c'), 2, 'initial: generate 1 段目は別の値になる');
+  }
+
+  // 6. LFSR が種から周期 255 で回る (README の例が --set 無しで動くこと)
+  const lfsr = await bothSims(example('lfsr8.v'));
+  for (const sim of lfsr.all) {
+    eq(sim.get('q'), 1, `initial: ${sim.constructor.name} の LFSR が種から始まる`);
+    sim.run(255);
+    eq(sim.get('q'), 1, `initial: ${sim.constructor.name} の LFSR は 255 で一周する`);
+  }
+  lfsr.wasm.reset();
+  lfsr.wasm.run(254);
+  ok(Number(lfsr.wasm.get('q')) !== 1, 'initial: 254 クロックでは戻らない',
+    String(lfsr.wasm.get('q')));
+
+  // 7. 部分代入でビットごとに置ける
+  const part = await bothSims(`module p(input clk, output reg [7:0] q);
+    initial q[3:0] = 4'hC;
+    initial q[7:4] = 4'h3;
+    always @(posedge clk) q <= q + 1;
+  endmodule`);
+  for (const sim of part.all) eq(sim.get('q'), 0x3c, 'initial: 部分代入でビットを分けて置ける');
+
+  // 8. 非同期リセットの値とは別物 (initial は電源投入時、rst はいつでも)
+  const rst = await bothSims(`module r(input clk, input rstn, output reg [3:0] q);
+    initial q = 4'h9;
+    always @(posedge clk or negedge rstn)
+      if (!rstn) q <= 4'h0;
+      else q <= q + 1;
+  endmodule`);
+  for (const sim of rst.all) {
+    sim.setInput('rstn', 1);
+    eq(sim.get('q'), 9, 'initial: リセットを当てるまでは initial の値');
+    sim.setInput('rstn', 0).eval();
+    eq(sim.get('q'), 0, 'initial: リセットを当てると rst の値になる');
+    sim.reset();
+    sim.setInput('rstn', 1);
+    eq(sim.get('q'), 9, 'initial: reset() は initial の値に戻す');
+  }
+}
+
 // ------------------------------------------------------------------ 階層参照
 //
 // 名前はもともと完全修飾名の平坦な Map で持っているので、解決側は既にできている。
@@ -3047,9 +3160,32 @@ async function testErrors() {
     ['システム関数は名前を出して断る',
       `module m(output [7:0] y); assign y = $clog2(8); endmodule`,
       /\$clog2 は未対応 \(システム関数/],
-    ['initial は未対応',
+    // initial — レジスタの電源投入時の値としてだけ受ける
+    ['initial の対象がレジスタでない',
       `module m(output reg y); initial y = 1'b0; endmodule`,
-      /'initial' は未対応/],
+      /'y' に初期値を書いたが、レジスタではない/],
+    ['initial の対象が組合せの reg',
+      `module m(input a, output reg y); initial y = 1'b0; always @(*) y = ~a; endmodule`,
+      /'y' に初期値を書いたが、レジスタではない/],
+    ['initial の右辺が信号',
+      `module m(input clk, input d, output reg q);
+       initial q = d; always @(posedge clk) q <= d; endmodule`,
+      /initial の右辺は定数でなければならない/],
+    ['initial の中の if',
+      `module m(input clk, output reg q);
+       initial if (1) q = 1'b1; always @(posedge clk) q <= ~q; endmodule`,
+      /initial の中に書けるのは定数の代入だけ/],
+    ['initial でノンブロッキング代入',
+      `module m(input clk, output reg q);
+       initial q <= 1'b1; always @(posedge clk) q <= ~q; endmodule`,
+      /initial の中はブロッキング代入 = を使う/],
+    ['initial が同じビットに違う値',
+      `module m(input clk, output reg [3:0] q);
+       initial q = 4'h1;
+       initial q = 4'h2;
+       always @(posedge clk) q <= q + 1;
+      endmodule`,
+      /違う初期値を 2 回置いている/],
     // generate まわり。展開できないもの・書き忘れを名指しで断る
     ['generate の for に genvar が要る',
       `module m(output y); for (i=0;i<2;i=i+1) begin: g assign y = 1'b0; end endmodule`,
@@ -4318,6 +4454,7 @@ const suites = [
   ['always @(*)', testCombAlways],
   ['繰り返し連接 / 宣言の代入', testSugar],
   ['階層参照', testHierRef],
+  ['initial', testInitial],
   ['比較器', testCompare],
   ['ALU (case の書き方)', testAlu],
   ['非 ANSI と多入力ゲート', testOnehot],

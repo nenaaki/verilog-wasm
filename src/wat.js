@@ -92,6 +92,19 @@ export function emitWat(netlist, order, layout) {
   L.push('      (local.set $n (i32.sub (local.get $n) (i32.const 1)))');
   L.push('      (br $again)))');
   L.push('  )');
+
+  // initial で置いた電源投入時の値。1 のビットは 64 レーンぶん立てる
+  if (layout.initWords.length > 0) {
+    L.push('  ;; --- 初期状態 (initial) ---');
+    for (const [off, value] of layout.initWords) {
+      const bytes = [];
+      let v = BigInt(value);
+      for (let i = 0; i < 8; i++) { bytes.push(Number(v & 0xffn)); v >>= 8n; }
+      const esc = bytes.map((b) => `\\${b.toString(16).padStart(2, '0')}`).join('');
+      L.push(`  (data (i32.const ${off}) "${esc}")`);
+    }
+  }
+
   L.push(')');
 
   return L.join('\n');

@@ -20,6 +20,9 @@ export class RefSimulator extends SignalAccess {
     // オフセット → ネット ID の逆引き (SignalAccess はオフセットで話すため)
     this.netOfOffset = new Map();
     for (const [netId, off] of this.layout.slots) this.netOfOffset.set(off, netId);
+
+    // WASM 側はデータセグメントで初期状態が入るので、こちらも同じ所から始める
+    this.reset();
   }
 
   readWord(offset) {
@@ -30,9 +33,11 @@ export class RefSimulator extends SignalAccess {
     this.values[this.netOfOffset.get(offset)] = BigInt(value) & MASK64;
   }
 
+  /** 全状態を電源投入時に戻す (initial を書いていなければゼロクリア) */
   reset() {
     this.values.fill(0n);
     this.next.fill(0n);
+    for (const [off, v] of this.layout.initWords) this.writeWord(off, v);
     return this;
   }
 

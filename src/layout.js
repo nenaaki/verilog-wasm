@@ -15,6 +15,8 @@
 // D ネットが他のレジスタの Q ネットと同一になる場合 (`a <= b; b <= a;` のスワップ) に
 // スロットを共有すると、commit が逐次代入になって値が壊れる。
 
+const ALL_ONES = (1n << 64n) - 1n;      // 64 レーンすべてを 1 にするワード
+
 export function buildLayout(netlist) {
   const { signals, regs } = netlist;
   const slots = new Map();
@@ -60,9 +62,17 @@ export function buildLayout(netlist) {
     if (isPort(s) && s.dir === 'input') inputNets.push(...s.bits);
   }
 
+  // initial で置いた電源投入時の値。1 のビットは 64 レーン全部を 1 にする
+  // (setInput と同じブロードキャスト)。0 のビットはメモリの既定値のままなので出さない。
+  const initWords = [];
+  for (const r of regs) {
+    if (r.init) initWords.push([slots.get(r.q), ALL_ONES]);
+  }
+
   return {
     slots,
     regNext,
+    initWords,
     byteSize: offset,
     pages: Math.max(1, Math.ceil(offset / 65536)),
     inputNets,

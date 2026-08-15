@@ -1338,6 +1338,45 @@ export function elaborate(mod, all = [mod]) {
     return n;
   }
 
+  // ---- initial (レジスタの電源投入時の値) ----------------------------------------
+  //
+  // 時間を持たない cycle-based なので、initial を手続きとしては走らせられない。
+  // 合成できる形 ―― 定数をレジスタに置く ―― だけを受け、その値を状態スロットの
+  // 初期値として持つ。これで reset() のゼロクリアが「initial の値に戻す」になる。
+  //
+  // レジスタかどうかは always を全部見終わるまで決まらないので、ここでは
+  // 「ネット → 初期ビット」を貯めるだけにして、検査は展開のあとでまとめてやる。
+  const initOf = new Map();            // レジスタの Q ネット → { bit, line }
+
+  function runInitial(item) {
+    for (const st of item.stmts) {
+      if (st.type !== 'ba') {
+        throw new CompileError(
+          'initial の中に書けるのは定数の代入だけ (if / case / for は未対応)', st.line);
+      }
+      const bits = lhsRegBits(st.lhs, st.line);
+      let value;
+      try {
+        value = constExpr(st.rhs);
+      } catch (e) {
+        // 「信号を読んでいる」が圧倒的に多いので、initial の文脈を足して言い直す
+        throw new CompileError(
+          `initial の右辺は定数でなければならない (${e.message.replace(/^\d+ 行目: /, '')})`,
+          st.line);
+      }
+      bits.forEach((qn, i) => {
+        const bit = Number((value >> BigInt(i)) & 1n);
+        const prev = initOf.get(qn);
+        if (prev !== undefined && prev.bit !== bit) {
+          throw new CompileError(
+            `initial が '${nets[qn].name}' に違う初期値を 2 回置いている `
+            + `(${prev.line} 行目と ${st.line} 行目)`, st.line);
+        }
+        initOf.set(qn, { bit, line: st.line });
+      });
+    }
+  }
+
   // ---- always @(*) (組合せ回路) ------------------------------------------------
   //
   // レジスタ用の always とは別物なので、別の経路で落とす。
@@ -1627,6 +1666,11 @@ export function elaborate(mod, all = [mod]) {
       return;
     }
 
+    if (item.type === 'initial') {
+      runInitial(item);
+      return;
+    }
+
     if (item.type === 'always' && item.comb) {
       runCombAlways(item);
       return;
@@ -1778,6 +1822,21 @@ export function elaborate(mod, all = [mod]) {
     if (s.isTop && s.dir === 'input') s.bits.forEach((n) => drivers.set(n, '入力ポート'));
   }
   itemPass(mod, '', true, 0, [mod.name]);
+
+  // ---- initial の値をレジスタに配る -----------------------------------------
+  // レジスタかどうかは always を全部見終わってはじめて決まるので、ここで検査する。
+  // 状態スロットを持たないもの (組合せの reg・刈られたレジスタ) に初期値を書いても
+  // 置き場所が無いので、黙って落とさずに断る。
+  const regByQ = new Map(regs.map((r) => [r.q, r]));
+  for (const [qn, { bit, line }] of initOf) {
+    const r = regByQ.get(qn);
+    if (!r) {
+      throw new CompileError(
+        `initial で '${nets[qn].name}' に初期値を書いたが、レジスタではない `
+        + '(always @(posedge …) で駆動される reg にだけ書ける)', line);
+    }
+    r.init = bit;
+  }
 
   // ---- 未駆動ネットの検査 ---------------------------------------------------
   // top の入力ポートだけは外から与えられるので対象外。子モジュールの入力ポートは

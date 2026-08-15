@@ -7,14 +7,14 @@ Verilog サブセット（ゲート + レジスタ）を **WebAssembly バイナ
 ```bash
 node test/run.js                                     # テスト
 node test/ui.js                                      # 回路エディタの操作テスト (Chrome が必要)
-node tools/vwc.js examples/lfsr8.v --run 8 --set q=1 # 波形を出す
+node tools/vwc.js examples/lfsr8.v --run 8           # 波形を出す           
 node tools/vwc.js examples/lfsr8.v --wat             # 生成コードを見る
 node tools/bench.js                                  # スループット計測
 node tools/serve.js                                  # → http://localhost:8080/web/ （テキスト版 / 回路エディタ）
 node tools/vwc.js examples/lfsr8.v -o lfsr8.wasm     # .wasm を書き出す
 ```
 
-生成した WASM はブラウザ側からも保存できる。テキスト版は「出力」の `.wasm を保存` / `.wat を保存`、回路エディタは「回路」の `.wasm を保存` で、いまコンパイルできているモジュールがそのまま落ちてくる（`WebAssembly.compile` に渡せる素のバイナリなので、他のホストからも読める）。
+生成した WASM はブラウザ側からも保存できる。テキスト版は「出力」の `.wasm を保存` / `.wat を保存`、回路エディタは「回路」の `.wasm を保存` で、いまコンパイルできているモジュールがそのまま落ちてくる（`WebAssembly.compile` に渡せる素のバイナリなので、他のホストからも読める。[`initial`](#initial) を書いた回路は初期状態もモジュールが運ぶ）。
 
 ```text
 $ node tools/vwc.js examples/shift8.v --run 8 --set din=1
@@ -51,18 +51,18 @@ WebAssembly.instantiate → sim.js
 | ファイル | 役割 | 行数 |
 | --- | --- | --- |
 | [src/lexer.js](src/lexer.js) | 字句解析 | 147 |
-| [src/parser.js](src/parser.js) | 構文解析 → AST | 815 |
-| [src/elaborate.js](src/elaborate.js) | AST → ネットリスト IR（bit-blast・階層の平坦化・定数式・定数畳み込み・CSE・function と for の展開・generate・always @(*)） | 1,684 |
+| [src/parser.js](src/parser.js) | 構文解析 → AST | 825 |
+| [src/elaborate.js](src/elaborate.js) | AST → ネットリスト IR（bit-blast・階層の平坦化・定数式・定数畳み込み・CSE・function と for の展開・generate・always @(*)・initial） | 1,739 |
 | [src/schedule.js](src/schedule.js) | トポロジカルソート・ループ検出・刈り取り | 91 |
-| [src/layout.js](src/layout.js) | メモリレイアウト | 84 |
-| [src/codegen.js](src/codegen.js) | WASM バイナリ生成 | 197 |
+| [src/layout.js](src/layout.js) | メモリレイアウト・初期状態 | 92 |
+| [src/codegen.js](src/codegen.js) | WASM バイナリ生成 | 227 |
 | [src/leb128.js](src/leb128.js) | LEB128・セクションエンコーダ | 59 |
-| [src/wat.js](src/wat.js) | WAT 出力（デバッグ用バックエンド） | 85 |
-| [src/interp.js](src/interp.js) | JS 参照実装（差分テスト用） | 78 |
+| [src/wat.js](src/wat.js) | WAT 出力（デバッグ用バックエンド） | 96 |
+| [src/interp.js](src/interp.js) | JS 参照実装（差分テスト用） | 82 |
 | [src/schematic.js](src/schematic.js) | 回路グラフ → Verilog・保存形式・幅の推論・階層の平坦化（GUI エディタ用フロントエンド） | 615 |
 | [src/samples.js](src/samples.js) | エディタのサンプル回路（データ） | 341 |
-| [src/sim.js](src/sim.js) / [src/signals.js](src/signals.js) / [src/compile.js](src/compile.js) | 実行時グルー・エントリ | 188 |
-| **合計（コメント込み）** | | **4,391** |
+| [src/sim.js](src/sim.js) / [src/signals.js](src/signals.js) / [src/compile.js](src/compile.js) | 実行時グルー・エントリ | 197 |
+| **合計（コメント込み）** | | **4,504** |
 
 エディタ側は [web/editor.html](web/editor.html) に状態と操作を置き、状態を持たない部分を分けてある。
 
@@ -96,6 +96,7 @@ endmodule
 - 式：ビット演算 `~` `&` `^` `|` `~^`、リダクション `&a` `|a` `^a` `~&a` `~|a` `~^a`、論理演算 `!` `&&` `||`、算術 `+` `-`（単項 `-` も）`*` `/` `%`（符号なし → [下記](#乗除算)）、比較 `==` `!=` `<` `<=` `>` `>=`（符号なし）、シフト `<<` `>>`、`? :`、ビット選択 `a[3]`、部分選択 `a[7:4]`、連接 `{a, b}`、繰り返し連接 `{4{a}}`（→ [下記](#繰り返し連接)）、`8'hFF` / `4'b1010` / `10` などのリテラル
 - `always @(posedge clk)` + `<=`（ノンブロッキング代入）→ D フリップフロップ
 - `always @(*)` / `always @*` / `always @(a or b)` + `=`（ブロッキング代入）→ 組合せ回路（→ [下記](#always-)）
+- `initial` によるレジスタの初期値（→ [下記](#initial)）
 - `always` の中の `if` / `else` / `else if`、`case` / `casez` / `default`（`begin` / `end` で入れ子可）
 - 非同期リセット `always @(posedge clk or posedge rst)`（`negedge rst_n` + `if (!rst_n)` の負論理も）
 - モジュール階層（インスタンス化とポート接続。順番指定・名前指定の両方）
@@ -105,7 +106,7 @@ endmodule
 - `generate`（`for` / `if` / `case`、`genvar`、入れ子。`generate` / `endgenerate` は省ける → [下記](#generate)）
 - 階層参照（`u0.q` / `bits[3].p` を式の中から読む → [下記](#階層参照)）
 
-**未対応**：`casex`、`initial`、`task`、`while` / `repeat`、複数クロック、負エッジのクロック、値としての `x` / `z`（`===` / `!==` も）、システム関数・タスク（`$display` など）、signed。いずれも行番号付きのエラーになる。
+**未対応**：`casex`、`task`、`while` / `repeat`、複数クロック、負エッジのクロック、値としての `x` / `z`（`===` / `!==` も）、システム関数・タスク（`$display` など）、signed。いずれも行番号付きのエラーになる。
 
 signed は書き方が 4 通りあるので、それぞれ名前を出して断る。素通りさせると `')' が必要` や `解釈できない文字 '''` のような見当違いのエラーになるため:
 
@@ -615,6 +616,57 @@ signals のキー: a | y | u0.d | u0.q | b[0].t | b[1].t
 
 `compile()` が返す `stats.gates` は刈り取り後（＝生成コードに乗ったゲート数）で、消えたぶんは `stats.pruned` に出る。`vwc.js` も `gates=0(+2 刈り取り)` のように両方見せる。
 
+### initial
+
+この処理系は時間を持たない cycle-based なので、`initial` を手続きとしては走らせられない。**合成できる形 ―― レジスタの電源投入時の値 ―― としてだけ読む**。
+
+```verilog
+module lfsr8(input clk, output reg [7:0] q);
+  wire fb;
+  assign fb = q[7] ^ q[5] ^ q[4] ^ q[3];
+  initial q = 8'h01;               // 全 0 は自己ループなので種が要る
+  always @(posedge clk) q <= {q[6:0], fb};
+endmodule
+```
+
+受けるのは**定数の代入だけ**。`if` / `case` や信号を読む右辺は、走らせる時間軸が無いので断る。部分代入（`initial q[3:0] = 4'hC;`）は書ける。
+
+| 書き方 | エラー |
+| --- | --- |
+| `initial q = d;`（信号を読む） | `initial の右辺は定数でなければならない (…)` |
+| `initial if (c) q = 1;` | `initial の中に書けるのは定数の代入だけ (if / case / for は未対応)` |
+| `initial q <= 1;` | `initial の中はブロッキング代入 = を使う` |
+| レジスタでないものに書く | `initial で 'y' に初期値を書いたが、レジスタではない` |
+| 同じビットに違う値を 2 回 | `initial が 'q' に違う初期値を 2 回置いている (3 行目と 4 行目)` |
+
+レジスタかどうかは `always` を全部見終わるまで決まらないので、展開中は「ネット → 初期ビット」を貯めるだけにして、**検査は展開が終わってからまとめて**やる。組合せの `reg`（`always @(*)` の代入先）は状態スロットを持たないので、そこに書いたら断る ―― 置き場所が無い値を黙って捨てないため。
+
+#### モジュールが初期状態を運ぶ
+
+初期値は**WASM のデータセクション**として出す。だから `WebAssembly.instantiate` に渡しただけで正しい状態から始まり、シミュレータのラッパを通さない他のホストでも成り立つ。
+
+```wat
+;; --- 初期状態 (initial) ---
+(data (i32.const 8) "\ff\ff\ff\ff\ff\ff\ff\ff")
+```
+
+1 のビットは **64 レーンぶん立てる**（`\ff` × 8 = 全ビット 1）。ビットスライスなので、1 本のネットのスロットが 64 個のレーンを兼ねている ―― `setInput` のブロードキャストと同じ形になる。
+
+続きのスロットは 1 個のセグメントにまとめる。セグメントの前置きだけで 12 バイトほどあるので、32 ビットのレジスタを 1 ビットずつ出すと本体より前置きの方が大きくなるため。**0 のビットは出さない**（メモリの既定値が 0 なので）。`initial q = 8'h00;` と書いた回路のバイト列は、`initial` を書かない回路と 1 バイトも変わらない。
+
+`reset()` も同じ表を使うので、**「全部 0 に戻す」ではなく「電源投入時に戻す」**になる。
+
+#### 非同期リセットとは別物
+
+`initial` は電源投入時の 1 回きり、非同期リセットはいつでも当たる。両方書ける:
+
+```verilog
+initial q = 4'h9;                        // 電源投入時は 9
+always @(posedge clk or negedge rstn)
+  if (!rstn) q <= 4'h0;                  // リセットを当てると 0
+  else q <= q + 1;
+```
+
 ### 非同期リセット
 
 ```verilog
@@ -776,6 +828,8 @@ counter #(4, 3) c2(clk, rst, by3);          // 順番指定
 
 論理回路のコンパイル結果は**分岐のない直線コード**なので、使う命令は `i64.and` / `i64.or` / `i64.xor` / `local.get` / `local.set` / `i64.load` / `i64.store` だけ。`run` のループにだけ `block` / `loop` / `br_if` / `call` / `i32.sub` / `i32.eqz` が加わる。面倒なのは LEB128 エンコーダだけで、そこは 59 行に収まっている。
 
+セクションは type / func / memory / export / code の 5 つ。[`initial`](#initial) を書いた回路にだけ data セクションが増えて、初期状態をモジュールが運ぶ。
+
 内部の組合せ配線は **local に置いてメモリを経由しない**。メモリに出るのは入力・出力・レジスタの状態だけ。
 
 ## ビットスライス（64 レーン同時実行）
@@ -838,13 +892,13 @@ import { WasmSimulator } from './src/sim.js';
 const compiled = compile(verilogSource);   // { bytes, wat, netlist, layout, stats, warnings }
 const sim = await WasmSimulator.create(compiled);
 
-sim.setInput('d', 0b1010);   // 入力ポート（reg も書けるので初期値のシードに使える）
+sim.setInput('d', 0b1010);   // 入力ポート（reg も書けるので状態の書き換えにも使える）
 sim.eval();                  // 組合せ論理のみ評価（クロックは打たない）
 sim.step();                  // 1 クロック
 sim.run(1000);               // 1000 クロック（ループは WASM 側にある）
 sim.get('q');                // → BigInt
 sim.getLanes('q');           // → 64 レーン分の BigInt[]
-sim.reset();                 // 全状態をゼロクリア
+sim.reset();                 // 全状態を initial の値に戻す（無ければゼロ）
 sim.snapshot();              // 観測可能な全信号
 ```
 
@@ -874,6 +928,7 @@ $ node test/run.js
 | `casez` | 優先順位エンコーダの全 16 通り、16 進の `z`、全桁 `z`、幅を広げたときの扱い、[priority8.v](examples/priority8.v) の全 256 通り |
 | `function` | ローカル変数・入れ子の呼び出し・`case`・部分代入・スコープ、**式を直接書いたのとゲート数が一致**すること、[gray4.v](examples/gray4.v) の往復とグレイカウンタの巡回 |
 | `for` | [bitops8.v](examples/bitops8.v) の 4 出力を全 256 通り、入れ子・下降・刻み 2・`parameter` 境界・`i*4+b` の添字、**手で書き並べたのとゲート数が一致**すること、定数式の `*` `/` `%` が回路にならないこと |
+| `initial` | instantiate しただけで初期値から始まること、`reset()` が 0 ではなく初期値に戻すこと、**生の .wasm を直に instantiate しても入っていること**、値 0 ならバイト列が変わらないこと、階層と generate、部分代入、非同期リセットとの違い、LFSR が種から周期 255 |
 | `階層参照` | [chain4.v](examples/chain4.v) の 16 通り（genvar 添字と 2 段の階層）、ビット選択・部分選択と取り違えないこと、**ポートでつないだのと同じゲート数**、module を 2 段またぐ参照 |
 | `繰り返し連接 / 宣言の代入` | `{n{x}}` の 6 通り（ゼロ詰め・符号拡張・入れ子・0 回）を全 32 通り、**並べて書いたのとゲート数・ネット数が一致**すること、自己決定幅、`wire t = 式` が assign に分けたのと同じ回路になること |
 | `always @(*)` | [alu_comb.v](examples/alu_comb.v) の全 8 演算 × 256 通り、ブロッキングの順序、**assign で書いたのと同じゲート数**、感度リストの 3 通りが同じ回路になること、階層と generate の中 |
@@ -883,7 +938,7 @@ $ node test/run.js
 | `モジュール階層` | [adder2.v](examples/adder2.v)（2 段の入れ子）の全 4×4×2 通り、完全修飾名、`--top` |
 | `非同期リセット` | `eval()` だけで Q が変わること、負論理・非ゼロ値・部分リセット、同期リセットとの違い |
 
-ほかに全加算器の真理値表、DFF のタイミング、LFSR の周期 255、レジスタのスワップと 3 段ローテーション、`eval` / `commit` の分離、64 レーンの独立性、107 種類のコンパイルエラー。
+ほかに全加算器の真理値表、DFF のタイミング、LFSR の周期 255、レジスタのスワップと 3 段ローテーション、`eval` / `commit` の分離、64 レーンの独立性、112 種類のコンパイルエラー。
 
 `GUI 回路グラフ` はエディタのサンプル回路（[src/samples.js](src/samples.js)）を Verilog に変換して突き合わせる。組合せ回路は真理値表、メモリ入りの回路は入力を変えながらクロックを打った値の列で確認する。未配線の部品が下流ごと除外されること、フィードバック配線が組合せループとして弾かれる一方で**メモリを挟んだ帰還は通る**ことも見ている。
 
@@ -1190,8 +1245,7 @@ module sketch(                              module sketch(
 
 | | 項目 | 何が要るか |
 | --- | --- | --- |
-| **既存の部品の組み替えで済む** | `initial` によるレジスタ初期値 | 状態スロットの初期値をレイアウトに持たせるだけ。いまは常にゼロクリア |
-| | `while` / `repeat` | 回数が定数に決まるものだけ `for` と同じ完全展開に落とす |
+| **既存の部品の組み替えで済む** | `while` / `repeat` | 回数が定数に決まるものだけ `for` と同じ完全展開に落とす |
 | **意味論の判断が要る** | signed | 幅の規則に符号拡張、比較の符号あり / なし分岐、`>>>`、**除算が floor ではなく 0 方向への切り捨て**。[断り書き](#対応している-verilog)を 4 箇所ぶん畳むことになる |
 | | `casex` / 値としての `x` `z` | いまは「x を値として持たない」ことを設計判断として断っている（`casez` を使わせる）。持たせるならネット 1 本が 1 ビットでなくなり、ビットスライスの前提から変わる |
 | **実行モデルから作り直し** | 複数クロック・負エッジ | `step()` がクロックエッジそのものなので、`eval` / `commit` の粒度から設計し直す必要がある |
