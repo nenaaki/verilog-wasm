@@ -1272,6 +1272,147 @@ export function elaborate(mod, all = [mod]) {
     return n;
   }
 
+  // ---- always @(*) (組合せ回路) ------------------------------------------------
+  //
+  // レジスタ用の always とは別物なので、別の経路で落とす。
+  //
+  //   代入は blocking (`=`) なので、後の文は前の文の結果を読む
+  //     → function の展開に使っている runFuncStmts がそのまま使える
+  //   保持は無い。代入されない経路があればラッチになる
+  //     → この処理系はラッチを持たないので、作らずにエラーにする
+  //
+  // 環境の初期値は**その信号自身のネット**にしておく。すると「代入前に読む」と
+  // 自分のネットが出てきて、結果の中に残る。それがそのままラッチの判定になる
+  // (自分の値に依存する組合せ出力 = 保持している、ということ)。
+
+  /** 文の並びから代入先の名前を集める (分岐の中も見る) */
+  function combTargets(stmts, out = new Set()) {
+    for (const st of stmts) {
+      if (st.type === 'ba') out.add(st.lhs.name);
+      else if (st.type === 'for') combTargets(st.body, out);
+      else if (st.type === 'if') {
+        combTargets(st.then, out);
+        if (st.else) combTargets(st.else, out);
+      } else if (st.type === 'case') {
+        for (const it of st.items) combTargets(it.stmts, out);
+        if (st.default) combTargets(st.default, out);
+      }
+    }
+    return out;
+  }
+
+  /** 文の並びが読んでいる名前を集める (感度リストの取りこぼしを見るため) */
+  function combReads(stmts, out = []) {
+    for (const st of stmts) {
+      if (st.type === 'ba') {
+        refNames(st.rhs, out);
+        if (st.lhs.range) { refNames(st.lhs.range.msb, out); refNames(st.lhs.range.lsb, out); }
+      } else if (st.type === 'for') combReads(st.body, out);
+      else if (st.type === 'if') {
+        refNames(st.cond, out);
+        combReads(st.then, out);
+        if (st.else) combReads(st.else, out);
+      } else if (st.type === 'case') {
+        refNames(st.sel, out);
+        for (const it of st.items) {
+          for (const l of it.labels) refNames(l, out);
+          combReads(it.stmts, out);
+        }
+        if (st.default) combReads(st.default, out);
+      }
+    }
+    return out;
+  }
+
+  function runCombAlways(item) {
+    const names = [...combTargets(item.stmts)];
+    if (names.length === 0) {
+      throw new CompileError('always @(*) の中に代入が無い', item.line);
+    }
+
+    const targets = new Map();
+    for (const name of names) {
+      const s = lookup(name, item.line);
+      if (s.dir === 'input') {
+        throw new CompileError(`入力ポート '${s.name}' は駆動できない`, item.line);
+      }
+      if (s.kind !== 'reg') {
+        throw new CompileError(
+          `always @(*) の代入先 '${s.name}' は reg で宣言する (wire は assign で駆動する)`,
+          item.line);
+      }
+      targets.set(name, s);
+    }
+
+    // 感度リストを書いたなら、読んでいる信号が全部並んでいること。
+    // 足りないと実機と食い違う (この処理系では列挙を無視するので値は正しく出るが、
+    // 「書いたとおりに読めない Verilog」を通してしまうことになる)
+    if (item.sens) {
+      const listed = new Set(item.sens);
+      const missing = [...new Set(combReads(item.stmts))]
+        .filter((n) => !listed.has(n) && !targets.has(n) && signals.has(resolveScope(n) + n));
+      if (missing.length > 0) {
+        throw new CompileError(
+          `always @(…) の感度リストに ${missing.join(', ')} が足りない `
+          + '(@(*) と書けば取りこぼさない)', item.line);
+      }
+    }
+
+    const savedEnv = funcEnv;
+    funcEnv = new Map();
+    for (const [name, s] of targets) {
+      funcEnv.set(name, { bits: [...s.bits], msb: s.msb, lsb: s.lsb });
+    }
+    let out;
+    try {
+      out = runFuncStmts(item.stmts, envBits(funcEnv));
+    } finally {
+      funcEnv = savedEnv;
+    }
+
+    // 代入先自身のネットが結果に残っていたら「前の値を保っている」= ラッチ。
+    // どの信号のネットで引っかかったかまで返すと、原因が 2 通りに切り分けられる:
+    //   自分自身 … 代入されない経路がある (else / default の書き忘れ)
+    //   別の名前 … その名前を代入より前に読んでいる (文の順番)
+    const ownOf = new Map();                    // ネット → 代入先の名前
+    for (const s of targets.values()) s.bits.forEach((n) => ownOf.set(n, s.name));
+    const memo = new Map();
+    const heldBy = (n) => {
+      if (ownOf.has(n)) return n;
+      const hit = memo.get(n);
+      if (hit !== undefined) return hit;
+      memo.set(n, -1);                          // 途中に循環があっても止まる
+      const g = gateOf.get(n);
+      let r = -1;
+      if (g) for (const x of g.in) { r = heldBy(x); if (r >= 0) break; }
+      memo.set(n, r);
+      return r;
+    };
+
+    // 駆動するのは**このブロックが触ったビットだけ**。信号まるごとではない。
+    // `always @(*) z[i] = …;` を i ごとに分けて書くのは正しい Verilog で、
+    // 各ブロックは自分のビットだけを駆動する (残りは別のブロックが駆動する)。
+    // 種のまま残っているビット = 一度も触っていない、として見分ける。
+    for (const [name, s] of targets) {
+      const bits = out.get(name);
+      for (let i = 0; i < bits.length; i++) {
+        if (bits[i] === s.bits[i]) continue;             // このブロックでは触っていない
+        const held = heldBy(bits[i]);
+        if (held >= 0) {
+          throw new CompileError(
+            held === s.bits[i]
+              ? `always @(*) の '${nets[held].name}' に、代入されない経路がある `
+                + '(ラッチになる)。先に既定値を代入するか、else / default を書いてください'
+              : `always @(*) の '${nets[s.bits[i]].name}' が '${nets[held].name}' を`
+                + `代入より前に読んでいる (ラッチになる)。'${nets[held].name}' への代入を`
+                + '先に書いてください',
+            item.line);
+        }
+        connectNets([s.bits[i]], [bits[i]], 'always @(*)', item.line);
+      }
+    }
+  }
+
   // ---- 項目の処理 ----------------------------------------------------------
   let clock = null;        // クロックのルートネット (buf をたどった先)
   let clockName = null;    // エラー表示用の名前
@@ -1405,6 +1546,11 @@ export function elaborate(mod, all = [mod]) {
         result.push(acc);
       }
       connect(outNode, result, `${item.gate} ゲート`, item.line);
+      return;
+    }
+
+    if (item.type === 'always' && item.comb) {
+      runCombAlways(item);
       return;
     }
 

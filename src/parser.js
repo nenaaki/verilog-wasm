@@ -322,7 +322,7 @@ export function parse(src) {
       if (peek().type === 'eof' || FUNC_BODY_STOP.has(peek().value)) {
         throw err("'endfunction' が見つからない");
       }
-      body.push(...parseStmtBlock(true));
+      body.push(...parseStmtBlock('function'));
     }
     expect('endfunction');
     if (body.length === 0) throw err(`function ${name} の中身が空`);
@@ -355,9 +355,10 @@ export function parse(src) {
 
   /**
    * begin...end なら中の文の列、そうでなければ 1 文だけの列。
-   * blocking = true は function の中。代入が `<=` ではなく `=` になる。
+   * ctx はブロッキング代入 (`=`) で書く場所の名前 ('function' / 'always @(*)')。
+   * null ならノンブロッキング代入 (`<=`) の always ブロック。取り違えは名指しで断る。
    */
-  function parseStmtBlock(blocking = false) {
+  function parseStmtBlock(ctx = null) {
     if (eat('begin')) {
       const list = [];
       while (!at('end')) {
@@ -366,36 +367,36 @@ export function parse(src) {
         if (peek().type === 'eof' || at('endmodule') || at('endfunction')) {
           throw err("'end' が見つからない");
         }
-        list.push(parseStmt(blocking));
+        list.push(parseStmt(ctx));
       }
       expect('end');
       return list;
     }
-    return [parseStmt(blocking)];
+    return [parseStmt(ctx)];
   }
 
-  function parseStmt(blocking = false) {
-    if (at('if')) return parseIf(blocking);
-    if (at('for')) return parseFor(blocking);
+  function parseStmt(ctx = null) {
+    if (at('if')) return parseIf(ctx);
+    if (at('for')) return parseFor(ctx);
     if (at('while') || at('repeat') || at('forever')) {
       throw err(`${peek().value} は未対応 (繰り返しは回数の決まった for だけ)`);
     }
-    if (at('case') || at('casez')) return parseCase(blocking);
+    if (at('case') || at('casez')) return parseCase(ctx);
     // casex は x も don't care にする。x を値として持たないので z との差が出ず、
     // 「x なら何でも一致」を装うことになるので断る (casez なら z / ? で足りる)
     if (at('casex')) throw err('casex は未対応 (x を値として扱わない。casez を使う)');
     const line = peek().line;
     const lhs = parseLValue();
-    // function の中はレジスタではなくその場で値が入る一時変数なので blocking 代入。
-    // always の中はレジスタなのでノンブロッキング。取り違えを名指しで断る
-    if (blocking) {
-      if (at('<=')) throw err('function の中はブロッキング代入 = を使う');
+    // function と always @(*) はレジスタではなくその場で値が決まるので blocking 代入。
+    // always @(posedge) の中はレジスタなのでノンブロッキング。取り違えを名指しで断る
+    if (ctx) {
+      if (at('<=')) throw err(`${ctx} の中はブロッキング代入 = を使う`);
       expect('=');
       const rhs = parseExpr();
       expect(';');
       return { type: 'ba', lhs, rhs, line };
     }
-    if (at('=')) throw err('always ブロック内ではノンブロッキング代入 <= を使う');
+    if (at('=')) throw err('always @(posedge …) の中はノンブロッキング代入 <= を使う');
     expect('<=');
     const rhs = parseExpr();
     expect(';');
@@ -411,7 +412,7 @@ export function parse(src) {
    * ヘッダの代入は Verilog では always の中でもブロッキング (`=`) なので、
    * 本体が `<=` でもここは `=` で受ける。
    */
-  function parseFor(blocking) {
+  function parseFor(ctx) {
     const line = expect('for').line;
     expect('(');
     const name = expectIdent();
@@ -427,7 +428,7 @@ export function parse(src) {
     if (stepName !== name) {
       throw err(`for の更新式は初期化と同じ変数でなければならない (${name} と ${stepName})`);
     }
-    return { type: 'for', name, init, cond, step, body: parseStmtBlock(blocking), line };
+    return { type: 'for', name, init, cond, step, body: parseStmtBlock(ctx), line };
   }
 
   /** integer の宣言。信号ではなく「elaborate 時の整数」= for のループ変数になる */
@@ -440,18 +441,18 @@ export function parse(src) {
     return { type: 'intdecl', names, line };
   }
 
-  function parseIf(blocking = false) {
+  function parseIf(ctx = null) {
     const line = expect('if').line;
     expect('(');
     const cond = parseExpr();
     expect(')');
-    const thenStmts = parseStmtBlock(blocking);
+    const thenStmts = parseStmtBlock(ctx);
     // else if は「else の中身が 1 個の if 文」として自然に入れ子になる
-    const elseStmts = eat('else') ? parseStmtBlock(blocking) : null;
+    const elseStmts = eat('else') ? parseStmtBlock(ctx) : null;
     return { type: 'if', cond, then: thenStmts, else: elseStmts, line };
   }
 
-  function parseCase(blocking = false) {
+  function parseCase(ctx = null) {
     // casez はラベルの z / ? をその桁だけ比較から外す。式の側は 2 値しか無いので
     // 「ラベルの don't care」だけを見れば Verilog と同じ結果になる
     const casez = at('casez');
@@ -471,13 +472,13 @@ export function parse(src) {
       if (eat('default')) {
         eat(':');                       // Verilog では ':' は省略できる
         if (dflt) throw err('default が 2 つある');
-        dflt = parseStmtBlock(blocking);
+        dflt = parseStmtBlock(ctx);
         continue;
       }
       const labels = [parseExpr()];
       while (eat(',')) labels.push(parseExpr());
       expect(':');
-      items.push({ labels, stmts: parseStmtBlock(blocking), line: iline });
+      items.push({ labels, stmts: parseStmtBlock(ctx), line: iline });
     }
     expect('endcase');
     if (items.length === 0 && !dflt) throw err('case の中身が空');
@@ -494,20 +495,43 @@ export function parse(src) {
     return { kind: t.value, name: expectIdent(), line: t.line };
   }
 
+  /**
+   * always は 2 種類ある。@ の後ろの形で決まる。
+   *
+   *   always @(posedge clk)  … レジスタ。ノンブロッキング代入 (`<=`)
+   *   always @(*) / @(a, b)  … 組合せ回路。ブロッキング代入 (`=`)
+   *
+   * 感度リストを書いた場合は「取りこぼしが無いか」を elaborate 側で確かめる。
+   * 実機と食い違う古典的なバグなので、そのまま通さずに名指しで断りたい。
+   */
   function parseAlways() {
     const line = expect('always').line;
     expect('@');
+
+    // always @* (括弧なし) も書ける
+    if (eat('*')) return { type: 'always', comb: true, sens: null, stmts: parseStmtBlock('always @(*)'), line };
+
     expect('(');
-    const edges = [parseEdge()];
-    while (eat('or')) edges.push(parseEdge());
-    expect(')');
-    if (edges.length > 2) {
-      throw err(`イベントは 2 つまで (クロックと非同期リセット。${edges.length} 個ある)`);
+    if (eat('*')) {
+      expect(')');
+      return { type: 'always', comb: true, sens: null, stmts: parseStmtBlock('always @(*)'), line };
     }
 
-    const stmts = parseStmtBlock();
+    if (at('posedge') || at('negedge')) {
+      const edges = [parseEdge()];
+      while (eat('or')) edges.push(parseEdge());
+      expect(')');
+      if (edges.length > 2) {
+        throw err(`イベントは 2 つまで (クロックと非同期リセット。${edges.length} 個ある)`);
+      }
+      return { type: 'always', edges, stmts: parseStmtBlock(), line };
+    }
 
-    return { type: 'always', edges, stmts, line };
+    // 信号名が並んでいたら感度リスト。区切りは or でもコンマでもよい
+    const sens = [expectIdent()];
+    while (eat('or') || eat(',')) sens.push(expectIdent());
+    expect(')');
+    return { type: 'always', comb: true, sens, stmts: parseStmtBlock('always @(*)'), line };
   }
 
   function parseGateInst() {

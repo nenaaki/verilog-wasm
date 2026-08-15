@@ -377,6 +377,113 @@ endmodule`;
   }
 }
 
+// ------------------------------------------------------------- always @(*)
+//
+// 組合せ always。レジスタ用の always とは代入の意味 (ブロッキング) も、
+// 未代入ビットの扱い (保持ではなくエラー) も違うので、両方を見る。
+async function testCombAlways() {
+  // ---- 値。alu_comb.v の全 8 演算 × 16 × 16 ----
+  const alu = await bothSims(example('alu_comb.v'));
+  let bad = null;
+  for (let op = 0; op < 8 && !bad; op++) {
+    for (let a = 0; a < 16 && !bad; a++) {
+      for (let b = 0; b < 16 && !bad; b++) {
+        const wide = [a + b, (a - b) & 31, a & b, a | b, a ^ b, (~a) & 15, a < b ? 1 : 0, 0][op];
+        const want = { y: wide & 15, carry: (wide >> 4) & 1, zero: (wide & 15) === 0 ? 1 : 0 };
+        for (const sim of alu.all) {
+          sim.setInput('op', op).setInput('a', a).setInput('b', b).eval();
+          for (const [k, v] of Object.entries(want)) {
+            if (Number(sim.get(k)) !== v && !bad) {
+              bad = `${sim.constructor.name} op=${op} a=${a} b=${b} ${k}=${sim.get(k)} (期待 ${v})`;
+            }
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, 'always @(*): alu_comb.v の全 8 演算 × 256 通りが一致', bad ?? '');
+  eqs(compile(example('alu_comb.v')).stats.regs, 0,
+    'always @(*): レジスタは 1 個も作られない');
+
+  // ---- ブロッキング代入。後の文が前の結果を読む ----
+  const { wasm: bw, ref: br } = await bothSims(`module b(input [3:0] a,
+    output reg [3:0] y, output reg [3:0] z);
+    always @(*) begin
+      y = a + 1;
+      z = y + 1;        // ← ここで読む y は 1 行上で決まった値
+    end
+  endmodule`);
+  for (const sim of [bw, br]) {
+    sim.setInput('a', 5).eval();
+    eq(sim.get('y'), 6, 'always @(*): ブロッキングの 1 文目');
+    eq(sim.get('z'), 7, 'always @(*): 2 文目は 1 文目の結果を読む');
+  }
+
+  // 同じ回路を assign で書くとゲート数が一致する (余計なものを作っていない)
+  const viaAlways = compile(`module g(input [3:0] a, input [3:0] b, output reg [3:0] y);
+    always @(*) y = (a & b) | (a ^ b); endmodule`);
+  const viaAssign = compile(`module g(input [3:0] a, input [3:0] b, output [3:0] y);
+    assign y = (a & b) | (a ^ b); endmodule`);
+  eqs(viaAlways.stats.gates, viaAssign.stats.gates,
+    'always @(*): assign で書いたのと同じゲート数');
+
+  // ---- 分岐。既定値を先に置く定石が通る ----
+  const { wasm: cw, ref: cr } = await bothSims(`module c(input [1:0] s, input [3:0] d,
+    output reg [3:0] y, output reg hit);
+    always @(*) begin
+      y = 4'h0;                        // 既定値。これでラッチにならない
+      hit = 1'b0;
+      case (s)
+        2'd1: begin y = d; hit = 1'b1; end
+        2'd2: if (d[0]) begin y = ~d; hit = 1'b1; end
+      endcase
+    end
+  endmodule`);
+  for (const sim of [cw, cr]) {
+    sim.setInput('s', 0).setInput('d', 9).eval();
+    eq(sim.get('y'), 0, 'always @(*): 拾わない case は既定値');
+    eq(sim.get('hit'), 0, 'always @(*): 既定値は分岐の外で決まる');
+    sim.setInput('s', 1).eval();
+    eq(sim.get('y'), 9, 'always @(*): case で上書きされる');
+    eq(sim.get('hit'), 1, 'always @(*): 同じ枝の 2 個目の代入も効く');
+    sim.setInput('s', 2).eval();
+    eq(sim.get('y'), 6, 'always @(*): case の中の if も通る');
+    sim.setInput('s', 2).setInput('d', 8).eval();
+    eq(sim.get('y'), 0, 'always @(*): else の無い if は既定値のまま');
+  }
+
+  // ---- 感度リスト。全部並んでいれば @(*) と同じ回路になる ----
+  const sens = compile(`module s(input a, input b, output reg y);
+    always @(a or b) y = a & b; endmodule`);
+  const star = compile(`module s(input a, input b, output reg y);
+    always @(*) y = a & b; endmodule`);
+  eqs(sens.stats.gates, star.stats.gates, 'always @(*): 感度リストを書いても同じ回路');
+  const comma = compile(`module s(input a, input b, output reg y);
+    always @(a, b) y = a & b; endmodule`);
+  eqs(comma.stats.gates, star.stats.gates, 'always @(*): コンマ区切りでも同じ');
+  const noParen = compile(`module s(input a, output reg y); always @* y = ~a; endmodule`);
+  eqs(noParen.stats.regs, 0, 'always @(*): @* (括弧なし) も書ける');
+
+  // ---- 階層と generate の中でも動く ----
+  const hier = await bothSims(`module leaf(input [3:0] d, output reg [3:0] q);
+    always @(*) q = d ^ 4'hF;
+  endmodule
+  module top(input [3:0] d, output [3:0] y, output reg [3:0] z);
+    leaf u (.d(d), .q(y));
+    genvar i;
+    for (i = 0; i < 4; i = i + 1) begin : g
+      always @(*) z[i] = d[3-i];
+    end
+  endmodule`);
+  for (const sim of hier.all) {
+    sim.setInput('d', 9).eval();
+    eq(sim.get('y'), 6, 'always @(*): 子 module の中でも動く');
+    eq(sim.get('z'), 9, 'always @(*): generate で展開しても動く (0b1001 は反転しても同じ)');
+    sim.setInput('d', 12).eval();
+    eq(sim.get('z'), 3, 'always @(*): generate 展開のビット並べ替え');
+  }
+}
+
 // ------------------------------------------------------------------ generate
 //
 // generate は「どの項目を作るか」を elaborate 時に決める。展開の結果が正しいこと
@@ -2837,6 +2944,32 @@ async function testErrors() {
     ['genvar に幅は書けない',
       `module m(output y); genvar [3:0] i; assign y=1'b0; endmodule`,
       /genvar に幅は書けない/],
+    // always @(*) — ラッチになる書き方と、代入の取り違え
+    ['always @(*) で else が無い',
+      `module m(input c, input d, output reg y); always @(*) if (c) y = d; endmodule`,
+      /'y' に、代入されない経路がある \(ラッチになる\)/],
+    ['always @(*) で default が無い',
+      `module m(input [1:0] s, output reg y);
+       always @(*) case (s) 2'd0: y=1'b1; 2'd1: y=1'b0; endcase endmodule`,
+      /代入されない経路がある/],
+    ['always @(*) で代入前に読む',
+      `module m(input a, output reg y, output reg z); always @(*) begin z = y; y = a; end endmodule`,
+      /'z' が 'y' を代入より前に読んでいる/],
+    ['always @(*) の感度リストが足りない',
+      `module m(input a, input b, output reg y); always @(a) y = a & b; endmodule`,
+      /感度リストに b が足りない/],
+    ['always @(*) の代入先が wire',
+      `module m(input a, output y); always @(*) y = ~a; endmodule`,
+      /代入先 'y' は reg で宣言する/],
+    ['always @(*) でノンブロッキング代入',
+      `module m(input a, output reg y); always @(*) y <= ~a; endmodule`,
+      /always @\(\*\) の中はブロッキング代入 = を使う/],
+    ['always @(posedge) でブロッキング代入',
+      `module m(input clk, input a, output reg y); always @(posedge clk) y = a; endmodule`,
+      /always @\(posedge …\) の中はノンブロッキング代入 <= を使う/],
+    ['always @(*) の中に代入が無い',
+      `module m(input a, output reg y); always @(*) begin end assign y = a; endmodule`,
+      /always @\(\*\) の中に代入が無い/],
     ['always_comb は未対応',
       `module m(input a, output reg y); always_comb y = ~a; endmodule`,
       /'always_comb' は未対応/],
@@ -3116,6 +3249,19 @@ function randomDesign(rng, nWires) {
   lines.push('  end');
   pool.push('wg');
 
+  // 組合せ always を 1 本。ブロッキング代入と「既定値 → 分岐で上書き」を差分に通す。
+  // 読むのは入力だけなので、pool に入れても組合せループにはならない
+  const cop = pick(['&', '|', '^']);
+  lines.unshift('  reg [7:0] rc, rct;');
+  lines.push('  always @(*) begin');
+  lines.push(`    rct = a ${cop} b;`);
+  lines.push('    rc = rct ^ c;');            // 1 行上の結果を読む (ブロッキング)
+  lines.push('    if (c[0]) rc = rct;');       // 既定値を置いてあるのでラッチにならない
+  lines.push("    else if (c[1]) rc[3:0] = 4'hF;");
+  lines.push('  end');
+  lines.push('  assign rout5 = rc;');
+  pool.push('rc');
+
   for (let i = 0; i < nWires; i++) {
     lines.push(`  wire [7:0] w${i};`);
     lines.push(`  assign w${i} = ${expr(3)};`);
@@ -3197,7 +3343,8 @@ module rnd(
   output [7:0] rout,
   output [7:0] rout2,
   output [7:0] rout3,
-  output [7:0] rout4
+  output [7:0] rout4,
+  output [7:0] rout5
 );
 ${lines.join('\n')}
   assign rout = r;
@@ -3212,6 +3359,7 @@ async function testRandomDiff() {
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
   const seen = {
     'if': 0, 'case': 0, 'casez': 0, 'function': 0, '+ / -': 0, '* / %': 0, 'generate': 0,
+    'always @(*)': 0,
     '比較': 0, 'シフト': 0, '論理': 0,
     '非同期リセット': 0, '階層': 0, 'parameter': 0, 'リダクション': 0,
   };
@@ -3225,6 +3373,7 @@ async function testRandomDiff() {
     if (/[-+] /.test(src)) seen['+ / -']++;
     if (/[*/%] /.test(src)) seen['* / %']++;
     if (/begin : gblk/.test(src)) seen['generate']++;
+    if (src.includes('always @(*)')) seen['always @(*)']++;
     if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
     if (/(<<|>>)/.test(src)) seen['シフト']++;
     if (/(&&|\|\||\(!)/.test(src)) seen['論理']++;
@@ -3261,7 +3410,7 @@ async function testRandomDiff() {
         wasm.step();
         ref.step();
       }
-      for (const port of ['y', 'rout', 'rout2', 'rout3', 'rout4']) {
+      for (const port of ['y', 'rout', 'rout2', 'rout3', 'rout4', 'rout5']) {
         if (wasm.get(port) !== ref.get(port)) {
           mismatch = `${port}: wasm=${wasm.get(port)} ref=${ref.get(port)}`
             + ` (a=${a} b=${b} c=${c} rst=${rst} t=${t})\n${src}`;
@@ -3992,6 +4141,7 @@ const suites = [
   ['刈り取り', testPrune],
   ['乗除算', testMulDiv],
   ['generate', testGenerate],
+  ['always @(*)', testCombAlways],
   ['比較器', testCompare],
   ['ALU (case の書き方)', testAlu],
   ['非 ANSI と多入力ゲート', testOnehot],

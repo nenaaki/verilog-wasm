@@ -71,9 +71,13 @@ export function buildLayout(netlist) {
     /**
      * 外部に見せる信号表。top のポートに加えて、階層の奥にあるレジスタも
      * 完全修飾名 (`h0.count`) で載せる — スロットを持つ状態なので観測できる。
+     *
+     * スロットを持たないものは載せない。`always @(*)` の代入先は reg と宣言するが
+     * フリップフロップではないので、ポートでなければ組合せ配線と同じく local に
+     * 載るだけで読めない。載せてしまうと get() が黙って 0 を返すことになる。
      */
     signalTable: [...signals.values()]
-      .filter((s) => isPort(s) || s.kind === 'reg')
+      .filter((s) => isPort(s) || (s.kind === 'reg' && s.bits.every((n) => slots.has(n))))
       .map((s) => ({
         name: s.name,
         dir: s.dir ?? 'internal',
