@@ -398,7 +398,10 @@ export function parse(src) {
       if (st.type === 'if') {
         return assignsTo(st.then, name) || (st.else ? assignsTo(st.else, name) : false);
       }
-      if (st.type === 'for') return assignsTo(st.body, name);
+      if (st.type === 'block') return assignsTo(st.stmts, name);
+      if (st.type === 'for' || st.type === 'while' || st.type === 'repeat_stmt') {
+        return assignsTo(st.body, name);
+      }
       if (st.type === 'case') {
         return st.items.some((it) => assignsTo(it.stmts, name))
           || (st.default ? assignsTo(st.default, name) : false);
@@ -417,6 +420,10 @@ export function parse(src) {
    */
   function parseStmtBlock(ctx = null) {
     if (eat('begin')) {
+      // 名前付きブロックはブロック内の宣言と disable のためのもの。どちらも無い
+      if (at(':')) {
+        throw err('文の begin にラベルは書けない (generate のブロックのラベルとは別物)');
+      }
       const list = [];
       while (!at('end')) {
         // endmodule / endfunction もここで止める。止めないと次の文の左辺として
@@ -433,11 +440,14 @@ export function parse(src) {
   }
 
   function parseStmt(ctx = null) {
+    // 入れ子の begin … end。文が並ぶ所ならどこにでも置ける (ループの本体で書きがち)
+    if (at('begin')) return { type: 'block', stmts: parseStmtBlock(ctx), line: peek().line };
     if (at('if')) return parseIf(ctx);
     if (at('for')) return parseFor(ctx);
-    if (at('while') || at('repeat') || at('forever')) {
-      throw err(`${peek().value} は未対応 (繰り返しは回数の決まった for だけ)`);
-    }
+    if (at('while')) return parseWhile(ctx);
+    if (at('repeat')) return parseRepeat(ctx);
+    // forever は終わりが定数に決まらないので展開できない
+    if (at('forever')) throw err('forever は未対応 (繰り返しは回数が定数に決まるものだけ)');
     if (at('case') || at('casez')) return parseCase(ctx);
     // casex は x も don't care にする。x を値として持たないので z との差が出ず、
     // 「x なら何でも一致」を装うことになるので断る (casez なら z / ? で足りる)
@@ -445,7 +455,6 @@ export function parse(src) {
     const line = peek().line;
     const lhs = parseLValue();
     // function と always @(*) はレジスタではなくその場で値が決まるので blocking 代入。
-    // always @(posedge) の中はレジスタなのでノンブロッキング。取り違えを名指しで断る
     if (ctx) {
       if (at('<=')) throw err(`${ctx} の中はブロッキング代入 = を使う`);
       expect('=');
@@ -453,11 +462,43 @@ export function parse(src) {
       expect(';');
       return { type: 'ba', lhs, rhs, line };
     }
-    if (at('=')) throw err('always @(posedge …) の中はノンブロッキング代入 <= を使う');
+    // always @(posedge) の中はレジスタなのでノンブロッキング (`<=`)。ただし
+    // integer への代入だけは展開時の値なので `=` になる (while の添字を進める形)。
+    // ここでは左辺が integer かどうか分からないので、両方受けて elaborate に任せる。
+    if (at('=')) {
+      next();
+      const rhs = parseExpr();
+      expect(';');
+      return { type: 'ba', lhs, rhs, line };
+    }
     expect('<=');
     const rhs = parseExpr();
     expect(';');
     return { type: 'nb', lhs, rhs, line };
+  }
+
+  /**
+   * while。elaborate 時に完全展開するので、条件は毎回定数式でなければならない。
+   * つまり動くのは integer で宣言した変数だけで、それを本体で進める形になる:
+   *
+   *   i = 0;
+   *   while (i < 8) begin q[i] <= d[7-i]; i = i + 1; end
+   */
+  function parseWhile(ctx) {
+    const line = expect('while').line;
+    expect('(');
+    const cond = parseExpr();
+    expect(')');
+    return { type: 'while', cond, body: parseStmtBlock(ctx), line };
+  }
+
+  /** repeat。回数は定数式。ループ変数が要らないぶん while より素直に書ける */
+  function parseRepeat(ctx) {
+    const line = expect('repeat').line;
+    expect('(');
+    const count = parseExpr();
+    expect(')');
+    return { type: 'repeat_stmt', count, body: parseStmtBlock(ctx), line };
   }
 
   /**

@@ -377,6 +377,177 @@ endmodule`;
   }
 }
 
+// ------------------------------------------------------------- while / repeat
+//
+// どちらも elaborate 時に完全展開する。回路になった結果が
+// 「同じことを for や並べ書きで書いたのと一致するか」で見る。
+async function testLoops() {
+  // ---- while: 添字を本体で進める ----
+  const rev8 = (v) => { let r = 0; for (let i = 0; i < 8; i++) r |= ((v >> i) & 1) << (7 - i); return r; };
+  const { wasm: ww, ref: wr, all: wAll } = await bothSims(`module w(input clk, input [7:0] d,
+    output reg [7:0] q, output reg [7:0] acc);
+    integer i;
+    always @(posedge clk) begin
+      i = 0;
+      while (i < 8) begin
+        q[i] <= d[7-i];          // ビット反転
+        i = i + 1;
+      end
+      acc <= d;
+      i = 0;
+      while (i < 3) begin acc <= acc ^ 8'h0F; i = i + 1; end   // 後の代入が勝つ
+    end
+  endmodule`);
+  let bad = null;
+  for (let d = 0; d < 256 && !bad; d++) {
+    for (const sim of wAll) {
+      sim.setInput('d', d).step();
+      if (Number(sim.get('q')) !== rev8(d)) {
+        bad = `${sim.constructor.name} d=${d} q=${sim.get('q')} (期待 ${rev8(d)})`;
+      }
+    }
+  }
+  ok(!bad, 'while: ビット反転が全 256 通り正しい', bad ?? '');
+
+  // for で書いたのとゲート数が一致する (展開の結果が同じ)
+  const viaWhile = compile(`module m(input clk, input [7:0] d, output reg [7:0] q);
+    integer i;
+    always @(posedge clk) begin
+      i = 0;
+      while (i < 8) begin q[i] <= d[7-i]; i = i + 1; end
+    end
+  endmodule`);
+  const viaFor = compile(`module m(input clk, input [7:0] d, output reg [7:0] q);
+    integer i;
+    always @(posedge clk) for (i = 0; i < 8; i = i + 1) q[i] <= d[7-i];
+  endmodule`);
+  eqs(viaWhile.stats.gates, viaFor.stats.gates, 'while: for で書いたのと同じゲート数');
+  eqs(viaWhile.stats.nets, viaFor.stats.nets, 'while: ネット数も同じ');
+
+  // 添字は 1 刻みでなくてもよい / 減らしてもよい
+  const { wasm: sw } = await bothSims(`module s(input clk, input [7:0] d, output reg [7:0] q);
+    integer i;
+    always @(posedge clk) begin
+      q <= 8'h00;
+      i = 6;
+      while (i >= 0) begin q[i] <= d[i]; i = i - 2; end    // 偶数ビットだけ通す
+    end
+  endmodule`);
+  sw.setInput('d', 0xff).step();
+  eq(sw.get('q'), 0x55, 'while: 添字を減らす向きにも回せる');
+
+  // ---- repeat: 回数が定数 ----
+  const { wasm: rw, ref: rr } = await bothSims(`module r(input clk, input [7:0] d,
+    output reg [7:0] q, output reg [7:0] p);
+    always @(posedge clk) begin
+      q <= d;
+      repeat (3) q <= q ^ 8'h0F;      // 同じビットに 3 回 → 最後が勝つ
+      p <= 8'h01;
+      repeat (0) p <= 8'hFF;          // 0 回なら何も起きない
+    end
+  endmodule`);
+  for (const sim of [rw, rr]) {
+    // ノンブロッキングなので、繰り返した 3 回の右辺はどれもエッジ前の q を読む。
+    // 同じビットへの代入は後が勝つので、結果は「1 回だけ書いた」のと同じになる
+    sim.setInput('d', 0xa5).step();          // q はエッジ前 0 → 0 ^ 0F
+    eq(sim.get('q'), 0x0f, 'repeat: 右辺はエッジ前の q を読み、最後の代入が勝つ');
+    sim.step();                              // q はエッジ前 0F → 0F ^ 0F
+    eq(sim.get('q'), 0x00, 'repeat: 次のエッジでも同じ規則');
+    eq(sim.get('p'), 1, 'repeat: 0 回は何も生まない');
+  }
+  const viaRepeat = compile(`module m(input clk, input [7:0] d, output reg [7:0] q);
+    integer i;
+    always @(posedge clk) begin q <= d; repeat (4) begin q <= q + 1; end end
+  endmodule`);
+  const viaFlat = compile(`module m(input clk, input [7:0] d, output reg [7:0] q);
+    always @(posedge clk) begin q <= d; q <= q + 1; q <= q + 1; q <= q + 1; q <= q + 1; end
+  endmodule`);
+  eqs(viaRepeat.stats.gates, viaFlat.stats.gates, 'repeat: 並べ書きと同じゲート数');
+
+  // ---- always @(*) と function の中でも動く ----
+  const comb = await bothSims(`module c(input [7:0] d, output reg [3:0] ones, output reg [3:0] f4);
+    integer k;
+    function [3:0] count4(input [7:0] v);
+      integer j;
+      begin
+        count4 = 4'h0;
+        j = 0;
+        repeat (4) begin count4 = count4 + v[j]; j = j + 1; end
+      end
+    endfunction
+    always @(*) begin
+      ones = 4'h0;
+      k = 0;
+      while (k < 8) begin ones = ones + d[k]; k = k + 1; end   // ブロッキングの積み上げ
+      f4 = count4(d);
+    end
+  endmodule`);
+  let cbad = null;
+  for (let d = 0; d < 256 && !cbad; d++) {
+    const ones = d.toString(2).split('').filter((x) => x === '1').length;
+    const low4 = (d & 15).toString(2).split('').filter((x) => x === '1').length;
+    for (const sim of comb.all) {
+      sim.setInput('d', d).eval();
+      if (Number(sim.get('ones')) !== ones || Number(sim.get('f4')) !== low4) {
+        cbad = `${sim.constructor.name} d=${d} ones=${sim.get('ones')} f4=${sim.get('f4')}`;
+      }
+    }
+  }
+  ok(!cbad, 'while / repeat: always @(*) と function の中でも動く (全 256 通り)', cbad ?? '');
+
+  // ---- examples/loops8.v ----
+  const ex = await bothSims(example('loops8.v'));
+  let ebad = null;
+  for (let d = 0; d < 256 && !ebad; d++) {
+    let even = 0;
+    for (let i = 0; i <= 6; i += 2) even |= ((d >> i) & 1) << i;
+    const ones = d.toString(2).split('').filter((x) => x === '1').length;
+    for (const sim of ex.all) {
+      sim.setInput('d', d).step();
+      const want = { rev: rev8(d), even, ones };
+      for (const [k, v] of Object.entries(want)) {
+        if (Number(sim.get(k)) !== v && !ebad) {
+          ebad = `${sim.constructor.name} d=${d} ${k}=${sim.get(k)} (期待 ${v})`;
+        }
+      }
+    }
+  }
+  ok(!ebad, 'while / repeat: loops8.v の 3 出力が全 256 通り正しい', ebad ?? '');
+
+  // ---- 入れ子の begin … end (ループの本体で書きがちな形) ----
+  const { wasm: bw } = await bothSims(`module b(input clk, input [3:0] a, output reg [3:0] q);
+    always @(posedge clk) begin begin q <= a; end end
+  endmodule`);
+  bw.setInput('a', 9).step();
+  eq(bw.get('q'), 9, 'while / repeat: 入れ子の begin … end が通る');
+
+  // ---- 入れ子 ----
+  const nest = await bothSims(`module n(input clk, input [3:0] a, output reg [15:0] grid);
+    integer i, j;
+    always @(posedge clk) begin
+      i = 0;
+      while (i < 4) begin
+        j = 0;
+        repeat (4) begin
+          grid[i*4+j] <= a[i] & a[j];
+          j = j + 1;
+        end
+        i = i + 1;
+      end
+    end
+  endmodule`);
+  for (const sim of nest.all) {
+    for (let a = 0; a < 16; a++) {
+      sim.setInput('a', a).step();
+      let want = 0;
+      for (let i = 0; i < 4; i++) {
+        for (let j = 0; j < 4; j++) want |= (((a >> i) & (a >> j)) & 1) << (i * 4 + j);
+      }
+      eq(sim.get('grid'), want, `while / repeat: 入れ子が 2 次元に展開される (a=${a})`);
+    }
+  }
+}
+
 // ------------------------------------------------------------------ initial
 //
 // initial は「電源投入時のレジスタの値」として読む。値そのものより、
@@ -3050,7 +3221,7 @@ async function testErrors() {
       /1 ビットでなければならない/],
     ['ブロッキング代入の誤用',
       `module m(input clk, a, output reg q); always @(posedge clk) q = a; endmodule`,
-      /ノンブロッキング/],
+      /'=' は integer にだけ書ける \('q' はレジスタなので <= を使う\)/],
     ['無い module のインスタンス化',
       `module m(input a, output y); sub u0(y, a); endmodule`,
       /module 'sub' が見つからない/],
@@ -3271,7 +3442,7 @@ async function testErrors() {
       /always @\(\*\) の中はブロッキング代入 = を使う/],
     ['always @(posedge) でブロッキング代入',
       `module m(input clk, input a, output reg y); always @(posedge clk) y = a; endmodule`,
-      /always @\(posedge …\) の中はノンブロッキング代入 <= を使う/],
+      /always @\(posedge …\) の中の '=' は integer にだけ書ける/],
     ['always @(*) の中に代入が無い',
       `module m(input a, output reg y); always @(*) begin end assign y = a; endmodule`,
       /always @\(\*\) の中に代入が無い/],
@@ -3365,12 +3536,37 @@ async function testErrors() {
        integer i;
        always @(posedge clk) for (i = 0; i < d; i = i + 1) q[i] <= d[i]; endmodule`,
       /'d' は定数式に使えない/],
-    ['while は未対応',
-      `module m(input clk, output reg y); always @(posedge clk) while (1) y <= 1'b0; endmodule`,
-      /while は未対応 \(繰り返しは回数の決まった for だけ\)/],
-    ['repeat も未対応',
-      `module m(input clk, output reg y); always @(posedge clk) repeat (3) y <= 1'b0; endmodule`,
-      /repeat は未対応/],
+    // while / repeat — 展開できない形を断る
+    ['while の条件が定数でない',
+      `module m(input clk, input a, output reg y);
+       always @(posedge clk) while (a) y <= 1'b0; endmodule`,
+      /'a' は定数式に使えない/],
+    ['while が終わらない',
+      `module m(input clk, output reg y);
+       integer i;
+       always @(posedge clk) begin i = 0; while (i < 8) y <= 1'b0; end endmodule`,
+      /while の繰り返しが 4096 回を超えた/],
+    ['repeat の回数が定数でない',
+      `module m(input clk, input [2:0] n, output reg y);
+       always @(posedge clk) repeat (n) y <= 1'b0; endmodule`,
+      /'n' は定数式に使えない/],
+    ['repeat の回数が負',
+      `module m(input clk, output reg y); always @(posedge clk) repeat (-1) y <= 1'b0; endmodule`,
+      /repeat の回数が負/],
+    ['repeat の回数が多すぎる',
+      `module m(input clk, output reg y); always @(posedge clk) repeat (99999) y <= 1'b0; endmodule`,
+      /repeat の回数が多すぎる/],
+    ['文の begin にラベル',
+      `module m(input clk, output reg q); always @(posedge clk) begin : b q <= 1'b0; end endmodule`,
+      /文の begin にラベルは書けない/],
+    ['forever は未対応',
+      `module m(input clk, output reg y); always @(posedge clk) forever y <= 1'b0; endmodule`,
+      /forever は未対応 \(繰り返しは回数が定数に決まるものだけ\)/],
+    ['integer にビット選択',
+      `module m(input clk, output reg y);
+       integer i;
+       always @(posedge clk) begin i[0] = 1; y <= 1'b0; end endmodule`,
+      /integer 'i' にビット選択は書けない/],
     ['integer に幅は書けない',
       `module m(output y); integer [3:0] i; assign y = 1'b0; endmodule`,
       /integer に幅は書けない/],
@@ -3430,7 +3626,7 @@ async function testErrors() {
       /default が 2 つ/],
     ['if の中でブロッキング代入',
       `module m(input clk, input a, output reg q); always @(posedge clk) if (a) q = 1'b1; endmodule`,
-      /ノンブロッキング/],
+      /'=' は integer にだけ書ける/],
     ['if で wire を駆動',
       `module m(input clk, input a, output y); always @(posedge clk) if (a) y <= 1'b1; endmodule`,
       /reg 宣言が必要/],
@@ -3585,9 +3781,17 @@ function randomDesign(rng, nWires) {
   // 分岐のある always ブロックも 1 本入れる。mux 木がコード生成まで通るか見る。
   // 分岐の中身は begin...end で囲んで、dangling else を生まないようにする。
   lines.unshift('  reg [7:0] r2;');
+  lines.unshift('  integer li;');   // while の添字
   const stmt = (depth) => {
     const r = rng();
     if (depth <= 0 || r < 0.4) return `r2 <= ${expr(2)};`;
+    // repeat と while も混ぜる。while は添字を本体で進める形にしないと終わらない
+    if (r < 0.44) return `repeat (${1 + Math.floor(rng() * 3)}) begin ${stmt(depth - 1)} end`;
+    if (r < 0.48) {
+      // 呼び出し側が begin … end で囲むので、2 文並べて返してよい
+      const n = 1 + Math.floor(rng() * 3);
+      return `li = 0; while (li < ${n}) begin ${stmt(depth - 1)} li = li + 1; end`;
+    }
     if (r < 0.7) {
       const then = `begin ${stmt(depth - 1)} end`;
       const els = rng() < 0.5 ? ` else begin ${stmt(depth - 1)} end` : '';
@@ -3667,7 +3871,7 @@ async function testRandomDiff() {
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
   const seen = {
     'if': 0, 'case': 0, 'casez': 0, 'function': 0, '+ / -': 0, '* / %': 0, 'generate': 0,
-    'always @(*)': 0, '{n{x}}': 0, 'wire t = 式': 0,
+    'always @(*)': 0, '{n{x}}': 0, 'wire t = 式': 0, 'repeat': 0, 'while': 0,
     '比較': 0, 'シフト': 0, '論理': 0,
     '非同期リセット': 0, '階層': 0, 'parameter': 0, 'リダクション': 0,
   };
@@ -3684,6 +3888,8 @@ async function testRandomDiff() {
     if (src.includes('always @(*)')) seen['always @(*)']++;
     if (/\{\d+\{/.test(src)) seen['{n{x}}']++;
     if (/wire \[7:0\] w\d+ =/.test(src)) seen['wire t = 式']++;
+    if (src.includes('repeat (')) seen['repeat']++;
+    if (src.includes('while (li')) seen['while']++;
     if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
     if (/(<<|>>)/.test(src)) seen['シフト']++;
     if (/(&&|\|\||\(!)/.test(src)) seen['論理']++;
@@ -4455,6 +4661,7 @@ const suites = [
   ['繰り返し連接 / 宣言の代入', testSugar],
   ['階層参照', testHierRef],
   ['initial', testInitial],
+  ['while / repeat', testLoops],
   ['比較器', testCompare],
   ['ALU (case の書き方)', testAlu],
   ['非 ANSI と多入力ゲート', testOnehot],

@@ -1078,6 +1078,64 @@ export function elaborate(mod, all = [mod]) {
    *
    * @param run 本体を走らせる関数 (always なら runStmts、function なら runFuncStmts)
    */
+  /**
+   * while。`for` と同じく elaborate 時に完全展開するので、条件は毎回定数式。
+   * `for` と違ってループ変数を進めるのは本体側 (`i = i + 1;`) なので、
+   * 進め忘れると条件が変わらず MAX_UNROLL で止まる。
+   */
+  function unrollWhile(st, state, run) {
+    let cur = state;
+    try {
+      for (let n = 0; ; n++) {
+        selfWidthCache.clear();      // 添字が変わると部分選択の幅も変わり得る
+        if (constExpr(st.cond) === 0n) break;
+        if (n >= MAX_UNROLL) {
+          throw new CompileError(
+            `while の繰り返しが ${MAX_UNROLL} 回を超えた `
+            + '(条件に出てくる integer を本体で進めているか?)', st.line);
+        }
+        cur = run(st.body, cur);
+      }
+    } finally {
+      selfWidthCache.clear();
+    }
+    return cur;
+  }
+
+  /** repeat。回数が定数に決まるので、ループ変数を持たずに展開できる */
+  function unrollRepeat(st, state, run) {
+    const n = constExpr(st.count);
+    if (n < 0n) throw new CompileError(`repeat の回数が負 (${n})`, st.line);
+    if (n > MAX_UNROLL) {
+      throw new CompileError(`repeat の回数が多すぎる (${n}。上限 ${MAX_UNROLL})`, st.line);
+    }
+    let cur = state;
+    try {
+      for (let k = 0; k < Number(n); k++) {
+        selfWidthCache.clear();
+        cur = run(st.body, cur);
+      }
+    } finally {
+      selfWidthCache.clear();
+    }
+    return cur;
+  }
+
+  /**
+   * integer への代入。信号ではなく「展開時の整数」なので回路は作らない。
+   * `while` の添字を進めるのに要る (`for` はヘッダで進めるのでこれが無くても済んだ)。
+   * 左辺が integer でなければ false を返して、呼び出し側の通常の代入に落とす。
+   */
+  function assignInteger(st) {
+    const key = resolveScope(st.lhs.name) + st.lhs.name;
+    if (!loopVars.has(key)) return false;
+    if (st.lhs.range) {
+      throw new CompileError(`integer '${st.lhs.name}' にビット選択は書けない`, st.line);
+    }
+    params.set(key, constExpr(st.rhs));
+    return true;
+  }
+
   function unrollFor(st, state, run) {
     const key = resolveScope(st.name) + st.name;
     if (!loopVars.has(key)) {
@@ -1112,7 +1170,25 @@ export function elaborate(mod, all = [mod]) {
     let cur = state;
     for (const st of stmts) {
       syncEnv(cur);                     // 右辺は「ここまでの結果」を読む
+
+      if (st.type === 'block') {          // 入れ子の begin … end
+        cur = runFuncStmts(st.stmts, cur);
+        continue;
+      }
+
+      if (st.type === 'while') {
+        cur = unrollWhile(st, cur, runFuncStmts);
+        continue;
+      }
+
+      if (st.type === 'repeat_stmt') {
+        cur = unrollRepeat(st, cur, runFuncStmts);
+        continue;
+      }
+
       if (st.type === 'ba') {
+        // integer への代入は展開時の値で、回路にはならない
+        if (assignInteger(st)) continue;
         const target = cur.get(st.lhs.name);
         if (!target) {
           throw new CompileError(
@@ -1186,6 +1262,29 @@ export function elaborate(mod, all = [mod]) {
   function runStmts(stmts, state) {
     let cur = state;
     for (const st of stmts) {
+      // `=` はここでは integer への代入だけ。レジスタは `<=` でなければならない
+      if (st.type === 'ba') {
+        if (assignInteger(st)) continue;
+        throw new CompileError(
+          `always @(posedge …) の中の '=' は integer にだけ書ける `
+          + `('${st.lhs.name}' はレジスタなので <= を使う)`, st.line);
+      }
+
+      if (st.type === 'block') {          // 入れ子の begin … end
+        cur = runStmts(st.stmts, cur);
+        continue;
+      }
+
+      if (st.type === 'while') {
+        cur = unrollWhile(st, cur, runStmts);
+        continue;
+      }
+
+      if (st.type === 'repeat_stmt') {
+        cur = unrollRepeat(st, cur, runStmts);
+        continue;
+      }
+
       if (st.type === 'nb') {
         const q = lhsRegBits(st.lhs, st.line);
         // 代入先の幅が右辺の文脈幅になる (文脈依存幅)
@@ -1393,8 +1492,10 @@ export function elaborate(mod, all = [mod]) {
   /** 文の並びから代入先の名前を集める (分岐の中も見る) */
   function combTargets(stmts, out = new Set()) {
     for (const st of stmts) {
-      if (st.type === 'ba') out.add(st.lhs.name);
-      else if (st.type === 'for') combTargets(st.body, out);
+      // integer は展開時の変数なので、駆動する信号としては数えない
+      if (st.type === 'ba') { if (!loopVars.has(resolveScope(st.lhs.name) + st.lhs.name)) out.add(st.lhs.name); }
+      else if (st.type === 'block') combTargets(st.stmts, out);
+      else if (st.type === 'for' || st.type === 'while' || st.type === 'repeat_stmt') combTargets(st.body, out);
       else if (st.type === 'if') {
         combTargets(st.then, out);
         if (st.else) combTargets(st.else, out);
@@ -1412,7 +1513,10 @@ export function elaborate(mod, all = [mod]) {
       if (st.type === 'ba') {
         refNames(st.rhs, out);
         if (st.lhs.range) { refNames(st.lhs.range.msb, out); refNames(st.lhs.range.lsb, out); }
-      } else if (st.type === 'for') combReads(st.body, out);
+      } else if (st.type === 'block') combReads(st.stmts, out);
+      else if (st.type === 'for') combReads(st.body, out);
+      else if (st.type === 'repeat_stmt') combReads(st.body, out);
+      else if (st.type === 'while') { refNames(st.cond, out); combReads(st.body, out); }
       else if (st.type === 'if') {
         refNames(st.cond, out);
         combReads(st.then, out);
