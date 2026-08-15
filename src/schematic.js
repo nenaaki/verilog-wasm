@@ -38,6 +38,11 @@ export const PARTS = {
   // ---- 算術・比較・選択 ----
   add:   { label: '加算', glyph: 'A+B', btn: '加算', ins: 2, outs: 1 },
   sub:   { label: '減算', glyph: 'A-B', btn: '減算', ins: 2, outs: 1 },
+  // 乗除算も出力の幅は入力と同じ (あふれた桁は捨てる)。加減算と同じ same 規則。
+  // 幅を残したければ連接で広げてから入れる
+  mul:   { label: '乗算', glyph: 'A*B', btn: '乗算', ins: 2, outs: 1 },
+  div:   { label: '除算', glyph: 'A/B', btn: '除算', ins: 2, outs: 1 },
+  mod:   { label: '剰余', glyph: 'A%B', btn: '剰余', ins: 2, outs: 1 },
   eq:    { label: '一致', glyph: 'A=B', btn: '一致', ins: 2, outs: 1, wrule: 'cmp' },
   lt:    { label: '小なり', glyph: 'A<B', btn: '小なり', ins: 2, outs: 1, wrule: 'cmp' },
   // 選択。上から順に 選択信号 (1 ビット) / 1 のとき / 0 のとき
@@ -402,6 +407,9 @@ const EXPR = {
   cat:  (args) => `{${args.join(', ')}}`,   // 端子の数は可変。先頭が上位ビット
   add:  ([a, b]) => `${a} + ${b}`,
   sub:  ([a, b]) => `${a} - ${b}`,
+  mul:  ([a, b]) => `${a} * ${b}`,
+  div:  ([a, b]) => `${a} / ${b}`,
+  mod:  ([a, b]) => `${a} % ${b}`,
   eq:   ([a, b]) => `${a} == ${b}`,
   lt:   ([a, b]) => `${a} < ${b}`,
   mux:  ([s, a, b]) => `${s} ? ${a} : ${b}`,

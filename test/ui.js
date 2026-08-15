@@ -1235,7 +1235,7 @@ ok(await js('__nodeText("less")') === 'less0', '部品: 9 < 5 は 0', await js('
 
 // パレットに新しい部品のボタンが並んでいる
 const btns = await js(`[...document.querySelectorAll('#palette button')].map(b => b.textContent).join(',')`);
-for (const label of ['ビット', '連接', '加算', '減算', '一致', '小なり', '選択']) {
+for (const label of ['ビット', '連接', '加算', '減算', '乗算', '除算', '剰余', '一致', '小なり', '選択']) {
   ok(btns.includes(label), `部品: パレットに「${label}」がある`, btns);
 }
 
@@ -1253,7 +1253,7 @@ ok(barHs.split(',').every((h) => Number(h) < 60), 'パレット: 上のツール
 ok(await js(`(() => { const p = document.getElementById('palette');
   return p.scrollHeight <= p.clientHeight + 1; })()`), 'パレット: 既定の大きさなら全部入る');
 const partCount = await js(`document.querySelectorAll('#palette button.part').length`);
-ok(partCount === 18, 'パレット: 置ける部品が 18 個そろっている', String(partCount));
+ok(partCount === 21, 'パレット: 置ける部品が 21 個そろっている', String(partCount));
 // 見出しで区切る。書き忘れた部品が消えないよう「その他」に落ちる作りなので、
 // その他が出ていないこと = 一覧に漏れが無いこと
 const gl = await js(`[...document.querySelectorAll('#palette .glabel')].map(g => g.textContent).join(',')`);

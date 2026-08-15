@@ -74,7 +74,7 @@
     font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em;
   }
   #palette .glabel:first-child { margin-top: 0; }
-  /* 18 個を縦に並べるので、行の高さを詰めて窓の高さに収める */
+  /* 21 個を縦に並べるので、行の高さを詰めて窓の高さに収める */
   #palette button { padding: 3px 2px; font-size: 11.5px; line-height: 1.35; }
   /* 保存した回路の名前は長くなりうるので、バーを押し広げない範囲で切る */
   #blockPick { max-width: 150px; }
@@ -1798,7 +1798,7 @@ const PALETTE_GROUPS = [
   ['ゲート', ['not', 'and', 'or', 'xor', 'nand', 'nor', 'xnor']],
   ['メモリ', ['dff']],
   ['幅', ['bit', 'cat']],
-  ['算術', ['add', 'sub', 'eq', 'lt', 'mux']],
+  ['算術', ['add', 'sub', 'mul', 'div', 'mod', 'eq', 'lt', 'mux']],
 ];
 
 function buildPalette() {

@@ -128,6 +128,13 @@ export function elaborate(mod, all = [mod]) {
       if (a === b) return a;
       if (a === CONST1 && b === CONST0) return s;      // s ? 1 : 0 = s
       if (a === CONST0 && b === CONST1) return newGate('not', [s]);
+      // 選ばれる側が選択信号そのもの / その反転なら、その枝の値は定数に決まる。
+      // 割り算の剰余の上位ビットがちょうどこの形 (s ? ~s : 0) になり、
+      // これを畳めるかどうかで非サイズリテラルの除算が 4 倍変わる
+      if (a === s) return newGate('or', [s, b]);       // s ? 1 : b = s | b
+      if (b === s) return newGate('and', [s, a]);      // s ? a : 0 = s & a
+      if (isInverseOf(s, a)) return newGate('and', [a, b]);   // s ? 0 : b = ~s & b
+      if (isInverseOf(s, b)) return newGate('or', [b, a]);    // s ? a : 1 = ~s | a
       return null;
     }
     return null;
@@ -170,9 +177,6 @@ export function elaborate(mod, all = [mod]) {
   // 添字が parameter と同じ経路でそのまま定数式として解ける
   const loopVars = new Set();
   const MAX_UNROLL = 4096;             // 展開しきれない for の歯止め
-
-  // 定数式では計算できるが、回路にはしない演算子
-  const MULDIV = { '*': '乗算', '/': '除算', '%': '剰余' };
 
   const funcs = new Map();             // 完全修飾名 → AST
   // 展開中のローカル環境。null 以外のあいだ refBits がこちらを先に見る。
@@ -465,6 +469,74 @@ export function elaborate(mod, all = [mod]) {
   }
 
   /**
+   * addBits と同じ加算器だが、最上位段の桁上げ出力も返す。
+   * 割り算の「引けるかどうか」は a - b の桁上げ出力そのものなので、和と判定を
+   * 1 個の加算器から取り出す必要がある (geCarry は判定だけで和を作らない)。
+   */
+  function addCarry(a, b, cin) {
+    let carry = cin;
+    const bits = [];
+    for (let i = 0; i < a.length; i++) {
+      const axb = newGate('xor', [a[i], b[i]]);
+      bits.push(newGate('xor', [axb, carry]));
+      carry = newGate('or', [newGate('and', [a[i], b[i]]), newGate('and', [carry, axb])]);
+    }
+    return { bits, carry };
+  }
+
+  /**
+   * a * b。両辺は実効幅 w に揃えてある。部分積を w 段積む配列乗算器で、
+   * w ビットに収まらない桁は作らない (+ / - と同じく、あふれは捨てる)。
+   *
+   * 部分積の j 段目は「a を j ビット左にずらして b[j] でマスクしたもの」なので、
+   * 下位 j ビットは必ず 0 になる。そこは加算器を置かず、累算器の j ビット目から
+   * 上だけを足す。全加算器は w²/2 個ほどで、素朴に w 段の w ビット加算を並べる
+   * より半分で済む。
+   *
+   * 片側が定数なら fold が効いて勝手に縮む。b[j] が 0 の段は部分積が丸ごと消え、
+   * 1 の段は AND が素通りするので、`a * 4` は加算器 0 個のただのシフトになる。
+   * 幅が 32 に広がる非サイズリテラルでも、上位の 0 ビットが同じ経路で消える。
+   */
+  function mulBits(a, b) {
+    const w = a.length;
+    let acc = a.map((n) => newGate('and', [n, b[0]]));
+    for (let j = 1; j < w; j++) {
+      const row = a.slice(0, w - j).map((n) => newGate('and', [n, b[j]]));
+      const sum = addBits(acc.slice(j), row, CONST0);
+      acc = [...acc.slice(0, j), ...sum];
+    }
+    return acc;
+  }
+
+  /**
+   * 符号なしの a / b と a % b を 1 個の回路から取り出す (両方要ることは少ないが、
+   * 使わない側は刈り取りが落とす)。筆算そのままの復元法で、上の桁から 1 ビットずつ:
+   *
+   *   剰余を 1 ビット左にずらして a のその桁を下ろす
+   *   → b を引いてみる → 引けたら (桁上げが立ったら) 商のその桁が 1、剰余を差に更新
+   *
+   * 剰余は常に b 未満なので w ビットに収まるが、左にずらした直後だけ 1 ビット
+   * はみ出す。そこで途中は w+1 ビットで持ち、最後に切り詰める。
+   *
+   * **b が 0 のときは全桁で「引けた」ことになり、商は全 1・剰余は a になる。**
+   * Verilog は x を返すが、この処理系は x を値として持たないので、回路が自然に
+   * 出す値をそのまま定義とした。
+   */
+  function divRem(a, b) {
+    const w = a.length;
+    const nb = [...b, CONST0].map((n) => newGate('not', [n]));   // ~b (w+1 ビット)
+    let rem = Array(w + 1).fill(CONST0);
+    const quot = new Array(w);
+    for (let i = w - 1; i >= 0; i--) {
+      rem = [a[i], ...rem.slice(0, w)];                          // rem = rem<<1 | a[i]
+      const { bits, carry } = addCarry(rem, nb, CONST1);         // rem - b
+      quot[i] = carry;                                           // 桁上げ = 引けた = rem >= b
+      rem = rem.map((n, k) => newGate('mux', [carry, bits[k], n]));
+    }
+    return { quot, rem: rem.slice(0, w) };
+  }
+
+  /**
    * a == b / a != b。差分ビットを OR リダクションして 1 ビットにする。
    * XNOR の AND リダクションでも同じだが、こちらは基本ゲートだけで済む。
    */
@@ -704,11 +776,6 @@ export function elaborate(mod, all = [mod]) {
         throw new CompileError(`未対応の単項演算子 '${e.op}'`, e.line);
       }
       case 'bin': {
-        // 乗除算は回路にしない。定数どうしなら constExpr が計算するので、ここに
-        // 来た = 信号が絡んでいる。ビット展開すると回路が一気に膨らむため断る
-        if (MULDIV[e.op]) {
-          throw new CompileError(`${MULDIV[e.op]}は未対応 (定数式の中だけで使える)`, e.line);
-        }
         // --- 文脈を受け取らないもの (結果 1 ビット) ---
         if (e.op === '&&' || e.op === '||') {
           // 両辺を「0 でないか」に潰してからゲート 1 個。
@@ -742,6 +809,9 @@ export function elaborate(mod, all = [mod]) {
         const a = evalExpr(e.a, w);
         const b = evalExpr(e.b, w);
         if (e.op === '+' || e.op === '-') return addSub(a, b, e.op);
+        if (e.op === '*') return mulBits(a, b);
+        if (e.op === '/') return divRem(a, b).quot;
+        if (e.op === '%') return divRem(a, b).rem;
         // 中置の ~^ / ^~ はビットごとの XNOR
         if (e.op === '~^' || e.op === '^~') {
           return a.map((n, i) => newGate('not', [newGate('xor', [n, b[i]])]));

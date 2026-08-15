@@ -225,6 +225,158 @@ endmodule`;
   ok(compiled.stats.regs === 0, '加算・減算: レジスタなし', `regs=${compiled.stats.regs}`);
 }
 
+// ------------------------------------------------------------------ 乗除算
+//
+// 配列乗算器と復元法の割り算。加算器と同じく JS の算術と全数で突き合わせる。
+async function testMulDiv() {
+  const src = `module muldiv(
+  input [3:0] a,
+  input [3:0] b,
+  output [7:0] mul,
+  output [3:0] mulw,
+  output [3:0] dv,
+  output [3:0] md,
+  output [7:0] sq,
+  output [7:0] mix
+);
+  assign mul  = a * b;         // 8 ビット文脈なので桁あふれしない
+  assign mulw = a * b;         // 4 ビットに切り詰められる
+  assign dv   = a / b;
+  assign md   = a % b;
+  assign sq   = a * a;
+  assign mix  = (a + b) * 2 - a / 2;
+endmodule`;
+  const { compiled, wasm, ref } = await bothSims(src);
+
+  let bad = null;
+  for (let a = 0; a < 16 && !bad; a++) {
+    for (let b = 0; b < 16 && !bad; b++) {
+      for (const sim of [wasm, ref]) sim.setInput('a', a).setInput('b', b).eval();
+      // b が 0 のときは回路が出す値をそのまま仕様にしている
+      // (Verilog は x だが、この処理系は x を値として持たない)
+      const expect = {
+        mul: (a * b) & 255,
+        mulw: (a * b) & 15,
+        dv: b === 0 ? 15 : Math.floor(a / b),
+        md: b === 0 ? a : a % b,
+        sq: (a * a) & 255,
+        // 2 と 2 は非サイズリテラル = 32 ビットなので、式全体が 32 ビットで回る
+        mix: ((a + b) * 2 - Math.floor(a / 2)) & 255,
+      };
+      for (const [port, want] of Object.entries(expect)) {
+        for (const sim of [wasm, ref]) {
+          if (Number(sim.get(port)) !== want) {
+            bad = `${sim.constructor.name} ${port}: a=${a} b=${b} 期待 ${want} / 実際 ${sim.get(port)}`;
+            break;
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, '乗除算: 全 256 通りが JS の算術と一致', bad ?? '');
+
+  for (const sim of [wasm, ref]) sim.setInput('a', 7).setInput('b', 5).eval();
+  eq(wasm.get('mul'), 35, '乗算: 7 * 5 は 8 ビットで 35');
+  eq(wasm.get('mulw'), 3, '乗算: 4 ビットに代入すると上位が落ちて 3');
+  eq(wasm.get('dv'), 1, '除算: 7 / 5 は 1 (切り捨て)');
+  eq(wasm.get('md'), 2, '剰余: 7 % 5 は 2');
+
+  // 0 除算。x を持たないので、復元法の回路がそのまま出す値になる
+  for (const sim of [wasm, ref]) sim.setInput('a', 9).setInput('b', 0).eval();
+  eq(wasm.get('dv'), 15, '除算: 0 で割ると全ビット 1');
+  eq(wasm.get('md'), 9, '剰余: 0 で割ると被除数がそのまま残る');
+  eq(ref.get('dv'), 15, '除算: 参照実装も同じ');
+
+  // 64 レーン同時。乗算器もビット単位なので、そのまま並列に効く
+  wasm.reset();
+  for (let lane = 0; lane < 64; lane++) {
+    wasm.setInputLane('a', lane, lane & 15).setInputLane('b', lane, (lane >> 2) & 15);
+  }
+  wasm.eval();
+  const lanes = wasm.getLanes('mul');
+  let laneBad = 0;
+  for (let lane = 0; lane < 64; lane++) {
+    if (Number(lanes[lane]) !== ((lane & 15) * ((lane >> 2) & 15))) laneBad++;
+  }
+  ok(laneBad === 0, '乗除算: 64 レーンが独立に計算される', `${laneBad} レーン不一致`);
+
+  eqs(compiled.stats.regs, 0, '乗除算: レジスタなし');
+
+  // --- 定数側は畳まれる ---
+  //
+  // 非サイズリテラルは 32 ビットに広がるが、定数畳み込みが部分積と筆算の段を
+  // 消すので、幅を書いた場合と同じ回路になる (README「サイズ無しリテラルの幅」)。
+  const gates = (expr) => compile(
+    `module g(input [7:0] a, input [7:0] b, output [7:0] p); assign p = ${expr}; endmodule`,
+  ).stats.gates;
+
+  eqs(gates("a * 4"), gates("a * 8'd4"), '乗算: 非サイズリテラルでも回路は増えない');
+  eqs(gates("a / 3"), gates("a / 8'd3"), '除算: 非サイズリテラルでも回路は増えない');
+  ok(gates('a * 4') < gates('a * 10'),
+    '乗算: 2 の冪の定数倍はシフトになる', `${gates('a * 4')} vs ${gates('a * 10')}`);
+  ok(gates('a * 4') < gates('a * b'),
+    '乗算: 定数倍は信号どうしより小さい', `${gates('a * 4')} vs ${gates('a * b')}`);
+
+  // --- examples/muldiv4.v ---
+  const ex = await bothSims(example('muldiv4.v'));
+  let exBad = null;
+  for (let a = 0; a < 16 && !exBad; a++) {
+    for (let b = 0; b < 16 && !exBad; b++) {
+      for (const sim of [ex.wasm, ex.ref]) sim.setInput('a', a).setInput('b', b).eval();
+      const expect = {
+        prod: a * b,
+        wrap: (a * b) & 15,
+        quot: b === 0 ? 15 : Math.floor(a / b),
+        rem: b === 0 ? a : a % b,
+        half: a >> 1,
+      };
+      for (const [port, want] of Object.entries(expect)) {
+        for (const sim of [ex.wasm, ex.ref]) {
+          if (Number(sim.get(port)) !== want) {
+            exBad = `${sim.constructor.name} ${port}: a=${a} b=${b} 期待 ${want} / 実際 ${sim.get(port)}`;
+            break;
+          }
+        }
+      }
+    }
+  }
+  ok(!exBad, 'muldiv4.v: 全 256 通りが JS の算術と一致', exBad ?? '');
+
+  // --- 回路エディタの乗算 / 除算 / 剰余の部品 ---
+  //
+  // 加減算と同じ 2 入力 1 出力の same 規則なので、生成される Verilog は 1 行。
+  // 4 ビットのバスを 2 本入れて、全 256 通りを Verilog 側と突き合わせる。
+  for (const [type, op] of [['mul', '*'], ['div', '/'], ['mod', '%']]) {
+    const g = toVerilog({
+      nodes: [
+        { id: 1, type: 'in', name: 'x', w: 4 }, { id: 2, type: 'in', name: 'y', w: 4 },
+        { id: 3, type }, { id: 4, type: 'out', name: 'z' },
+      ],
+      wires: [
+        { from: { node: 1, port: 0 }, to: { node: 3, port: 0 } },
+        { from: { node: 2, port: 0 }, to: { node: 3, port: 1 } },
+        { from: { node: 3, port: 0 }, to: { node: 4, port: 0 } },
+      ],
+    });
+    ok(g.source.includes(`x ${op} y`), `回路グラフ ${type}: assign に ${op} が出る`, g.source);
+    const { wasm: gw, ref: gr } = await bothSims(g.source);
+    let gBad = null;
+    for (let x = 0; x < 16 && !gBad; x++) {
+      for (let y = 0; y < 16 && !gBad; y++) {
+        for (const sim of [gw, gr]) sim.setInput('x', x).setInput('y', y).eval();
+        // 出力の幅は入力と同じ 4 ビット (あふれは捨てる)
+        const want = { mul: (x * y) & 15, div: y === 0 ? 15 : Math.floor(x / y), mod: y === 0 ? x : x % y }[type];
+        for (const sim of [gw, gr]) {
+          if (Number(sim.get('z')) !== want) {
+            gBad = `${sim.constructor.name} x=${x} y=${y} 期待 ${want} / 実際 ${sim.get('z')}`;
+          }
+        }
+      }
+    }
+    ok(!gBad, `回路グラフ ${type}: 全 256 通りが一致`, gBad ?? '');
+  }
+}
+
 // ------------------------------------------------------------------ 比較器
 //
 // 加算器と同じ理由で、ここも JS の比較と直接突き合わせる。
@@ -2437,16 +2589,6 @@ async function testErrors() {
     ['幅が負になる範囲',
       `module m #(parameter W = 0) (output [W-2:0] y); assign y = 0; endmodule`,
       /ビット範囲 \[-2:0\] が不正/],
-    // * / % は定数式では計算できる (for の添字に要る) が、回路にはしない
-    ['信号どうしの乗算は未対応',
-      `module m(input [3:0] a, output [7:0] y); assign y = a * a; endmodule`,
-      /乗算は未対応 \(定数式の中だけで使える\)/],
-    ['信号の除算は未対応',
-      `module m(input [3:0] a, output [3:0] y); assign y = a / 2; endmodule`,
-      /除算は未対応/],
-    ['信号の剰余は未対応',
-      `module m(input [3:0] a, output [3:0] y); assign y = a % 3; endmodule`,
-      /剰余は未対応/],
     ['定数式の 0 除算',
       `module m(output [7:0] y); localparam K = 3 / 0; assign y = K; endmodule`,
       /定数式で 0 除算/],
@@ -2699,7 +2841,12 @@ function randomDesign(rng, nWires) {
       if (k < 0.5) return `1'b${Math.floor(rng() * 2)}`;
       return s;
     }
-    if (r < 0.4) return `(~${expr(depth - 1)})`;
+    if (r < 0.37) return `(~${expr(depth - 1)})`;
+    if (r < 0.4) {
+      // 乗除算。回路が他より一桁大きいので、右辺は葉に留めて深追いしない
+      const md = ['*', '/', '%'][Math.floor(rng() * 3)];
+      return `(${expr(depth - 1)} ${md} ${expr(0)})`;
+    }
     if (r < 0.52) return `(${expr(depth - 1)} & ${expr(depth - 1)})`;
     if (r < 0.62) return `(${expr(depth - 1)} | ${expr(depth - 1)})`;
     if (r < 0.72) return `(${expr(depth - 1)} ^ ${expr(depth - 1)})`;
@@ -2848,7 +2995,8 @@ async function testRandomDiff() {
 
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
   const seen = {
-    'if': 0, 'case': 0, 'casez': 0, 'function': 0, '+ / -': 0, '比較': 0, 'シフト': 0, '論理': 0,
+    'if': 0, 'case': 0, 'casez': 0, 'function': 0, '+ / -': 0, '* / %': 0,
+    '比較': 0, 'シフト': 0, '論理': 0,
     '非同期リセット': 0, '階層': 0, 'parameter': 0, 'リダクション': 0,
   };
 
@@ -2859,6 +3007,7 @@ async function testRandomDiff() {
     if (/\bcasez \(/.test(src)) seen['casez']++;
     if (/\brndf\(/.test(src)) seen['function']++;
     if (/[-+] /.test(src)) seen['+ / -']++;
+    if (/[*/%] /.test(src)) seen['* / %']++;
     if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
     if (/(<<|>>)/.test(src)) seen['シフト']++;
     if (/(&&|\|\||\(!)/.test(src)) seen['論理']++;
@@ -3624,6 +3773,7 @@ const suites = [
   ['文脈依存幅', testContextWidth],
   ['畳み込み / CSE', testFoldCse],
   ['刈り取り', testPrune],
+  ['乗除算', testMulDiv],
   ['比較器', testCompare],
   ['ALU (case の書き方)', testAlu],
   ['非 ANSI と多入力ゲート', testOnehot],

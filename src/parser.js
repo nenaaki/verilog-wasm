@@ -100,8 +100,7 @@ export function parse(src) {
     };
   }
 
-  // * / % は + - より強く結合する (Verilog と同じ)。回路としては未対応で、
-  // 定数式の中だけで計算できる — for の添字 (`d[i*4+b]`) に要るため
+  // * / % は + - より強く結合する (Verilog と同じ)
   const parseMul = binaryLevel(['*', '/', '%'], () => parseUnary());
   const parseAdd = binaryLevel(['+', '-'], parseMul);
   const parseShift = binaryLevel(['<<', '>>'], parseAdd);
