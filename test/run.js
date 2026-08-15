@@ -377,6 +377,173 @@ endmodule`;
   }
 }
 
+// ------------------------------------------------------------------ generate
+//
+// generate は「どの項目を作るか」を elaborate 時に決める。展開の結果が正しいこと
+// (値) と、展開の仕方が正しいこと (スコープ・ゲート数) の両方を見る。
+async function testGenerate() {
+  // ---- for-generate: 段ごとに wire を持つ桁上げ伝播加算器 ----
+  const rip = await bothSims(example('ripple8.v'));
+  let bad = null;
+  for (let t = 0; t < 200 && !bad; t++) {
+    const a = (t * 37) & 255;
+    const b = (t * 91) & 255;
+    const cin = t & 1;
+    for (const sim of rip.all) {
+      sim.setInput('a', a).setInput('b', b).setInput('cin', cin).eval();
+      const total = a + b + cin;
+      if (Number(sim.get('sum')) !== (total & 255) || Number(sim.get('cout')) !== (total >> 8)) {
+        bad = `${sim.constructor.name} ${a}+${b}+${cin}: sum=${sim.get('sum')} cout=${sim.get('cout')}`;
+      }
+    }
+  }
+  ok(!bad, 'generate: ripple8.v が 8 ビット加算と桁上げで一致', bad ?? '');
+
+  // 手で書き並べたのとゲート数が一致すること (展開が余分な回路を作っていない)
+  const genAdd = compile(example('ripple8.v'));
+  // 同じ構造 (段のあいだの c も含めて) を手で書き並べる
+  const byHand = compile(`module h(input [1:0] a, input [1:0] b, input cin,
+    output [1:0] sum, output cout);
+    wire [2:0] c;
+    wire p0, g0, p1, g1;
+    assign c[0] = cin;
+    assign cout = c[2];
+    assign p0 = a[0] ^ b[0];
+    assign g0 = a[0] & b[0];
+    assign sum[0] = p0 ^ c[0];
+    assign c[1] = g0 | (p0 & c[0]);
+    assign p1 = a[1] ^ b[1];
+    assign g1 = a[1] & b[1];
+    assign sum[1] = p1 ^ c[1];
+    assign c[2] = g1 | (p1 & c[1]);
+  endmodule`);
+  const gen2bit = compile(example('ripple8.v').replace('parameter W = 8', 'parameter W = 2'));
+  eqs(gen2bit.stats.gates, byHand.stats.gates,
+    'generate: 展開した回路が手で書き並べたのと同じゲート数');
+  ok(genAdd.stats.gates > gen2bit.stats.gates,
+    'generate: W を増やすと段が増える', `${gen2bit.stats.gates} → ${genAdd.stats.gates}`);
+
+  // ---- if / case-generate と、generate キーワードを省いた形 ----
+  const pick = (mode, n) => `module g #(parameter MODE = ${mode}, parameter N = ${n})
+    (input [3:0] d, output [3:0] y0, output [3:0] y1);
+    generate
+      if (MODE == 0) begin : m
+        assign y0 = d;
+      end else begin : m
+        assign y0 = ~d;
+      end
+    endgenerate
+    case (N)                        // generate / endgenerate は省ける
+      1, 2:    assign y1 = d + 1;
+      3:       assign y1 = d + 3;
+      default: assign y1 = 4'h0;
+    endcase
+  endmodule`;
+  for (const [mode, n, wy0, wy1] of [[0, 1, 9, 10], [1, 2, 6, 10], [1, 3, 6, 12], [1, 9, 6, 0]]) {
+    const { wasm: gw, ref: gr } = await bothSims(pick(mode, n));
+    for (const sim of [gw, gr]) {
+      sim.setInput('d', 9).eval();
+      eq(sim.get('y0'), wy0, `generate: if で MODE=${mode} の枝が選ばれる`);
+      eq(sim.get('y1'), wy1, `generate: case で N=${n} の枝が選ばれる`);
+    }
+  }
+
+  // 選ばれなかった枝の回路は作られない。刈り取りで消えるのではなく、そもそも作らない
+  // (刈り取りなら stats.pruned に出るので、そこも見る)
+  const plain = compile(`module g(input [3:0] d, output [3:0] y); assign y = d; endmodule`);
+  const off = compile(`module g(input [3:0] d, output [3:0] y);
+    if (0) begin : on assign y = d * d; end else begin : on assign y = d; end
+  endmodule`);
+  eqs(off.stats.gates, plain.stats.gates, 'generate: 通らない枝の乗算器は作られない');
+  eqs(off.stats.pruned, plain.stats.pruned, 'generate: 刈り取りで消したのではない');
+
+  // ---- スコープ ----
+  const scoped = await bothSims(`module s #(parameter W = 4) (
+    input [W-1:0] a, output [W-1:0] shadow, output [W-1:0] outer, output [15:0] grid);
+    wire [W-1:0] t;
+    assign t = a;
+    genvar i, j;
+    for (i = 0; i < W; i = i + 1) begin : s1
+      wire t;                              // 内側の t (1 ビット) が勝つ
+      assign t = a[i];
+      assign shadow[i] = t;
+    end
+    for (i = 0; i < W; i = i + 1) begin : s2
+      assign outer[i] = t[W-1-i] ^ (W == 4);   // 外の t と parameter が見える
+    end
+    for (i = 0; i < 4; i = i + 1) begin : r   // 入れ子。添字は両方とも定数式
+      for (j = 0; j < 4; j = j + 1) begin : c
+        assign grid[i*4+j] = a[i] & a[j];
+      end
+    end
+  endmodule`);
+  for (const sim of scoped.all) {
+    for (let a = 0; a < 16; a++) {
+      sim.setInput('a', a).eval();
+      let grid = 0;
+      for (let i = 0; i < 4; i++) {
+        for (let j = 0; j < 4; j++) grid |= (((a >> i) & (a >> j)) & 1) << (i * 4 + j);
+      }
+      let outer = 0;
+      for (let i = 0; i < 4; i++) outer |= (((a >> (3 - i)) & 1) ^ 1) << i;
+      eq(sim.get('shadow'), a, `generate: 内側の宣言が勝つ (a=${a})`);
+      eq(sim.get('outer'), outer, `generate: 外の信号と parameter が見える (a=${a})`);
+      eq(sim.get('grid'), grid, `generate: 入れ子の for が 2 次元に展開される (a=${a})`);
+    }
+  }
+
+  // 展開した名前は完全修飾名になる (ラベル[添字].名前)
+  const named = compile(`module n(input a, output y);
+    genvar i;
+    for (i = 0; i < 2; i = i + 1) begin : blk
+      wire w;
+      assign w = a;
+    end
+    assign y = 1'b0;
+  endmodule`);
+  const netNames = named.netlist.nets.map((x) => x.name);
+  ok(netNames.includes('blk[0].w') && netNames.includes('blk[1].w'),
+    'generate: 段ごとの名前が blk[0].w / blk[1].w になる',
+    netNames.filter((x) => x.includes('blk')).join(','));
+
+  // ---- 階層の中の generate。同じ module を違うパラメータで 2 個 ----
+  const hier = await bothSims(`module popcnt #(parameter W = 4) (input [W-1:0] d, output [W-1:0] acc);
+    wire [W*W-1:0] s;
+    genvar i;
+    for (i = 0; i < W; i = i + 1) begin : p
+      if (i == 0) assign s[W-1:0] = d[0];
+      else        assign s[W*i+W-1 : W*i] = s[W*i-1 : W*i-W] + d[i];
+    end
+    assign acc = s[W*W-1 : W*W-W];
+  endmodule
+  module top(input [7:0] d, output [3:0] n4, output [7:0] n8);
+    popcnt #(.W(4)) a (.d(d[3:0]), .acc(n4));
+    popcnt #(.W(8)) b (.d(d),      .acc(n8));
+  endmodule`);
+  let hbad = null;
+  for (let d = 0; d < 256 && !hbad; d++) {
+    const ones = (v) => v.toString(2).split('').filter((x) => x === '1').length;
+    for (const sim of hier.all) {
+      sim.setInput('d', d).eval();
+      if (Number(sim.get('n8')) !== ones(d) || Number(sim.get('n4')) !== ones(d & 15)) {
+        hbad = `${sim.constructor.name} d=${d}: n4=${sim.get('n4')} n8=${sim.get('n8')}`;
+      }
+    }
+  }
+  ok(!hbad, 'generate: 子 module の中の generate がパラメータごとに展開される', hbad ?? '');
+
+  // ---- 0 回の for は何も生まない ----
+  const bare = compile(`module e(input a, output y); assign y = 1'b0; endmodule`);
+  const empty = compile(`module e(input a, output y);
+    genvar i;
+    for (i = 0; i < 0; i = i + 1) begin : g assign y = a; end
+    assign y = 1'b0;
+  endmodule`);
+  eqs(empty.stats.gates, bare.stats.gates, 'generate: 1 度も回らない for は項目を作らない');
+  eqs(empty.netlist.signals.size, bare.netlist.signals.size,
+    'generate: 1 度も回らない for は信号も作らない');
+}
+
 // ------------------------------------------------------------------ 比較器
 //
 // 加算器と同じ理由で、ここも JS の比較と直接突き合わせる。
@@ -2636,9 +2803,40 @@ async function testErrors() {
     ['initial は未対応',
       `module m(output reg y); initial y = 1'b0; endmodule`,
       /'initial' は未対応/],
-    ['generate は未対応',
-      `module m(input a, output y); generate assign y = ~a; endgenerate endmodule`,
-      /'generate' は未対応/],
+    // generate まわり。展開できないもの・書き忘れを名指しで断る
+    ['generate の for に genvar が要る',
+      `module m(output y); for (i=0;i<2;i=i+1) begin: g assign y = 1'b0; end endmodule`,
+      /'i' は genvar で宣言されていない/],
+    ['generate の for にラベルが要る',
+      `module m(output y); genvar i; for (i=0;i<2;i=i+1) assign y = 1'b0; endmodule`,
+      /generate の for にはラベルが要る/],
+    ['generate の条件は定数式',
+      `module m(input a, output y); genvar i; for (i=0;i<a;i=i+1) begin: g assign y=1'b0; end endmodule`,
+      /'a' は定数式に使えない/],
+    ['generate は入れ子にできない',
+      `module m(output y); generate generate assign y=1'b0; endgenerate endgenerate endmodule`,
+      /generate は入れ子にできない/],
+    ['generate の中の localparam',
+      `module m(output y); generate localparam K=1; assign y=1'b0; endgenerate endmodule`,
+      /generate の中の localparam は未対応/],
+    ['generate の中の function',
+      `module m(output y); generate function f(input a); f=a; endfunction assign y=1'b0; endgenerate endmodule`,
+      /generate の中の function は未対応/],
+    ['generate の中の casez',
+      `module m(output y); generate casez (1'b1) 1'b1: assign y=1'b0; endcase endgenerate endmodule`,
+      /generate の中では case だけ使える/],
+    ['endgenerate の書き忘れ',
+      `module m(output y); generate assign y = 1'b0; endmodule`,
+      /'endgenerate' が見つからない/],
+    ['generate ブロックの end の書き忘れ',
+      `module m(output y); genvar i; generate for(i=0;i<1;i=i+1) begin: g assign y=1'b0; endgenerate endmodule`,
+      /generate ブロックの 'end' が見つからない/],
+    ['generate の for が終わらない',
+      `module m(output y); genvar i; for (i=0;i>=0;i=i+1) begin: g wire t; assign t=1'b0; end assign y=1'b0; endmodule`,
+      /generate の for が 4096 回を超えた/],
+    ['genvar に幅は書けない',
+      `module m(output y); genvar [3:0] i; assign y=1'b0; endmodule`,
+      /genvar に幅は書けない/],
     ['always_comb は未対応',
       `module m(input a, output reg y); always_comb y = ~a; endmodule`,
       /'always_comb' は未対応/],
@@ -2900,6 +3098,24 @@ function randomDesign(rng, nWires) {
     end
   endfunction`);
 
+  // generate で 1 ビットずつ組み立てる wire を 1 本。展開された項目がふつうの
+  // assign とまったく同じ経路を通ることを差分テストに通す。入力だけから作るので
+  // プールに入れても組合せループにはならない。
+  const gop = pick(['^', '&', '|']);
+  lines.push('  genvar gi;');
+  lines.push('  wire [7:0] wg;');
+  lines.push('  for (gi = 0; gi < 8; gi = gi + 1) begin : gblk');
+  lines.push('    wire t;');
+  lines.push(`    assign t = a[gi] ${gop} b[7-gi];`);
+  // if-generate で偶数ビットと奇数ビットの作り方を変える (枝の選択も差分に通す)
+  lines.push('    if (gi % 2 == 0) begin : ev');
+  lines.push('      assign wg[gi] = c[gi] ? t : ~t;');
+  lines.push('    end else begin : od');
+  lines.push('      assign wg[gi] = t & c[gi];');
+  lines.push('    end');
+  lines.push('  end');
+  pool.push('wg');
+
   for (let i = 0; i < nWires; i++) {
     lines.push(`  wire [7:0] w${i};`);
     lines.push(`  assign w${i} = ${expr(3)};`);
@@ -2995,7 +3211,7 @@ async function testRandomDiff() {
 
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
   const seen = {
-    'if': 0, 'case': 0, 'casez': 0, 'function': 0, '+ / -': 0, '* / %': 0,
+    'if': 0, 'case': 0, 'casez': 0, 'function': 0, '+ / -': 0, '* / %': 0, 'generate': 0,
     '比較': 0, 'シフト': 0, '論理': 0,
     '非同期リセット': 0, '階層': 0, 'parameter': 0, 'リダクション': 0,
   };
@@ -3008,6 +3224,7 @@ async function testRandomDiff() {
     if (/\brndf\(/.test(src)) seen['function']++;
     if (/[-+] /.test(src)) seen['+ / -']++;
     if (/[*/%] /.test(src)) seen['* / %']++;
+    if (/begin : gblk/.test(src)) seen['generate']++;
     if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
     if (/(<<|>>)/.test(src)) seen['シフト']++;
     if (/(&&|\|\||\(!)/.test(src)) seen['論理']++;
@@ -3774,6 +3991,7 @@ const suites = [
   ['畳み込み / CSE', testFoldCse],
   ['刈り取り', testPrune],
   ['乗除算', testMulDiv],
+  ['generate', testGenerate],
   ['比較器', testCompare],
   ['ALU (case の書き方)', testAlu],
   ['非 ANSI と多入力ゲート', testOnehot],

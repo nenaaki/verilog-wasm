@@ -18,8 +18,8 @@ const GATE_PRIMITIVES = new Set(['and', 'or', 'not', 'nand', 'nor', 'xor', 'xnor
 // module 本体に書けそうで書けないもの。名前を出して断る。こうしないと
 // 「<モジュール名> <インスタンス名>」に見えて、遠いところでエラーになる
 const UNSUPPORTED_ITEMS = new Set([
-  'initial', 'generate', 'endgenerate', 'task', 'defparam', 'specify',
-  'always_comb', 'always_ff', 'always_latch', 'genvar', 'real', 'time',
+  'initial', 'task', 'defparam', 'specify',
+  'always_comb', 'always_ff', 'always_latch', 'real', 'time',
 ]);
 const DIRECTIONS = new Set(['input', 'output']);
 const NET_KINDS = new Set(['wire', 'reg']);
@@ -602,32 +602,186 @@ export function parse(src) {
     while (!at('endmodule')) {
       if (peek().type === 'eof') throw err("'endmodule' が見つからない");
       const v = peek().value;
-      if (v === 'parameter' || v === 'localparam') {
-        // 本体の parameter は宣言の並びに足す (ヘッダのぶんの後ろに来る)
-        params.push(...parseParamDecl().items);
-      } else if (DIRECTIONS.has(v) || NET_KINDS.has(v)) items.push(parseDecl());
-      else if (v === 'assign') {
-        const aline = next().line;
-        const lhs = parseLValue();
-        expect('=');
-        const rhs = parseExpr();
-        expect(';');
-        items.push({ type: 'assign', lhs, rhs, line: aline });
-      } else if (v === 'always') items.push(parseAlways());
-      else if (v === 'integer') items.push(parseIntDecl());
-      else if (v === 'function') items.push(parseFunction());
-      else if (GATE_PRIMITIVES.has(v)) items.push(parseGateInst());
-      else if (UNSUPPORTED_ITEMS.has(v)) throw err(`'${v}' は未対応`);
-      else if (peek().type === 'ident' && (peek(1).type === 'ident' || peek(1).value === '#')) {
-        // <モジュール名> [#( … )] <インスタンス名> ( … ) ;
-        items.push(parseModuleInst());
-      } else if (peek().type === 'ident') {
-        throw err(`'${v}' は未対応 (always_comb・initial などは未実装)`);
-      } else throw err(`予期しないトークン '${v}'`);
+      if (v === 'generate') {
+        const gline = next().line;
+        const gitems = [];
+        while (!at('endgenerate')) {
+          // endmodule まで来たら書き忘れ。ここで止めないと endmodule を項目として読む
+          if (peek().type === 'eof' || at('endmodule')) throw err("'endgenerate' が見つからない");
+          parseGenItem(gitems);
+        }
+        expect('endgenerate');
+        // generate / endgenerate 自体はスコープを作らない (ラベル無し)
+        items.push({ type: 'genblock', label: null, items: gitems, line: gline });
+      } else if (v === 'for' || v === 'if' || v === 'case') {
+        // generate / endgenerate は省ける。module の直下の for / if / case は generate 構文
+        parseGenItem(items);
+      } else {
+        parseModuleItem(items, params);
+      }
     }
     expect('endmodule');
 
     return { type: 'module', name, params, portOrder, items, line };
+  }
+
+  /**
+   * module の項目 1 個。generate の中からも同じものを読むので切り出してある。
+   * params が null なら generate の中 — parameter と function は module の直下でしか
+   * 宣言できないので、そこで名前を出して断る。
+   */
+  function parseModuleItem(items, params) {
+    const v = peek().value;
+    if (v === 'parameter' || v === 'localparam') {
+      if (!params) {
+        throw err(`generate の中の ${v} は未対応 (module の直下で宣言してください)`);
+      }
+      // 本体の parameter は宣言の並びに足す (ヘッダのぶんの後ろに来る)
+      params.push(...parseParamDecl().items);
+    } else if (DIRECTIONS.has(v) || NET_KINDS.has(v)) items.push(parseDecl());
+    else if (v === 'assign') {
+      const aline = next().line;
+      const lhs = parseLValue();
+      expect('=');
+      const rhs = parseExpr();
+      expect(';');
+      items.push({ type: 'assign', lhs, rhs, line: aline });
+    } else if (v === 'always') items.push(parseAlways());
+    else if (v === 'integer') items.push(parseIntDecl());
+    else if (v === 'genvar') items.push(parseGenvarDecl());
+    else if (v === 'function') {
+      if (!params) throw err('generate の中の function は未対応 (module の直下で宣言してください)');
+      items.push(parseFunction());
+    } else if (GATE_PRIMITIVES.has(v)) items.push(parseGateInst());
+    else if (UNSUPPORTED_ITEMS.has(v)) throw err(`'${v}' は未対応`);
+    else if (peek().type === 'ident' && (peek(1).type === 'ident' || peek(1).value === '#')) {
+      // <モジュール名> [#( … )] <インスタンス名> ( … ) ;
+      items.push(parseModuleInst());
+    } else if (peek().type === 'ident') {
+      throw err(`'${v}' は未対応 (always_comb・initial などは未実装)`);
+    } else throw err(`予期しないトークン '${v}'`);
+  }
+
+  // ---- generate --------------------------------------------------------------
+  //
+  // generate は「どの項目を作るか」を elaborate 時に決める仕掛け。always の中の
+  // for / if / case とよく似た形に見えるが、展開されるものが「文」ではなく
+  // 「module の項目 (宣言・assign・always・インスタンス)」である点が違う。だから
+  // 文の構文木 (parseStmtBlock) ではなく、ここで別に組み立てる。
+  //
+  // generate / endgenerate は省ける (Verilog-2005 と同じ)。module の直下に
+  // for / if / case が来たら、それは generate 構文だと読む。
+
+  /** genvar の宣言。integer と同じ「elaborate 時の整数」なので intdecl に寄せる */
+  function parseGenvarDecl() {
+    const line = expect('genvar').line;
+    if (at('[')) throw err('genvar に幅は書けない (generate の添字として使う)');
+    const names = [expectIdent()];
+    while (eat(',')) names.push(expectIdent());
+    expect(';');
+    return { type: 'intdecl', names, line };
+  }
+
+  /** begin [: ラベル] <項目>* end。ラベルはスコープの名前になる */
+  function parseGenBlock() {
+    const line = expect('begin').line;
+    const label = eat(':') ? expectIdent() : null;
+    const items = [];
+    while (!at('end')) {
+      if (peek().type === 'eof' || at('endmodule') || at('endgenerate')) {
+        throw err("generate ブロックの 'end' が見つからない");
+      }
+      parseGenItem(items);
+    }
+    expect('end');
+    return { type: 'genblock', label, items, line };
+  }
+
+  /** for / if / case の枝 1 個。begin … end でも項目 1 個でもよい */
+  function parseGenBody() {
+    if (at('begin')) return parseGenBlock();
+    const line = peek().line;
+    const items = [];
+    parseGenItem(items);
+    return { type: 'genblock', label: null, items, line };
+  }
+
+  function parseGenFor() {
+    const line = expect('for').line;
+    expect('(');
+    const name = expectIdent();
+    expect('=');
+    const init = parseExpr();
+    expect(';');
+    const cond = parseExpr();
+    expect(';');
+    const stepName = expectIdent();
+    expect('=');
+    const step = parseExpr();
+    expect(')');
+    if (stepName !== name) {
+      throw err(`for の更新式は初期化と同じ変数でなければならない (${name} と ${stepName})`);
+    }
+    const body = parseGenBody();
+    // 繰り返すぶんだけ同じ名前が並ぶので、区別するラベルが要る
+    if (!body.label) {
+      throw err('generate の for にはラベルが要る (for (…) begin : g … end の形。'
+        + '中の名前が g[0].x になる)');
+    }
+    return { type: 'genfor', name, init, cond, step, body, line };
+  }
+
+  function parseGenIf() {
+    const line = expect('if').line;
+    expect('(');
+    const cond = parseExpr();
+    expect(')');
+    const then = parseGenBody();
+    const els = eat('else') ? parseGenBody() : null;
+    return { type: 'genif', cond, then, else: els, line };
+  }
+
+  function parseGenCase() {
+    const line = expect('case').line;
+    expect('(');
+    const sel = parseExpr();
+    expect(')');
+    const items = [];
+    let dflt = null;
+    while (!at('endcase')) {
+      if (peek().type === 'eof' || at('endmodule')) throw err("'endcase' が見つからない");
+      const iline = peek().line;
+      if (eat('default')) {
+        eat(':');                       // Verilog では ':' は省略できる
+        if (dflt) throw err('default が 2 つある');
+        dflt = parseGenBody();
+        continue;
+      }
+      const labels = [parseExpr()];
+      while (eat(',')) labels.push(parseExpr());
+      expect(':');
+      items.push({ labels, body: parseGenBody(), line: iline });
+    }
+    expect('endcase');
+    if (items.length === 0 && !dflt) throw err('case の中身が空');
+    return { type: 'gencase', sel, items, default: dflt, line };
+  }
+
+  /** generate の中に書ける 1 個。for / if / case / begin か、ふつうの module 項目 */
+  function parseGenItem(items) {
+    const v = peek().value;
+    if (v === 'for') { items.push(parseGenFor()); return; }
+    if (v === 'if') { items.push(parseGenIf()); return; }
+    if (v === 'case') { items.push(parseGenCase()); return; }
+    if (v === 'begin') { items.push(parseGenBlock()); return; }
+    if (v === 'generate') {
+      throw err('generate は入れ子にできない (中の for / if / case はそのまま書ける)');
+    }
+    if (v === 'casez' || v === 'casex') {
+      throw err(`generate の中では case だけ使える (${v} は条件を回路にする書き方なので、`
+        + 'どの項目を作るかは決められない)');
+    }
+    parseModuleItem(items, null);
   }
 
   const modules = [];

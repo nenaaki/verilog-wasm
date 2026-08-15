@@ -36,7 +36,7 @@ GUI 回路エディタ            … web/editor.html （部品と配線）
 Verilog ソース
   ↓ lexer.js / parser.js
 AST
-  ↓ elaborate.js          … 階層の平坦化・全信号を 1 ビットのネットに展開 (bit-blast)・定数畳み込み・CSE
+  ↓ elaborate.js          … 階層と generate の展開・全信号を 1 ビットのネットに展開 (bit-blast)・定数畳み込み・CSE
 ネットリスト IR            … gates[] / regs[] / signals
   ↓ schedule.js           … トポロジカルソート・組合せループ検出・到達不能ゲートの刈り取り
 評価順に並んだゲート列
@@ -51,8 +51,8 @@ WebAssembly.instantiate → sim.js
 | ファイル | 役割 | 行数 |
 | --- | --- | --- |
 | [src/lexer.js](src/lexer.js) | 字句解析 | 147 |
-| [src/parser.js](src/parser.js) | 構文解析 → AST | 592 |
-| [src/elaborate.js](src/elaborate.js) | AST → ネットリスト IR（bit-blast・階層の平坦化・定数式・定数畳み込み・CSE・function と for の展開） | 1,371 |
+| [src/parser.js](src/parser.js) | 構文解析 → AST | 737 |
+| [src/elaborate.js](src/elaborate.js) | AST → ネットリスト IR（bit-blast・階層の平坦化・定数式・定数畳み込み・CSE・function と for の展開・generate） | 1,473 |
 | [src/schedule.js](src/schedule.js) | トポロジカルソート・ループ検出・刈り取り | 91 |
 | [src/layout.js](src/layout.js) | メモリレイアウト | 80 |
 | [src/codegen.js](src/codegen.js) | WASM バイナリ生成 | 197 |
@@ -62,7 +62,7 @@ WebAssembly.instantiate → sim.js
 | [src/schematic.js](src/schematic.js) | 回路グラフ → Verilog・保存形式・幅の推論・階層の平坦化（GUI エディタ用フロントエンド） | 615 |
 | [src/samples.js](src/samples.js) | エディタのサンプル回路（データ） | 341 |
 | [src/sim.js](src/sim.js) / [src/signals.js](src/signals.js) / [src/compile.js](src/compile.js) | 実行時グルー・エントリ | 188 |
-| **合計（コメント込み）** | | **3,851** |
+| **合計（コメント込み）** | | **4,098** |
 
 エディタ側は [web/editor.html](web/editor.html) に状態と操作を置き、状態を持たない部分を分けてある。
 
@@ -101,8 +101,9 @@ endmodule
 - `parameter` / `localparam` とパラメータ付きインスタンス化（`#(.WIDTH(4))`）、`[WIDTH-1:0]` のような定数式の範囲
 - `function`（呼び出しごとにインライン展開。ローカル変数と `=` のブロッキング代入）
 - `for`（`integer` のループ変数。elaborate 時に完全展開）
+- `generate`（`for` / `if` / `case`、`genvar`、入れ子。`generate` / `endgenerate` は省ける → [下記](#generate)）
 
-**未対応**：`casex`、`generate`、`initial`、`task`、`while` / `repeat`、複数クロック、負エッジのクロック、値としての `x` / `z`（`===` / `!==` も）、システム関数・タスク（`$display` など）、signed。いずれも行番号付きのエラーになる。
+**未対応**：`casex`、`initial`、`task`、`while` / `repeat`、複数クロック、負エッジのクロック、値としての `x` / `z`（`===` / `!==` も）、システム関数・タスク（`$display` など）、signed。いずれも行番号付きのエラーになる。
 
 signed は書き方が 4 通りあるので、それぞれ名前を出して断る。素通りさせると `')' が必要` や `解釈できない文字 '''` のような見当違いのエラーになるため:
 
@@ -384,6 +385,91 @@ transpose[a*4+b] = v[b*4+a];   // 定数どうしなので展開時に計算で�
 
 [examples/bitops8.v](examples/bitops8.v) がビット反転・ビット数の数え上げ・累積 OR で、最後のものは `prefix_or[k] = prefix_or[k-1] | v[k]` と**直前の代入結果を次の段が読む**形になっている（ブロッキング代入が要る所）。
 
+### generate
+
+`for` が **`always` の中の「文」**を展開するのに対し、`generate` は **module の「項目」**を展開する。展開されるものが宣言・`assign`・`always`・インスタンスなので、**段ごとに `wire` を持てる**のが効きどころになる。
+
+```verilog
+module ripple8 #(parameter W = 8) (
+  input [W-1:0] a, input [W-1:0] b, input cin, output [W-1:0] sum, output cout
+);
+  wire [W:0] c;                 // 段のあいだの桁上げ
+  assign c[0] = cin;
+  assign cout = c[W];
+
+  genvar i;
+  generate
+    for (i = 0; i < W; i = i + 1) begin : bits
+      wire p, g;                // ← 段ごとに 1 本ずつ。for ではこれが書けない
+      assign p = a[i] ^ b[i];
+      assign g = a[i] & b[i];
+      assign sum[i] = p ^ c[i];
+      assign c[i + 1] = g | (p & c[i]);
+    end
+  endgenerate
+endmodule
+```
+
+`for` / `if` / `case` の 3 つと、`genvar`、入れ子に対応している。**`generate` / `endgenerate` は省ける**（Verilog-2005 と同じ）。module の直下に `for` / `if` / `case` が来たら generate 構文として読む。
+
+条件は全部**定数式**（`parameter` と `genvar` だけで組める式）で、展開は elaborate 時に終わる。**通らなかった枝はそもそも作られない** ―― [刈り取り](#到達不能ゲートの刈り取り)で消えるのではないので、`stats.pruned` にも出ない。
+
+#### 既にある部品の組み替えでできている
+
+新しく足したのは項目を差し込む経路だけで、中身は元からあるものを使い回している。
+
+| generate の要素 | 使い回した仕組み |
+| --- | --- |
+| `genvar` と添字 | `for` のループ変数と同じ。`params` に入れて `constExpr` で解く（`intdecl` に寄せてある） |
+| 項目の差し込み | `itemPass` が項目を平坦にディスパッチするループなので、そこへ流し込む |
+| `bits[3].p` という名前 | 階層の平坦化で使っている `scope` の接頭辞。`h0.h1.carry` と同じ仕組み |
+| インスタンスの生成 | `instantiate` をそのまま呼ぶ。接頭辞が `bits[3].` になるので名前が衝突しない |
+| 繰り返しの歯止め | `for` と同じ `MAX_UNROLL`（4096 回） |
+
+実行モデルにも codegen にも触っていない。
+
+#### スコープは内から外へ辿る
+
+generate ブロックは module の中の**入れ子スコープ**なので、ブロックの中から外の信号とパラメータが見える。同じ名前を内側で宣言したら内側が勝つ。
+
+```verilog
+wire [3:0] t;
+for (i = 0; i < 4; i = i + 1) begin : s
+  wire t;                      // 1 ビットの t。このブロックの中ではこちらが勝つ
+  assign t = a[i];
+  assign y[i] = t;
+end
+for (i = 0; i < 4; i = i + 1) begin : o
+  assign z[i] = t[i];          // 宣言していないので外の 4 ビットの t が見える
+end
+```
+
+これは名前解決を **module の境界で止めて外へ辿る**ようにして表している。子 module から親の信号は見えない（そこで止まる）が、generate ブロックからその module の信号は見える。区別は「いま展開している場所」と「いま展開している module」の 2 つの接頭辞を持つだけで付く。
+
+`for` にはラベルが要る（繰り返すぶんだけ同じ名前が並ぶため）。`if` / `case` の枝はラベルを省ける ―― 1 つの枝しか展開されないので名前が衝突しない。
+
+#### 断っているもの
+
+| 書き方 | エラー |
+| --- | --- |
+| `generate` の中の `parameter` / `localparam` | `generate の中の localparam は未対応 (module の直下で宣言してください)` |
+| `generate` の中の `function` | 同上 |
+| `generate` の入れ子（`generate` を 2 回） | `generate は入れ子にできない (中の for / if / case はそのまま書ける)` |
+| `generate` の中の `casez` / `casex` | `generate の中では case だけ使える` |
+| ラベルの無い `for` | `generate の for にはラベルが要る` |
+
+**階層参照（`bits[3].p` を式の中から読む）も未対応**。生成した段をつなぐときは、段の出力を 1 本の太いバスにまとめて定数式の部分選択で取り出す:
+
+```verilog
+wire [4*N-1:0] o;                                  // 段ごとに 4 ビット
+for (i = 0; i < N; i = i + 1) begin : g
+  if (i == 0) leaf u (.d(d),                  .y(o[3:0]));
+  else        leaf u (.d(o[4*i-1 : 4*i-4]),   .y(o[4*i+3 : 4*i]));
+end
+```
+
+添字は `genvar` なので範囲は展開時に定数になり、ふつうの部分選択として通る。
+
 ### 到達不能ゲートの刈り取り
 
 `schedule.js` は並べ切ったあとに、**出力ポートとレジスタの D から逆向きに辿って、そこに届かないゲートを `order` から外す**。外から見えるネットは線形メモリにスロットを持つものだけ（入力ポート・出力ポート・レジスタの Q）で、内部の組合せ配線は WASM の local に載るだけなので、届かないゲートは評価しなくても外から見た挙動は変わらない。
@@ -644,7 +730,7 @@ $ node test/run.js
 1804 件成功, 0 件失敗
 ```
 
-中核は **WASM バックエンド vs JS 参照実装の差分テスト**。ランダムに生成した Verilog 25 回路 × ランダム入力 12 ベクタで、両者の出力が完全一致することを確認する。生成器は `+` `-`・`*` `/` `%`・比較 6 種・`<<` `>>`・`&&` `||` `!`・リダクション 6 種・`if` / `case` / `casez`・`function` の呼び出しと `for` の展開・非同期リセット・子モジュールのインスタンス化を混ぜる。25 回路の中に各構文が現れること自体もテストしている。
+中核は **WASM バックエンド vs JS 参照実装の差分テスト**。ランダムに生成した Verilog 25 回路 × ランダム入力 12 ベクタで、両者の出力が完全一致することを確認する。生成器は `+` `-`・`*` `/` `%`・比較 6 種・`<<` `>>`・`&&` `||` `!`・リダクション 6 種・`if` / `case` / `casez`・`function` の呼び出しと `for` の展開・`generate` の for / if・非同期リセット・子モジュールのインスタンス化を混ぜる。25 回路の中に各構文が現れること自体もテストしている。
 
 **演算子は差分テストの枠の外**にある。加算器も比較器も mux 木もビットに展開した時点でふつうのゲートの塊になるので、WASM と参照実装は同じネットリストを見ていて、間違っていれば揃って間違う。ここは **JS で素直に書いたモデルと直接**比べる:
 
@@ -661,12 +747,13 @@ $ node test/run.js
 | `casez` | 優先順位エンコーダの全 16 通り、16 進の `z`、全桁 `z`、幅を広げたときの扱い、[priority8.v](examples/priority8.v) の全 256 通り |
 | `function` | ローカル変数・入れ子の呼び出し・`case`・部分代入・スコープ、**式を直接書いたのとゲート数が一致**すること、[gray4.v](examples/gray4.v) の往復とグレイカウンタの巡回 |
 | `for` | [bitops8.v](examples/bitops8.v) の 4 出力を全 256 通り、入れ子・下降・刻み 2・`parameter` 境界・`i*4+b` の添字、**手で書き並べたのとゲート数が一致**すること、定数式の `*` `/` `%` が回路にならないこと |
+| `generate` | for / if / case、入れ子、`genvar` の添字、内側の宣言が勝つこと、**手で書き並べたのとゲート数が一致**すること、通らない枝が作られないこと（刈り取りではなく）、子 module の中の generate をパラメータ違いで 2 個 |
 | `FSM` / `ALU` | [seqdet.v](examples/seqdet.v) に 20 ビット列、[alu4.v](examples/alu4.v) の 8 演算 × 5 組 |
 | `parameter` | [counter_param.v](examples/counter_param.v) の 3 インスタンスが別々に展開されること、定数式の範囲 |
 | `モジュール階層` | [adder2.v](examples/adder2.v)（2 段の入れ子）の全 4×4×2 通り、完全修飾名、`--top` |
 | `非同期リセット` | `eval()` だけで Q が変わること、負論理・非ゼロ値・部分リセット、同期リセットとの違い |
 
-ほかに全加算器の真理値表、DFF のタイミング、LFSR の周期 255、レジスタのスワップと 3 段ローテーション、`eval` / `commit` の分離、64 レーンの独立性、81 種類のコンパイルエラー。
+ほかに全加算器の真理値表、DFF のタイミング、LFSR の周期 255、レジスタのスワップと 3 段ローテーション、`eval` / `commit` の分離、64 レーンの独立性、91 種類のコンパイルエラー。
 
 `GUI 回路グラフ` はエディタのサンプル回路（[src/samples.js](src/samples.js)）を Verilog に変換して突き合わせる。組合せ回路は真理値表、メモリ入りの回路は入力を変えながらクロックを打った値の列で確認する。未配線の部品が下流ごと除外されること、フィードバック配線が組合せループとして弾かれる一方で**メモリを挟んだ帰還は通る**ことも見ている。
 
@@ -944,7 +1031,22 @@ module sketch(                              module sketch(
 
 ## 次にやること
 
-- エディタ: 波形の列をドラッグして範囲を選び、その区間だけ表を作る
-- エディタ: 部品のライブラリを .json でまとめて出し入れする（いまは回路 1 個ずつ）
-- コンパイラ: 複数クロック。いまは `step()` がエッジそのものなので、実行モデルの拡張から必要になる
+**エディタ側**は独立した 2 件が残っている。
+
+- 波形の列をドラッグして範囲を選び、その区間だけ表を作る
+- 部品のライブラリを .json でまとめて出し入れする（いまは回路 1 個ずつ）
+
+**コンパイラ側**は、未対応の残りを「何に依存するか」で並べると 3 層になる。
+
+| | 項目 | 何が要るか |
+| --- | --- | --- |
+| **既存の部品の組み替えで済む** | 繰り返し連接 `{4{a}}` | 連接のパートを n 回並べるだけ。`{{(W-1){1'b0}}, x}` のゼロ詰めが書けないのが地味に効く |
+| | 階層参照 `bits[3].p` / `u0.carry` | 名前は元から完全修飾名で持っているので、解決側は既にできている。**式のパーサで `a[3]`（ビット選択）と区別する**のが仕事になる（[generate](#断っているもの) の段をつなぐときに要る） |
+| | `initial` によるレジスタ初期値 | 状態スロットの初期値をレイアウトに持たせるだけ。いまは常にゼロクリア |
+| | `while` / `repeat` | 回数が定数に決まるものだけ `for` と同じ完全展開に落とす |
+| **意味論の判断が要る** | signed | 幅の規則に符号拡張、比較の符号あり / なし分岐、`>>>`、**除算が floor ではなく 0 方向への切り捨て**。[断り書き](#対応している-verilog)を 4 箇所ぶん畳むことになる |
+| | `casex` / 値としての `x` `z` | いまは「x を値として持たない」ことを設計判断として断っている（`casez` を使わせる）。持たせるならネット 1 本が 1 ビットでなくなり、ビットスライスの前提から変わる |
+| **実行モデルから作り直し** | 複数クロック・負エッジ | `step()` がクロックエッジそのものなので、`eval` / `commit` の粒度から設計し直す必要がある |
+
+`task` と `$display` はこの処理系（時間を持たない cycle-based・副作用なし）に居場所が無いので、断ったままにする。
 

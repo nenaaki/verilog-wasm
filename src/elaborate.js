@@ -163,8 +163,24 @@ export function elaborate(mod, all = [mod]) {
   // 階層は「展開しながら平坦化」する。signals は 1 個のフラットな Map で、キーは
   // インスタンス名を前置した完全修飾名 (`h0.s1`、`h0.h1.carry`)。名前解決だけを
   // 現在のスコープで行う。scope は再帰の入り口で差し替えて出口で戻すので、
-  // 深さ優先の走査中は常に「いま展開している module の接頭辞」になっている。
+  // 深さ優先の走査中は常に「いま展開している場所の接頭辞」になっている。
   let scope = '';
+  // いま展開している module の接頭辞。generate ブロックは module の中の入れ子
+  // スコープなので、scope はそれより深くなり得る (`h0.g[2].`)。名前を外へ辿るとき
+  // ここで止める ― 子 module から親の信号は見えないが、generate ブロックの中から
+  // その module の信号は見える、という違いを 1 個の変数で表している。
+  let scopeBase = '';
+
+  /**
+   * 名前が実際に宣言されているスコープを、内側から外へ辿って探す。
+   * 見つからなければ scopeBase を返す (エラーメッセージが module の名前で出る)。
+   */
+  function resolveScope(name) {
+    for (let p = scope; ; p = p.slice(0, p.lastIndexOf('.', p.length - 2) + 1)) {
+      if (signals.has(p + name) || params.has(p + name) || loopVars.has(p + name)) return p;
+      if (p === scopeBase || p.length <= scopeBase.length) return scopeBase;
+    }
+  }
 
   // ---- function ---------------------------------------------------------------
   //
@@ -209,7 +225,7 @@ export function elaborate(mod, all = [mod]) {
         // 定数式は幅を持たない整数で計算するので、ビットに展開する function は使えない
         throw new CompileError(`定数式では function (${e.name}) を呼べない`, e.line);
       case 'ref': {
-        const v = params.get(scope + e.name);
+        const v = params.get(resolveScope(e.name) + e.name);
         if (v === undefined) {
           throw new CompileError(
             `'${e.name}' は定数式に使えない (parameter / localparam ではない)`, e.line);
@@ -304,11 +320,14 @@ export function elaborate(mod, all = [mod]) {
     }
 
     const saved = scope;
+    const savedBase = scopeBase;
     scope = prefix;                    // 既定値は自分のスコープで評価する
+    scopeBase = prefix;                // 親の名前は見えない (module の境界)
     for (const p of m.params ?? []) {
       params.set(prefix + p.name, byName.has(p.name) ? byName.get(p.name) : constExpr(p.expr));
     }
     scope = saved;
+    scopeBase = savedBase;
   }
 
   function declare(prefix, name, { dir, kind, range }, line) {
@@ -340,12 +359,13 @@ export function elaborate(mod, all = [mod]) {
   }
 
   const lookup = (name, line) => {
-    const s = signals.get(scope + name);
+    const base = resolveScope(name);
+    const s = signals.get(base + name);
     if (!s) {
-      if (params.has(scope + name)) {
+      if (params.has(base + name)) {
         throw new CompileError(`'${name}' は parameter なので信号として使えない`, line);
       }
-      if (loopVars.has(scope + name)) {
+      if (loopVars.has(base + name)) {
         throw new CompileError(
           `'${name}' は integer なので信号として使えない (for のループ変数と定数式でだけ使える)`, line);
       }
@@ -354,12 +374,13 @@ export function elaborate(mod, all = [mod]) {
     return s;
   };
 
-  /** 宣言だけ先に処理して、前方参照 (assign が後続の wire 宣言を参照する等) を許す */
-  function declPass(m, prefix) {
-    // [WIDTH-1:0] の WIDTH を引くのに自分のスコープが要る
-    const saved = scope;
-    scope = prefix;
-    for (const item of m.items) {
+  /**
+   * 項目の並びから宣言だけを拾う。generate ブロックの中身にも同じものを使うので、
+   * module 単位ではなく項目の配列を受ける。入れ子の generate は見ない ―
+   * 中の宣言はそのブロックを展開するときに、そのブロックのスコープで処理する。
+   */
+  function declItems(items, prefix) {
+    for (const item of items) {
       if (item.type === 'decl') {
         for (const n of item.names) declare(prefix, n, item, item.line);
       }
@@ -381,7 +402,18 @@ export function elaborate(mod, all = [mod]) {
         funcs.set(prefix + item.name, item);
       }
     }
+  }
+
+  /** 宣言だけ先に処理して、前方参照 (assign が後続の wire 宣言を参照する等) を許す */
+  function declPass(m, prefix) {
+    // [WIDTH-1:0] の WIDTH を引くのに自分のスコープが要る
+    const saved = scope;
+    const savedBase = scopeBase;
+    scope = prefix;
+    scopeBase = prefix;
+    declItems(m.items, prefix);
     scope = saved;
+    scopeBase = savedBase;
     for (const pname of m.portOrder) {
       if (!signals.has(prefix + pname)) {
         throw new CompileError(
@@ -699,7 +731,7 @@ export function elaborate(mod, all = [mod]) {
         return funcWidth(lookupFunc(e));
       case 'ref':
         // parameter を式の中で使ったときはサイズ無しリテラルと同じ 32 ビット扱い
-        if (params.has(scope + e.name)) return PARAM_WIDTH;
+        if (params.has(resolveScope(e.name) + e.name)) return PARAM_WIDTH;
         return refBits(e).length;        // refBits は純粋 (既存のネット ID を返すだけ)
       case 'un':
         // 論理否定とリダクションは 1 ビット。残り (~ 単項 -) はオペランドの幅
@@ -745,7 +777,7 @@ export function elaborate(mod, all = [mod]) {
         return out;
       }
       case 'ref': {
-        const pv = params.get(scope + e.name);
+        const pv = params.get(resolveScope(e.name) + e.name);
         if (pv !== undefined) {
           if (e.range) throw new CompileError('parameter のビット選択は未対応', e.line);
           return constBits(pv, w);
@@ -981,7 +1013,7 @@ export function elaborate(mod, all = [mod]) {
    * @param run 本体を走らせる関数 (always なら runStmts、function なら runFuncStmts)
    */
   function unrollFor(st, state, run) {
-    const key = scope + st.name;
+    const key = resolveScope(st.name) + st.name;
     if (!loopVars.has(key)) {
       throw new CompileError(
         `'${st.name}' は integer で宣言されていない (for のループ変数)`, st.line);
@@ -1245,12 +1277,88 @@ export function elaborate(mod, all = [mod]) {
   let clockName = null;    // エラー表示用の名前
 
   function itemPass(mod, prefix, isTop, depth, stack) {
-  for (const item of mod.items) {
-    if (item.type === 'decl') continue;
+    for (const item of mod.items) runItem(item, mod, prefix, isTop, depth, stack);
+  }
+
+  /**
+   * generate ブロックを 1 個展開する。tag が null ならスコープを作らずに
+   * 親の名前空間へそのまま出す (generate / endgenerate 自体と、ラベルの無い枝)。
+   *
+   * 中の宣言はここで先に済ませるので、ブロックの中での前方参照は module の直下と
+   * 同じように効く。scopeBase は動かさない ― ブロックの中から module の信号が
+   * 見えるのは、resolveScope が scopeBase まで外へ辿るからである。
+   */
+  function runGenBlock(blk, mod, prefix, isTop, depth, stack, tag) {
+    const child = tag === null ? prefix : `${prefix}${tag}.`;
+    const saved = scope;
+    scope = child;
+    try {
+      declItems(blk.items, child);
+      for (const it of blk.items) runItem(it, mod, child, isTop, depth, stack);
+    } finally {
+      scope = saved;
+    }
+  }
+
+  function runItem(item, mod, prefix, isTop, depth, stack) {
+    if (item.type === 'decl') return;
     // function は宣言だけ。回路になるのは呼び出された場所 (declPass で集めてある)
-    if (item.type === 'func') continue;
-    // integer は for のループ変数。declPass で名前を登録してある
-    if (item.type === 'intdecl') continue;
+    if (item.type === 'func') return;
+    // integer / genvar は展開時の整数。declPass で名前を登録してある
+    if (item.type === 'intdecl') return;
+
+    // ---- generate。どの項目を作るかを定数式で決めて、選んだものを流し込む ----
+    if (item.type === 'genblock') {
+      runGenBlock(item, mod, prefix, isTop, depth, stack, item.label);
+      return;
+    }
+
+    if (item.type === 'genfor') {
+      // 添字は for のループ変数とまったく同じ経路 (params に入れて定数式で解く)
+      const key = resolveScope(item.name) + item.name;
+      if (!loopVars.has(key)) {
+        throw new CompileError(
+          `'${item.name}' は genvar で宣言されていない (generate の for の添字)`, item.line);
+      }
+      const had = params.has(key);
+      const savedVal = params.get(key);
+      try {
+        params.set(key, constExpr(item.init));
+        for (let n = 0; ; n++) {
+          selfWidthCache.clear();      // 添字が変わると部分選択の幅も変わり得る
+          if (constExpr(item.cond) === 0n) break;
+          if (n >= MAX_UNROLL) {
+            throw new CompileError(
+              `generate の for が ${MAX_UNROLL} 回を超えた (条件が定数で終わらない?)`, item.line);
+          }
+          // ラベルは g[0] / g[1] … になる (Verilog の名前の付け方と同じ)
+          runGenBlock(item.body, mod, prefix, isTop, depth, stack,
+            `${item.body.label}[${params.get(key)}]`);
+          params.set(key, constExpr(item.step));
+        }
+      } finally {
+        selfWidthCache.clear();
+        if (had) params.set(key, savedVal); else params.delete(key);
+      }
+      return;
+    }
+
+    if (item.type === 'genif') {
+      const taken = constExpr(item.cond) !== 0n ? item.then : item.else;
+      if (taken) runGenBlock(taken, mod, prefix, isTop, depth, stack, taken.label);
+      return;
+    }
+
+    if (item.type === 'gencase') {
+      const sel = constExpr(item.sel);
+      let taken = null;
+      for (const it of item.items) {
+        if (it.labels.some((l) => constExpr(l) === sel)) { taken = it.body; break; }
+      }
+      taken ??= item.default;
+      if (taken) runGenBlock(taken, mod, prefix, isTop, depth, stack, taken.label);
+      return;
+    }
 
     if (item.type === 'assign') {
       const s = lookup(item.lhs.name, item.line);
@@ -1263,7 +1371,7 @@ export function elaborate(mod, all = [mod]) {
       // 代入先の幅が右辺の文脈幅になる (文脈依存幅)
       const lhsWidth = refBits(item.lhs).length;
       connect(item.lhs, evalExpr(item.rhs, lhsWidth), 'assign 文', item.line);
-      continue;
+      return;
     }
 
     if (item.type === 'gate') {
@@ -1297,7 +1405,7 @@ export function elaborate(mod, all = [mod]) {
         result.push(acc);
       }
       connect(outNode, result, `${item.gate} ゲート`, item.line);
-      continue;
+      return;
     }
 
     if (item.type === 'always') {
@@ -1344,16 +1452,15 @@ export function elaborate(mod, all = [mod]) {
           line,
         });
       }
-      continue;
+      return;
     }
 
     if (item.type === 'inst') {
       instantiate(item, prefix, depth, stack);
-      continue;
+      return;
     }
 
     throw new CompileError(`未対応の項目 '${item.type}'`, item.line);
-  }
   }
 
   /**
@@ -1431,9 +1538,12 @@ export function elaborate(mod, all = [mod]) {
 
     // --- 3. 子の中身 ---
     const saved = scope;
+    const savedBase = scopeBase;
     scope = childPrefix;
+    scopeBase = childPrefix;           // ここから外へは名前を辿らない (module の境界)
     itemPass(sub, childPrefix, false, depth + 1, [...stack, item.module]);
     scope = saved;
+    scopeBase = savedBase;
   }
 
   // ---- 展開の開始 ----------------------------------------------------------
