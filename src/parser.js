@@ -152,7 +152,10 @@ export function parse(src) {
     if (t.type === 'num') {
       next();
       // mask は casez のラベルで「比較しない桁」。それ以外の場所では elaborate が断る
-      return { type: 'num', width: t.width, bits: t.bits, mask: t.mask ?? 0n, line: t.line };
+      return {
+        type: 'num', width: t.width, bits: t.bits, mask: t.mask ?? 0n,
+        unsized: !!t.unsized, line: t.line,
+      };
     }
 
     if (eat('(')) {

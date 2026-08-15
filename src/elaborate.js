@@ -430,6 +430,22 @@ export function elaborate(mod, all = [mod]) {
    * 0 は許す ―― `{{(W-1){1'b0}}, x}` は W が 1 のとき 0 回になり、Verilog でも
    * 「連接の中でだけ許される幅 0」として通る書き方だから。
    */
+  /**
+   * 連接のパートにサイズ無しリテラルは置けない (Verilog の規則)。
+   * 幅が決まらないと連接全体の幅が決まらないため ―― `{a, 1}` は 33 ビットになる。
+   * 素通りさせると「1 ビットの 1 を繋いだつもりが 32 ビット」という食い違いになるので、
+   * 黙って受けずに書き足させる。
+   */
+  function checkSizedParts(parts, what) {
+    for (const p of parts) {
+      if (p.type === 'num' && p.unsized) {
+        throw new CompileError(
+          `${what}の中のリテラル '${
+            p.bits}' には幅が要る (幅を書かないと 32 ビットとして繋がってしまう)`, p.line);
+      }
+    }
+  }
+
   function repeatCount(e) {
     const n = constExpr(e.count);
     if (n < 0n) {
@@ -798,8 +814,10 @@ export function elaborate(mod, all = [mod]) {
       case 'tern':
         return Math.max(selfWidth(e.a), selfWidth(e.b));
       case 'concat':
+        checkSizedParts(e.parts, '連接');
         return e.parts.reduce((sum, p) => sum + selfWidth(p), 0);
       case 'repeat':
+        checkSizedParts(e.parts, '繰り返し連接');
         // 繰り返し連接。回数は定数式なので、ここで数に落とせる
         return repeatCount(e) * e.parts.reduce((sum, p) => sum + selfWidth(p), 0);
       default:

@@ -117,6 +117,7 @@ export function lex(src) {
         width: UNSIZED_WIDTH,
         bits: value,
         plain: Number(value),
+        unsized: true,
       });
       i += raw.length;
       continue;

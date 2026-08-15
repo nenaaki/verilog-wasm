@@ -3405,6 +3405,12 @@ async function testErrors() {
        module m(output [7:0] y); s u(); localparam K = u.q; assign y = K; endmodule`,
       /階層参照は定数式に使えない/],
     // 繰り返し連接 / 宣言と同時の代入
+    ['連接にサイズ無しリテラル',
+      `module m(input [3:0] a, output [7:0] y); assign y = {a, 1}; endmodule`,
+      /連接の中のリテラル '1' には幅が要る/],
+    ['繰り返し連接にサイズ無しリテラル',
+      `module m(output [7:0] y); assign y = {4{3}}; endmodule`,
+      /繰り返し連接の中のリテラル '3' には幅が要る/],
     ['繰り返し連接の回数が負',
       `module m(input a, output [7:0] y); assign y = {-1{a}}; endmodule`,
       /繰り返し連接の回数が負/],
