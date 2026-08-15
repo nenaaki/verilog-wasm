@@ -225,6 +225,8 @@ export function elaborate(mod, all = [mod]) {
         // 定数式は幅を持たない整数で計算するので、ビットに展開する function は使えない
         throw new CompileError(`定数式では function (${e.name}) を呼べない`, e.line);
       case 'ref': {
+        // 階層参照は「回路の中の信号」なので、定数式には出てこない
+        if (e.path) throw new CompileError('階層参照は定数式に使えない', e.line);
         const v = params.get(resolveScope(e.name) + e.name);
         if (v === undefined) {
           throw new CompileError(
@@ -446,12 +448,45 @@ export function elaborate(mod, all = [mod]) {
     return [...bits, ...Array(width - bits.length).fill(CONST0)];
   }
 
+  /**
+   * 階層参照のパスを完全修飾名に落とす。`bits[i-1].s` の添字は genvar のことが
+   * あるので、ここで初めて数になる (signals のキーは `bits[0].s` の形)。
+   */
+  function pathName(node) {
+    return node.path
+      .map((p) => (p.index === null ? p.name : `${p.name}[${constExpr(p.index)}]`))
+      .join('.');
+  }
+
   function refBits(node) {
+    if (node.path) {
+      const name = pathName(node);
+      const base = resolveScope(name);
+      const s = signals.get(base + name);
+      if (!s) {
+        // 先頭の名前のスコープが既にあるなら、末尾の名前の間違い。
+        // 影も形も無いなら、まだ展開されていない (書く場所の問題) 可能性が高い
+        const head = node.path[0].name;
+        const known = [...signals.keys()]
+          .some((k) => k.startsWith(`${base}${head}.`) || k.startsWith(`${base}${head}[`));
+        throw new CompileError(
+          known
+            ? `階層参照 '${name}' の指す信号が無い ('${head}' の中にその名前は無い)`
+            : `階層参照 '${name}' の指す信号が無い `
+              + '(インスタンスや generate ブロックより後ろに書く必要がある)',
+          node.line);
+      }
+      return sliceOfSignal(s, node);
+    }
     // function を展開している間はローカル (引数・ローカル変数・戻り値) を先に見る。
     // 外側の信号と同じ名前でもローカルが勝つ (Verilog のスコープ規則)
     const local = funcEnv?.get(node.name);
     if (local) return sliceBits(local, node);
-    const s = lookup(node.name, node.line);
+    return sliceOfSignal(lookup(node.name, node.line), node);
+  }
+
+  /** 信号のビット選択 / 部分選択。範囲を書いていなければ全ビット */
+  function sliceOfSignal(s, node) {
     if (!node.range) return s.bits;
     // 添字は定数式。パラメータ入りの [WIDTH-1:0] もここで数になる
     const { msb, lsb } = evalRange(node.range, node.line);
@@ -747,6 +782,7 @@ export function elaborate(mod, all = [mod]) {
         // 関数呼び出しの自己決定幅は宣言した戻り値の幅。中身は見なくて済む
         return funcWidth(lookupFunc(e));
       case 'ref':
+        if (e.path) return refBits(e).length;      // 階層参照は parameter にならない
         // parameter を式の中で使ったときはサイズ無しリテラルと同じ 32 ビット扱い
         if (params.has(resolveScope(e.name) + e.name)) return PARAM_WIDTH;
         return refBits(e).length;        // refBits は純粋 (既存のネット ID を返すだけ)
@@ -797,6 +833,7 @@ export function elaborate(mod, all = [mod]) {
         return out;
       }
       case 'ref': {
+        if (e.path) return resize(refBits(e), w);
         const pv = params.get(resolveScope(e.name) + e.name);
         if (pv !== undefined) {
           if (e.range) throw new CompileError('parameter のビット選択は未対応', e.line);
@@ -1206,7 +1243,7 @@ export function elaborate(mod, all = [mod]) {
   /** 式の中に出てくる信号名を集める (どのイベント信号を見ているか判定するのに使う) */
   function refNames(e, out = []) {
     if (!e || typeof e !== 'object') return out;
-    if (e.type === 'ref') out.push(e.name);
+    if (e.type === 'ref') { if (!e.path) out.push(e.name); return out; }
     for (const k of ['a', 'b', 'sel']) if (e[k]) refNames(e[k], out);
     if (e.parts) for (const p of e.parts) refNames(p, out);
     if (e.args) for (const a of e.args) refNames(a, out);   // 関数呼び出しの引数

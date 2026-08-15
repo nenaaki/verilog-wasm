@@ -40,8 +40,8 @@ function eq(actual, expected, label) {
   ok(a === e, label, a === e ? '' : `期待 ${e} / 実際 ${a}`);
 }
 
-async function bothSims(src) {
-  const compiled = compile(src);
+async function bothSims(src, top) {
+  const compiled = compile(src, top ? { top } : undefined);
   const wasm = await WasmSimulator.create(compiled);
   const ref = new RefSimulator(compiled);
   return { compiled, wasm, ref, all: [wasm, ref] };
@@ -374,6 +374,67 @@ endmodule`;
       }
     }
     ok(!gBad, `回路グラフ ${type}: 全 256 通りが一致`, gBad ?? '');
+  }
+}
+
+// ------------------------------------------------------------------ 階層参照
+//
+// 名前はもともと完全修飾名の平坦な Map で持っているので、解決側は既にできている。
+// 見るところは「式のパーサが a[3] (ビット選択) と b[3].t (階層の添字) を
+// 取り違えないか」と、添字が genvar でも正しく落ちるか。
+async function testHierRef() {
+  const chain = await bothSims(example('chain4.v'), 'chain4');
+  let bad = null;
+  for (let d = 0; d < 16 && !bad; d++) {
+    // 段を素直にたどる: 0 段目は ^1、以降は ^2
+    let v = d ^ 1;
+    const stage = [v];
+    for (let i = 1; i < 4; i++) { v ^= 2; stage.push(v); }
+    for (const sim of chain.all) {
+      sim.setInput('d', d).eval();
+      const want = { chain: stage[3], probe: stage[1] };
+      for (const [k, x] of Object.entries(want)) {
+        if (Number(sim.get(k)) !== x && !bad) {
+          bad = `${sim.constructor.name} d=${d} ${k}=${sim.get(k)} (期待 ${x})`;
+        }
+      }
+    }
+  }
+  ok(!bad, '階層参照: chain4.v の 16 通りが一致 (genvar 添字と 2 段の階層)', bad ?? '');
+
+  // ---- ビット選択と取り違えない ----
+  const { wasm: mw } = await bothSims(`module s(output [3:0] q); assign q = 4'hA; endmodule
+  module m(input [3:0] a, output y, output [1:0] z, output w);
+    s u ();
+    assign y = a[2];        // ビット選択
+    assign z = a[2:1];      // 部分選択
+    assign w = u.q[1];      // 階層参照 + ビット選択
+  endmodule`, 'm');
+  mw.setInput('a', 0b0110).eval();
+  eq(mw.get('y'), 1, '階層参照: ふつうのビット選択は変わらない');
+  eq(mw.get('z'), 3, '階層参照: 部分選択も変わらない');
+  eq(mw.get('w'), 1, '階層参照: 階層参照のあとのビット選択も効く (A の 1 ビット目)');
+
+  // ---- 階層参照で組んだのと、素直に書いたのが同じ回路になる ----
+  const viaHier = compile(`module s(input d, output q); assign q = ~d; endmodule
+  module m(input a, output y); s u (.d(a), .q()); assign y = u.q; endmodule`, 'm');
+  const viaPort = compile(`module s(input d, output q); assign q = ~d; endmodule
+  module m(input a, output y); s u (.d(a), .q(y)); endmodule`, 'm');
+  eqs(viaHier.stats.gates, viaPort.stats.gates,
+    '階層参照: ポートでつないだのと同じゲート数');
+
+  // ---- 深さ 3 (module → module → 信号) ----
+  const deep = await bothSims(`module inner(output [3:0] v); assign v = 4'h6; endmodule
+  module mid(output [3:0] w); inner i0 (); assign w = i0.v; endmodule
+  module m(output [3:0] y, output [3:0] z);
+    mid m0 ();
+    assign y = m0.w;
+    assign z = m0.i0.v;      // 2 段またぐ
+  endmodule`, 'm');
+  for (const sim of deep.all) {
+    sim.eval();
+    eq(sim.get('y'), 6, '階層参照: 1 段');
+    eq(sim.get('z'), 6, '階層参照: 2 段またいでも読める');
   }
 }
 
@@ -3023,6 +3084,19 @@ async function testErrors() {
     ['genvar に幅は書けない',
       `module m(output y); genvar [3:0] i; assign y=1'b0; endmodule`,
       /genvar に幅は書けない/],
+    // 階層参照
+    ['階層参照が展開より前',
+      `module s(output q); assign q=1'b0; endmodule
+       module m(output y); assign y = u.q; s u(); endmodule`,
+      /インスタンスや generate ブロックより後ろに書く必要がある/],
+    ['階層参照の名前が無い',
+      `module s(output q); assign q=1'b0; endmodule
+       module m(output y); s u(); assign y = u.nope; endmodule`,
+      /'u' の中にその名前は無い/],
+    ['階層参照を定数式に使う',
+      `module s(output q); assign q=1'b0; endmodule
+       module m(output [7:0] y); s u(); localparam K = u.q; assign y = K; endmodule`,
+      /階層参照は定数式に使えない/],
     // 繰り返し連接 / 宣言と同時の代入
     ['繰り返し連接の回数が負',
       `module m(input a, output [7:0] y); assign y = {-1{a}}; endmodule`,
@@ -4243,6 +4317,7 @@ const suites = [
   ['generate', testGenerate],
   ['always @(*)', testCombAlways],
   ['繰り返し連接 / 宣言の代入', testSugar],
+  ['階層参照', testHierRef],
   ['比較器', testCompare],
   ['ALU (case の書き方)', testAlu],
   ['非 ANSI と多入力ゲート', testOnehot],

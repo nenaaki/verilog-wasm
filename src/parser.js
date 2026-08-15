@@ -131,6 +131,21 @@ export function parse(src) {
     return parsePrimary();
   }
 
+  /**
+   * いまの '[' に対応する ']' の次が '.' か。
+   * `a[3]` (ビット選択) と `b[3].t` (階層の添字) を見分けるための先読み。
+   * 添字の中にさらに '[' が来ることがあるので、深さを数えて対応を取る。
+   */
+  function closingBracketThenDot() {
+    let depth = 0;
+    for (let k = 0; ; k++) {
+      const tk = peek(k);
+      if (tk.type === 'eof') return false;
+      if (tk.value === '[') depth++;
+      else if (tk.value === ']' && --depth === 0) return peek(k + 1).value === '.';
+    }
+  }
+
   function parsePrimary() {
     const t = peek();
 
@@ -178,6 +193,24 @@ export function parse(src) {
         }
         expect(')');
         return { type: 'call', name: t.value, args, line: t.line };
+      }
+      // 階層参照。`u0.q` / `bits[3].p` のように、インスタンスや generate ブロックの
+      // 中の信号を外から読む。名前は完全修飾名でそのまま signals のキーになるが、
+      // 添字が genvar のこともある (`bits[i-1].s`) ので、数に落とすのは elaborate 側。
+      // ビット選択の '[' と紛らわしいので、']' の次が '.' かどうかで見分ける。
+      if (at('.') || (at('[') && closingBracketThenDot())) {
+        const path = [{ name: t.value, index: null }];
+        for (;;) {
+          if (at('[')) {
+            next();
+            path[path.length - 1].index = parseExpr();
+            expect(']');
+          }
+          if (!eat('.')) break;
+          path.push({ name: expectIdent(), index: null });
+          if (!at('.') && !(at('[') && closingBracketThenDot())) break;
+        }
+        return { type: 'ref', path, range: parseRange(), line: t.line };
       }
       return { type: 'ref', name: t.value, range: parseRange(), line: t.line };
     }
