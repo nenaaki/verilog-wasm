@@ -148,7 +148,18 @@ export function parse(src) {
 
     if (at('{')) {
       const line = next().line;
-      const parts = [parseExpr()];
+      const first = parseExpr();
+      // {n{…}} は繰り返し連接。'{' が続いたら first は中身ではなく繰り返し回数。
+      // 1 個目を読むまで区別が付かないので、読んでから振り分ける
+      if (at('{')) {
+        next();
+        const parts = [parseExpr()];
+        while (eat(',')) parts.push(parseExpr());
+        expect('}');
+        expect('}');
+        return { type: 'repeat', count: first, parts, line };
+      }
+      const parts = [first];
       while (eat(',')) parts.push(parseExpr());
       expect('}');
       return { type: 'concat', parts, line };
@@ -190,10 +201,23 @@ export function parse(src) {
     if (!dir && !kind) throw err('宣言が必要');
     rejectSignedness();
     const range = parseRange();
-    const names = [expectIdent()];
-    while (eat(',')) names.push(expectIdent());
+    // `wire t = a & b;` は宣言と assign を 1 行で書いたもの (net declaration assignment)。
+    // 名前ごとに書けるので `wire x = a, y = b;` も通す。
+    // reg に付けたら初期値の意味になってしまうので、そこは名指しで断る。
+    const names = [];
+    const inits = [];
+    do {
+      const nm = expectIdent();
+      names.push(nm);
+      if (!at('=')) continue;
+      const iline = next().line;
+      if (kind === 'reg') {
+        throw err(`reg '${nm}' の宣言に初期値は書けない (initial は未対応)`);
+      }
+      inits.push({ name: nm, expr: parseExpr(), line: iline });
+    } while (eat(','));
     expect(';');
-    return { type: 'decl', dir, kind, range, names, line };
+    return { type: 'decl', dir, kind, range, names, inits, line };
   }
 
   /**

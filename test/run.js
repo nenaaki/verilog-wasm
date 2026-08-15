@@ -377,6 +377,85 @@ endmodule`;
   }
 }
 
+// ------------------------------------------- 繰り返し連接 / 宣言と同時の代入
+//
+// どちらも「同じことを長く書いたのと一致するか」で見る。糖衣なので、
+// 展開した先が手で書き並べたのと一字一句同じ回路になるはず。
+async function testSugar() {
+  // ---- 繰り返し連接 {n{x}} ----
+  const { wasm: rw, ref: rr } = await bothSims(`module r #(parameter W = 8) (
+    input a, input [3:0] d,
+    output [7:0] rep, output [W-1:0] zext, output [7:0] sext,
+    output [7:0] pair, output [7:0] nest, output [3:0] none
+  );
+    assign rep  = {8{a}};                  // 1 ビットを 8 本に広げる
+    assign zext = {{(W-1){1'b0}}, a};      // ゼロ詰めの定番
+    assign sext = {{4{d[3]}}, d};          // 符号拡張の定番
+    assign pair = {2{d[1:0], 2'b10}};      // 中身が 2 個以上のとき
+    assign nest = {2{{2{d[1:0]}}}};        // 入れ子
+    assign none = {{0{a}}, d};             // 0 回。連接の中なら幅 0 が許される
+  endmodule`);
+  let bad = null;
+  for (let d = 0; d < 16 && !bad; d++) {
+    for (const a of [0, 1]) {
+      const lo = d & 3;
+      const want = {
+        rep: a ? 255 : 0,
+        zext: a,
+        sext: ((d & 8 ? 0xf0 : 0) | d),
+        pair: (lo << 6) | (2 << 4) | (lo << 2) | 2,
+        nest: (lo << 6) | (lo << 4) | (lo << 2) | lo,
+        none: d,
+      };
+      for (const sim of [rw, rr]) {
+        sim.setInput('a', a).setInput('d', d).eval();
+        for (const [k, v] of Object.entries(want)) {
+          if (Number(sim.get(k)) !== v && !bad) {
+            bad = `${sim.constructor.name} a=${a} d=${d} ${k}=${sim.get(k)} (期待 ${v})`;
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, '繰り返し連接: 全 32 通りが手で並べたのと一致', bad ?? '');
+
+  // 並べて書いたのとゲート数が一致する (展開が余計なものを作っていない)
+  const rep = compile(`module g(input [3:0] d, output [15:0] y); assign y = {4{d}}; endmodule`);
+  const flat = compile(`module g(input [3:0] d, output [15:0] y); assign y = {d, d, d, d}; endmodule`);
+  eqs(rep.stats.gates, flat.stats.gates, '繰り返し連接: 並べて書いたのと同じゲート数');
+  eqs(rep.stats.nets, flat.stats.nets, '繰り返し連接: ネット数も同じ');
+
+  // 幅は「回数 × 中身の合計」で、連接と同じく自己決定 (文脈は中に入らない)
+  const w = compile(`module g(input [3:0] d, output [31:0] y); assign y = {2{d}}; endmodule`);
+  const sim = await WasmSimulator.create(w);
+  sim.setInput('d', 15).eval();
+  eq(sim.get('y'), 0xff, '繰り返し連接: 自己決定幅は 8 ビット (代入先に広げられない)');
+
+  // ---- 宣言と同時の代入 ----
+  const { wasm: dw, ref: dr } = await bothSims(`module d(input [3:0] a, input [3:0] b,
+    output [3:0] y, output [4:0] s);
+    wire [3:0] t = a & b, u = a | b;     // 1 行に 2 本
+    wire [4:0] wide = a + b;             // 幅は左辺で決まる (文脈依存幅)
+    assign y = t ^ u;
+    assign s = wide;
+  endmodule`);
+  for (const sim of [dw, dr]) {
+    sim.setInput('a', 9).setInput('b', 5).eval();
+    eq(sim.get('y'), 12, '宣言の代入: 値が入る');
+    eq(sim.get('s'), 14, '宣言の代入: 左辺の幅が右辺の文脈になる (桁上げが残る)');
+  }
+  const decl = compile(`module g(input [3:0] a, input [3:0] b, output [3:0] y);
+    wire [3:0] t = a & b;
+    assign y = t | b;
+  endmodule`);
+  const split = compile(`module g(input [3:0] a, input [3:0] b, output [3:0] y);
+    wire [3:0] t;
+    assign t = a & b;
+    assign y = t | b;
+  endmodule`);
+  eqs(decl.stats.gates, split.stats.gates, '宣言の代入: assign に分けて書いたのと同じ回路');
+}
+
 // ------------------------------------------------------------- always @(*)
 //
 // 組合せ always。レジスタ用の always とは代入の意味 (ブロッキング) も、
@@ -2944,6 +3023,22 @@ async function testErrors() {
     ['genvar に幅は書けない',
       `module m(output y); genvar [3:0] i; assign y=1'b0; endmodule`,
       /genvar に幅は書けない/],
+    // 繰り返し連接 / 宣言と同時の代入
+    ['繰り返し連接の回数が負',
+      `module m(input a, output [7:0] y); assign y = {-1{a}}; endmodule`,
+      /繰り返し連接の回数が負/],
+    ['繰り返し連接の回数が多すぎる',
+      `module m(input a, output [7:0] y); assign y = {99999{a}}; endmodule`,
+      /繰り返し連接の回数が多すぎる/],
+    ['繰り返し連接の回数が定数でない',
+      `module m(input [2:0] n, input a, output [7:0] y); assign y = {n{a}}; endmodule`,
+      /'n' は定数式に使えない/],
+    ['reg の宣言に初期値',
+      `module m(output reg y); reg [3:0] t = 4'h0; always @(*) y = t[0]; endmodule`,
+      /reg 't' の宣言に初期値は書けない \(initial は未対応\)/],
+    ['宣言の代入と assign の多重ドライブ',
+      `module m(input a, output y); wire t = a; assign t = ~a; assign y = t; endmodule`,
+      /t が多重にドライブされている \(宣言の代入 と assign 文\)/],
     // always @(*) — ラッチになる書き方と、代入の取り違え
     ['always @(*) で else が無い',
       `module m(input c, input d, output reg y); always @(*) if (c) y = d; endmodule`,
@@ -3208,6 +3303,8 @@ function randomDesign(rng, nWires) {
     // 生成した function をインライン展開に通す。中身は if / case / ローカル変数入り。
     // 子モジュールには宣言していないので、そちらを組み立てている間は出さない
     if (r < 0.98 && !inSub) return `rndf(${expr(depth - 1)}, ${expr(depth - 1)})`;
+    // 繰り返し連接も混ぜる。回数は 1〜4 の定数
+    if (rng() < 0.35) return `{${1 + Math.floor(rng() * 4)}{${expr(depth - 1)}}}`;
     return `{${expr(depth - 1)}, ${expr(depth - 1)}}`;
   };
 
@@ -3263,8 +3360,9 @@ function randomDesign(rng, nWires) {
   pool.push('rc');
 
   for (let i = 0; i < nWires; i++) {
-    lines.push(`  wire [7:0] w${i};`);
-    lines.push(`  assign w${i} = ${expr(3)};`);
+    // 半分は宣言と同時に代入する (assign に分けたのと同じ回路になるはず)
+    if (rng() < 0.5) lines.push(`  wire [7:0] w${i} = ${expr(3)};`);
+    else { lines.push(`  wire [7:0] w${i};`); lines.push(`  assign w${i} = ${expr(3)};`); }
     pool.push(`w${i}`);
   }
 
@@ -3359,7 +3457,7 @@ async function testRandomDiff() {
   // 生成器が特定の構文を作らなくなったことに気づけるように数えておく
   const seen = {
     'if': 0, 'case': 0, 'casez': 0, 'function': 0, '+ / -': 0, '* / %': 0, 'generate': 0,
-    'always @(*)': 0,
+    'always @(*)': 0, '{n{x}}': 0, 'wire t = 式': 0,
     '比較': 0, 'シフト': 0, '論理': 0,
     '非同期リセット': 0, '階層': 0, 'parameter': 0, 'リダクション': 0,
   };
@@ -3374,6 +3472,8 @@ async function testRandomDiff() {
     if (/[*/%] /.test(src)) seen['* / %']++;
     if (/begin : gblk/.test(src)) seen['generate']++;
     if (src.includes('always @(*)')) seen['always @(*)']++;
+    if (/\{\d+\{/.test(src)) seen['{n{x}}']++;
+    if (/wire \[7:0\] w\d+ =/.test(src)) seen['wire t = 式']++;
     if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
     if (/(<<|>>)/.test(src)) seen['シフト']++;
     if (/(&&|\|\||\(!)/.test(src)) seen['論理']++;
@@ -4142,6 +4242,7 @@ const suites = [
   ['乗除算', testMulDiv],
   ['generate', testGenerate],
   ['always @(*)', testCombAlways],
+  ['繰り返し連接 / 宣言の代入', testSugar],
   ['比較器', testCompare],
   ['ALU (case の書き方)', testAlu],
   ['非 ANSI と多入力ゲート', testOnehot],

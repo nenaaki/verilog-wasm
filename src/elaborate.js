@@ -423,6 +423,23 @@ export function elaborate(mod, all = [mod]) {
   }
 
   // ---- 式の評価 (→ LSB 先頭のネット配列) ------------------------------------
+  /**
+   * 繰り返し連接 `{n{…}}` の n。定数式なので展開時に数に落ちる。
+   * 0 は許す ―― `{{(W-1){1'b0}}, x}` は W が 1 のとき 0 回になり、Verilog でも
+   * 「連接の中でだけ許される幅 0」として通る書き方だから。
+   */
+  function repeatCount(e) {
+    const n = constExpr(e.count);
+    if (n < 0n) {
+      throw new CompileError(`繰り返し連接の回数が負 (${n})`, e.line);
+    }
+    if (n > MAX_UNROLL) {
+      throw new CompileError(
+        `繰り返し連接の回数が多すぎる (${n}。上限 ${MAX_UNROLL})`, e.line);
+    }
+    return Number(n);
+  }
+
   function resize(bits, width) {
     if (bits.length === width) return bits;
     if (bits.length > width) return bits.slice(0, width);
@@ -746,6 +763,9 @@ export function elaborate(mod, all = [mod]) {
         return Math.max(selfWidth(e.a), selfWidth(e.b));
       case 'concat':
         return e.parts.reduce((sum, p) => sum + selfWidth(p), 0);
+      case 'repeat':
+        // 繰り返し連接。回数は定数式なので、ここで数に落とせる
+        return repeatCount(e) * e.parts.reduce((sum, p) => sum + selfWidth(p), 0);
       default:
         throw new CompileError(`未知の式ノード '${e.type}'`, e.line);
     }
@@ -863,6 +883,15 @@ export function elaborate(mod, all = [mod]) {
         // 各パートは自己決定 — 文脈は中に伝わらない (だから幅が曖昧にならない)
         const out = [];
         for (let i = e.parts.length - 1; i >= 0; i--) out.push(...evalExpr(e.parts[i]));
+        return resize(out, w);
+      }
+      case 'repeat': {
+        // {n{a, b}} は {a, b} を n 個並べたもの。LSB 先頭配列では
+        // 中身をそのまま n 回つなぐだけでその順番になる
+        const inner = [];
+        for (let i = e.parts.length - 1; i >= 0; i--) inner.push(...evalExpr(e.parts[i]));
+        const out = [];
+        for (let k = 0; k < repeatCount(e); k++) out.push(...inner);
         return resize(out, w);
       }
       default:
@@ -1442,7 +1471,19 @@ export function elaborate(mod, all = [mod]) {
   }
 
   function runItem(item, mod, prefix, isTop, depth, stack) {
-    if (item.type === 'decl') return;
+    if (item.type === 'decl') {
+      // `wire t = 式;` の右辺。宣言そのものは declPass で済んでいるので、
+      // ここは assign 文とまったく同じ扱いにする
+      for (const init of item.inits ?? []) {
+        const lhs = { type: 'ref', name: init.name, range: null, line: init.line };
+        const s = lookup(init.name, init.line);
+        if (s.dir === 'input') {
+          throw new CompileError(`入力ポート '${s.name}' は駆動できない`, init.line);
+        }
+        connect(lhs, evalExpr(init.expr, refBits(lhs).length), '宣言の代入', init.line);
+      }
+      return;
+    }
     // function は宣言だけ。回路になるのは呼び出された場所 (declPass で集めてある)
     if (item.type === 'func') return;
     // integer / genvar は展開時の整数。declPass で名前を登録してある
