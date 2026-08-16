@@ -28,9 +28,21 @@ import { GATE_PRIMITIVES } from './parser.js';
 
 const MAX_DEPTH = 16;   // インスタンスの入れ子の上限
 
-// z / ? は「その桁を比較しない」印としてだけ扱う。値としての z は持たないので、
-// casez のラベル以外の場所に出てきたら断る (黙って 0 にすると回路が静かに変わる)
-const DONT_CARE_ONLY_IN_CASEZ = 'z / ? は casez のラベルでしか使えない (値としての z は扱わない)';
+// z / ? と x は「その桁を比較しない」印としてだけ扱う。値としての x / z は
+// 持たないので、ラベル以外の場所に出てきたら断る (黙って 0 にすると回路が静かに
+// 変わる)。どちらを比較から外すかは case の種類で違う:
+//   casez … z / ?
+//   casex … z / ? と x
+const DONT_CARE_MSG = {
+  z: 'z / ? は casez / casex のラベルでしか使えない (値としての z は扱わない)',
+  x: 'x は casex のラベルでしか使えない (値としての x は扱わない)',
+};
+
+/** 比較しない桁が「そこに書けない場所」に出ていないか。x を先に見て理由を分ける */
+function checkNoDontCare(e) {
+  if (e.xmask) throw new CompileError(DONT_CARE_MSG.x, e.line);
+  if (e.mask) throw new CompileError(DONT_CARE_MSG.z, e.line);
+}
 
 /**
  * @param {object} mod    top にする module の AST
@@ -44,6 +56,7 @@ export function elaborate(mod, all = [mod]) {
   const regs = [];
   const signals = new Map();
   const drivers = new Map(); // netId -> 駆動元の説明 (多重ドライブ検出用)
+  const warnings = [];       // 回路は変えずに伝えたいこと (到達しない case のラベルなど)
 
   const newNet = (name) => {
     nets.push({ name });
@@ -220,7 +233,7 @@ export function elaborate(mod, all = [mod]) {
     const bool = (b) => (b ? 1n : 0n);
     switch (e.type) {
       case 'num': {
-        if (e.mask) throw new CompileError(DONT_CARE_ONLY_IN_CASEZ, e.line);
+        checkNoDontCare(e);
         const v = e.bits & ((1n << BigInt(e.width)) - 1n);   // 自分の幅で切る
         // signed なら最上位ビットが符号。以降は幅を持たない整数として扱う
         if (e.signed && ((v >> BigInt(e.width - 1)) & 1n) === 1n) return v - (1n << BigInt(e.width));
@@ -712,22 +725,131 @@ export function elaborate(mod, all = [mod]) {
         cs = cs && signOf(label);
       }
     }
+    checkCaseLabels(st, cw, cs);
     return { cw, cs };
   }
 
+  // ---- 到達しないラベルの検査 ------------------------------------------------
+  //
+  // case は上から順に最初に一致したものが勝つので、先に書いたラベルに**飲み込まれる**
+  // ラベルは決して選ばれない。重複ラベルはもちろん、casez / casex では
+  // `4'b1???` の後の `4'b1010` のように、字面が違っても飲み込まれることがある。
+  // どちらも書き間違いなので、回路は変えずに警告として伝える。
+  //
+  // ラベルを (値, 比較する桁) の対に落とすと、飲み込みは 2 つの条件になる:
+  //   L1 が見る桁は L2 も見ている            … care1 ⊆ care2
+  //   その桁での値が一致する                  … (value1 ^ value2) & care1 == 0
+  //
+  // **見逃しはあっても誤検出はしない**ように作る。落とせないラベル (信号を含む式)
+  // は「何も飲み込まない」ものとして飛ばす ― 飲み込む側から外しても、飲み込まれる
+  // 側から外しても、報告が減るだけで嘘は増えない。
+  const checkedCases = new Set();          // 同じ case を for の展開で何度も見ないため
+  const MAX_COVER_WIDTH = 12;              // 全網羅を数え上げる上限 (4096 通り)
+
+  const subsumes = (a, b) => (a.care & ~b.care) === 0n && ((a.value ^ b.value) & a.care) === 0n;
+
+  /** ラベルを幅 cw の (値, 比較する桁) にする。落とせなければ null */
+  function labelPattern(label, cw, cs, kind) {
+    const all = (1n << BigInt(cw)) - 1n;
+    if (label.type !== 'num') {
+      // parameter だけで書いたラベルも定数に落ちる。全桁を比較する
+      if (cw > PARAM_WIDTH) return null;    // 32 ビットを超える拡張は constBits と食い違う
+      try {
+        const v = constExpr(label);
+        return { value: ((v % (all + 1n)) + all + 1n) % (all + 1n), care: all };
+      } catch { return null; }
+    }
+    // matchLabel / evalExpr と同じ伸ばし方をなぞる。don't care の桁は広がらないので、
+    // 自分の幅より上は必ず「比較する」側に入る
+    const dc = dontCareMask(label, kind);
+    const w = BigInt(label.width);
+    const raw = label.bits & ((1n << w) - 1n);
+    const fill = cs && label.signed && ((raw >> (w - 1n)) & 1n) === 1n;
+    let value = 0n;
+    let care = 0n;
+    for (let i = 0n; i < BigInt(cw); i++) {
+      if (i < w && ((dc >> i) & 1n) === 1n) continue;         // 比較しない桁
+      care |= 1n << i;
+      const bit = i < w ? (raw >> i) & 1n : (fill ? 1n : 0n);
+      if (bit === 1n) value |= 1n << i;
+    }
+    return { value, care };
+  }
+
+  const labelText = (label) => {
+    if (label.text) return label.text;
+    try { return String(constExpr(label)); } catch { return '式'; }
+  };
+
+  function checkCaseLabels(st, cw, cs) {
+    if (checkedCases.has(st)) return;      // for の中の case は展開のたびに通る
+    checkedCases.add(st);
+
+    const seen = [];
+    for (const it of st.items) {
+      for (const label of it.labels) {
+        const p = labelPattern(label, cw, cs, st.kind);
+        if (!p) continue;
+        const hit = seen.find((q) => subsumes(q, p));
+        if (hit) {
+          warnings.push(
+            `${label.line ?? it.line} 行目の ${st.kind} のラベル ${labelText(label)} は`
+            + `選ばれない (${hit.line} 行目の ${hit.text} が先に一致する)`);
+        }
+        seen.push({ ...p, line: label.line ?? it.line, text: labelText(label) });
+      }
+    }
+
+    // default も同じ話。**前のラベルが全部の値を網羅していたら default は選ばれない。**
+    // 落とせなかったラベルは網羅を増やす側にしか働かないので、数え上げから抜けていても
+    // 「網羅していた」という結論は嘘にならない。
+    if (!st.default || cw > MAX_COVER_WIDTH || seen.length === 0) return;
+    const size = 1n << BigInt(cw);
+    for (let v = 0n; v < size; v++) {
+      if (!seen.some((p) => ((v ^ p.value) & p.care) === 0n)) return;   // 網羅していない
+    }
+    warnings.push(
+      `${st.line} 行目の ${st.kind} の default は選ばれない (ラベルが ${cw} ビットの値を`
+      + '全部網羅している)');
+  }
+
   /**
-   * case のラベル 1 個と式の一致。casez のときはラベルに書いた z / ? の桁を
-   * 比較から外す。ラベルを幅 cw に伸ばしたときの上位は 0 で埋まる (don't care は
-   * 広がらない) ので、そこは比較する ― Verilog の規則どおり。
+   * ラベル 1 個の「比較しない桁」。casez は z / ?、casex はそれに加えて x。
    *
-   * don't care は**リテラルに書いたものだけ**を見る。式で作った z は無いので、
+   * **式の側は 2 値しか無いので、don't care はラベルにしか現れない。** だから
+   * casex も casez とまったく同じ機構でそのまま正しく落ちる ― Verilog が
+   * 「どちらのオペランドの x / z も比較から外す」と決めているうちの、
+   * 起こり得るほうだけが残る形になっている。
+   *
+   * don't care は**リテラルに書いたものだけ**を見る。式で作った x / z は無いので、
    * ラベルがリテラル以外なら普通の一致になる。
    */
-  function matchLabel(sel, label, cw, casez, signed) {
-    const mask = casez && label.type === 'num' ? label.mask : 0n;
+  function dontCareMask(label, kind) {
+    if (label.type !== 'num') return 0n;
+    if (kind === 'casex') return label.mask | label.xmask;
+    if (kind === 'casez') {
+      // casez のラベルの x は「式の桁が x のときだけ一致」= 決して一致しない。
+      // 黙って死んだ枝にすると気づけないので断る
+      if (label.xmask) {
+        throw new CompileError(
+          'casez のラベルに x は書けない (x を値として扱わないので、この枝は決して選ばれない)。'
+          + '比較しない桁なら ? か z を、x も比較から外したいなら casex を使う', label.line);
+      }
+      return label.mask;
+    }
+    return 0n;                                    // 素の case は全桁を比較する
+  }
+
+  /**
+   * case のラベル 1 個と式の一致。ラベルを幅 cw に伸ばしたときの上位は
+   * 符号か 0 で埋まる (don't care は広がらない) ので、そこは比較する ―
+   * Verilog の規則どおり。
+   */
+  function matchLabel(sel, label, cw, kind, signed) {
+    const mask = dontCareMask(label, kind);
     if (!mask) return equalBits(sel, evalExpr(label, cw, signed), '==')[0];
-    // mask を落としたリテラルとして評価する (don't care の桁は 0 が入っている)
-    const bits = evalExpr({ ...label, mask: 0n }, cw, signed);
+    // don't care を落としたリテラルとして評価する (その桁には 0 が入っている)
+    const bits = evalExpr({ ...label, mask: 0n, xmask: 0n }, cw, signed);
     const diffs = [];
     for (let i = 0; i < cw; i++) {
       if ((mask >> BigInt(i)) & 1n) continue;
@@ -882,10 +1004,15 @@ export function elaborate(mod, all = [mod]) {
   //
   // ゲートは作らないので、同じノードを何度尋ねても副作用は無い。ノードごとに
   // 結果をキャッシュして、深い式で何度も辿らないようにしてある。
+  //
+  // **キーは AST ノードだが、答えはノードだけでは決まらない。** 同じ `{a, 4'h0}` でも
+  // いまのスコープとパラメータの値で幅が変わるので、その 2 つが動く所では捨てる:
+  //   - ループ変数が進むとき (for / while / repeat / generate の for)
+  //   - インスタンスの出入り (同じ module を別のパラメータで 2 回展開する)
+  // 捨て忘れると 1 個目の幅が 2 個目に流用され、**エラーにならずに値が変わる**。
   const selfWidthCache = new Map();
   const signCache = new Map();
 
-  /** 添字が変わると幅も符号 (部分選択かどうか) も変わり得るので、まとめて捨てる */
   const clearExprCache = () => { selfWidthCache.clear(); signCache.clear(); };
 
   function selfWidth(e) {
@@ -1032,7 +1159,7 @@ export function elaborate(mod, all = [mod]) {
       case 'sys':
         return extend(evalExpr(e.a), w, sg);
       case 'num': {
-        if (e.mask) throw new CompileError(DONT_CARE_ONLY_IN_CASEZ, e.line);
+        checkNoDontCare(e);
         // 自分の幅より上は符号ビット (符号なしなら 0)。ここでマスクしないと
         // 4'hFF が 255 のまま広がる
         const top = (e.bits >> BigInt(e.width - 1)) & 1n;
@@ -1469,7 +1596,7 @@ export function elaborate(mod, all = [mod]) {
           syncEnv(before);
           let cond = null;
           for (const label of it.labels) {
-            const hit = matchLabel(sel, label, cw, st.casez, cs);
+            const hit = matchLabel(sel, label, cw, st.kind, cs);
             cond = cond === null ? hit : newGate('or', [cond, hit]);
           }
           acc = mergeBits(cond, runFuncStmts(it.stmts, new Map(before)), acc);
@@ -1545,7 +1672,7 @@ export function elaborate(mod, all = [mod]) {
           const it = st.items[k];
           let cond = null;
           for (const label of it.labels) {
-            const hit = matchLabel(sel, label, cw, st.casez, cs);
+            const hit = matchLabel(sel, label, cw, st.kind, cs);
             cond = cond === null ? hit : newGate('or', [cond, hit]);
           }
           acc = mergeStates(cond, runStmts(it.stmts, new Map(cur)), acc, cur);
@@ -1671,22 +1798,60 @@ export function elaborate(mod, all = [mod]) {
   // 「ネット → 初期ビット」を貯めるだけにして、検査は展開のあとでまとめてやる。
   const initOf = new Map();            // レジスタの Q ネット → { bit, line }
 
+  /**
+   * initial の中の定数式。信号を読んでいるのが圧倒的に多いので、
+   * initial の文脈を足して言い直す。
+   */
+  function initialConst(e, what, line) {
+    try {
+      return constExpr(e);
+    } catch (err) {
+      throw new CompileError(
+        `${what}は定数でなければならない (${err.message.replace(/^\d+ 行目: /, '')})`, line);
+    }
+  }
+
+  /**
+   * initial の中の case。**選択式もラベルも定数**なので、どの枝を採るかは
+   * ここで決まってしまう ― 回路にはならず、選んだ枝の代入だけが残る
+   * (generate の case と同じ落とし方)。casez / casex の don't care も効く。
+   */
+  function initialCase(st) {
+    const sel = initialConst(st.sel, 'initial の case の選択式', st.line);
+    for (const it of st.items) {
+      for (const label of it.labels) {
+        const dc = dontCareMask(label, st.kind);
+        const v = initialConst({ ...label, mask: 0n, xmask: 0n }, 'initial の case のラベル', it.line);
+        if (((sel ^ v) & ~dc) === 0n) return it.stmts;
+      }
+    }
+    return st.default;
+  }
+
   function runInitial(item) {
-    for (const st of item.stmts) {
+    runInitialStmts(item.stmts);
+  }
+
+  function runInitialStmts(stmts) {
+    for (const st of stmts) {
+      if (st.type === 'block') { runInitialStmts(st.stmts); continue; }
+      if (st.type === 'if') {
+        const taken = initialConst(st.cond, 'initial の if の条件', st.line) !== 0n ? st.then : st.else;
+        if (taken) runInitialStmts(taken);
+        continue;
+      }
+      if (st.type === 'case') {
+        const taken = initialCase(st);
+        if (taken) runInitialStmts(taken);
+        continue;
+      }
       if (st.type !== 'ba') {
         throw new CompileError(
-          'initial の中に書けるのは定数の代入だけ (if / case / for は未対応)', st.line);
+          'initial の中に書けるのは定数の代入と、定数で選ぶ if / case だけ '
+          + '(for / while / repeat は未対応)', st.line);
       }
       const bits = lhsRegBits(st.lhs, st.line);
-      let value;
-      try {
-        value = constExpr(st.rhs);
-      } catch (e) {
-        // 「信号を読んでいる」が圧倒的に多いので、initial の文脈を足して言い直す
-        throw new CompileError(
-          `initial の右辺は定数でなければならない (${e.message.replace(/^\d+ 行目: /, '')})`,
-          st.line);
-      }
+      const value = initialConst(st.rhs, 'initial の右辺', st.line);
       bits.forEach((qn, i) => {
         const bit = Number((value >> BigInt(i)) & 1n);
         const prev = initOf.get(qn);
@@ -2133,13 +2298,22 @@ export function elaborate(mod, all = [mod]) {
     }
 
     // --- 3. 子の中身 ---
+    // 幅と符号のキャッシュはスコープとパラメータの値に依存しているので、
+    // 境界の出入りで捨てる。同じ module を別のパラメータで 2 回展開したとき、
+    // 1 個目の幅が 2 個目に流用されるのを防ぐ (ポート接続は親のスコープで
+    // 評価するので、捨てるのは itemPass の直前でよい)
     const saved = scope;
     const savedBase = scopeBase;
     scope = childPrefix;
     scopeBase = childPrefix;           // ここから外へは名前を辿らない (module の境界)
-    itemPass(sub, childPrefix, false, depth + 1, [...stack, item.module]);
-    scope = saved;
-    scopeBase = savedBase;
+    clearExprCache();
+    try {
+      itemPass(sub, childPrefix, false, depth + 1, [...stack, item.module]);
+    } finally {
+      scope = saved;
+      scopeBase = savedBase;
+      clearExprCache();
+    }
   }
 
   // ---- 展開の開始 ----------------------------------------------------------
@@ -2200,7 +2374,10 @@ export function elaborate(mod, all = [mod]) {
     signals,
     clock,
     portOrder: mod.portOrder,
-    warnings: undriven.length ? [`未駆動の信号を 0 に固定しました: ${undriven.join(', ')}`] : [],
+    warnings: [
+      ...(undriven.length ? [`未駆動の信号を 0 に固定しました: ${undriven.join(', ')}`] : []),
+      ...warnings,
+    ],
     CONST0,
     CONST1,
   };

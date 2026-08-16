@@ -5,8 +5,12 @@
 import { CompileError } from './errors.js';
 
 // 's は符号付きリテラル (4'sd5)。ビット列は 4'd5 と同じで、signed の印だけが付く。
-// z / Z / ? は casez のラベルで「その桁を比較しない」印として使う。x / X は
-// 値としての x なので断るが、これも読めないと理由が伝わらないので桁に含める。
+//
+// z / Z / ? と x / X は「その桁を比較しない」印。**2 本に分けて持つ**のは、
+// どちらを比較から外すかが casez と casex で違うため (casez は z / ? だけ、
+// casex は x も)。値としての x / z は持たないので、ラベル以外に出てきたら
+// elaborate が名指しで断る ― どの文字だったかで理由が変わるので、ここでは
+// 読むだけにして判断は上に任せる。
 const RE_SIZED = /(\d+)?'([sS]?)([bodhBODH])([0-9a-fA-F_xXzZ?]+)/y;
 const RE_DEC = /\d[\d_]*/y;
 const RE_IDENT = /[A-Za-z_][A-Za-z0-9_$]*/y;
@@ -73,30 +77,29 @@ export function lex(src) {
       const [raw, widthStr, signChar, baseChar, digitsRaw] = sized;
       const radix = RADIX[baseChar.toLowerCase()];
       const digits = digitsRaw.replace(/_/g, '');
-      // mask は「比較しない桁」。1 桁が基数ぶんのビットになるので、value と同じ
-      // 桁上げで積めば z / ? の位置がそのままビットに広がる (4'hz なら 4 ビット)
+      // mask / xmask は「比較しない桁」。1 桁が基数ぶんのビットになるので、value と
+      // 同じ桁上げで積めば z / x の位置がそのままビットに広がる (4'hz なら 4 ビット)
       let value = 0n;
-      let mask = 0n;
+      let mask = 0n;      // z / ? の桁
+      let xmask = 0n;     // x の桁
       for (const d of digits) {
-        const dontCare = d === 'z' || d === 'Z' || d === '?';
-        if (d === 'x' || d === 'X') {
-          throw new CompileError(
-            `${raw} の x は未対応 (x を値として扱わない。比較しない桁なら z か ? を使う)`, line);
+        const isZ = d === 'z' || d === 'Z' || d === '?';
+        const isX = d === 'x' || d === 'X';
+        if ((isZ || isX) && radix === 10) {
+          throw new CompileError(`${raw}: 10 進のリテラルでは x / z / ? は使えない`, line);
         }
-        if (dontCare && radix === 10) {
-          throw new CompileError(`${raw}: 10 進のリテラルでは z / ? は使えない`, line);
-        }
-        const v = dontCare ? 0 : parseInt(d, radix);
+        const v = isZ || isX ? 0 : parseInt(d, radix);
         if (Number.isNaN(v)) throw new CompileError(`基数 ${radix} に対して不正な桁 '${d}'`, line);
         value = value * BigInt(radix) + BigInt(v);
-        mask = mask * BigInt(radix) + (dontCare ? BigInt(radix - 1) : 0n);
+        mask = mask * BigInt(radix) + (isZ ? BigInt(radix - 1) : 0n);
+        xmask = xmask * BigInt(radix) + (isX ? BigInt(radix - 1) : 0n);
       }
       const width = widthStr ? parseInt(widthStr, 10) : UNSIZED_WIDTH;
       if (width < 1 || width > 4096) throw new CompileError(`ビット幅 ${width} が不正`, line);
       const wm = (1n << BigInt(width)) - 1n;
       tokens.push({
-        type: 'num', value: raw, line, width, bits: value & wm, mask: mask & wm,
-        signed: !!signChar,
+        type: 'num', value: raw, line, width, bits: value & wm,
+        mask: mask & wm, xmask: xmask & wm, signed: !!signChar,
       });
       i += raw.length;
       continue;

@@ -2,8 +2,13 @@
 //
 // 中核は「WASM バックエンド vs JS 参照実装」の差分テスト。
 // ランダムな回路 × ランダムな入力で両者の出力が一致することを確認する。
+//
+//   --check-readme   README に手書きしてある件数がズレていたら落とす
+//   --update-readme  ズレていたら README を書き換える
+//
+// 何も付けなければ、ズレを 1 行知らせるだけで落とさない (開発中に邪魔しない)。
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -22,6 +27,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const example = (n) => readFileSync(join(HERE, '..', 'examples', n), 'utf8');
 
 let passed = 0;
+let errorKinds = 0;      // testErrors が数えるコンパイルエラーの種類数
 const failures = [];
 
 function ok(cond, label, detail = '') {
@@ -659,6 +665,47 @@ async function testInitial() {
     sim.setInput('rstn', 1);
     eq(sim.get('q'), 9, 'initial: reset() は initial の値に戻す');
   }
+
+  // 9. 定数で選ぶ if / case。**回路にはならない** ― どの枝を採るかは展開時に
+  //    決まってしまうので、選ばれた枝の代入だけが初期値として残る
+  const sel = (mode, body) => `module m #(parameter MODE = ${mode}) (input clk, output reg [7:0] q);
+    initial ${body}
+    always @(posedge clk) q <= q + 1;
+  endmodule`;
+  const csBody = "case (MODE) 0: q = 8'h00; 1: q = 8'hFF; default: q = 8'h5A; endcase";
+  for (const [mode, want] of [[0, 0x00], [1, 0xFF], [9, 0x5A]]) {
+    const { all: cs } = await bothSims(sel(mode, csBody));
+    for (const sim of cs) {
+      eq(sim.get('q'), want, `${sim.constructor.name} initial: case が MODE=${mode} の枝を選ぶ`);
+    }
+  }
+  const ifBody = "if (MODE) q = 8'hAB; else q = 8'hCD;";
+  for (const [mode, want] of [[1, 0xAB], [0, 0xCD]]) {
+    const { all: is } = await bothSims(sel(mode, ifBody));
+    for (const sim of is) {
+      eq(sim.get('q'), want, `${sim.constructor.name} initial: if が MODE=${mode} の枝を選ぶ`);
+    }
+  }
+  // begin … end の入れ子と、casez の don't care
+  const { all: nest } = await bothSims(sel(6, `begin
+      if (MODE) begin
+        casez (MODE) 4'b1??: q = 8'hE0; 4'b0??: q = 8'hE1; default: q = 8'hE2; endcase
+      end
+    end`));
+  for (const sim of nest) {
+    eq(sim.get('q'), 0xE0, `${sim.constructor.name} initial: 入れ子の begin と casez`);
+  }
+
+  // 選ばれなかった枝は初期値を置かない (2 回置くとエラーになるので、それで確かめる)
+  const twice = sel(0, "begin if (MODE) q = 8'h11; else q = 8'h22; if (!MODE) q = 8'h22; end");
+  let ok2 = true;
+  try { compile(twice, { wat: false }); } catch (e) { ok2 = false; }
+  ok(ok2, 'initial: 選ばれなかった枝の代入は無かったことになる');
+  const conflict = sel(0, "begin q = 8'h11; if (!MODE) q = 8'h22; end");
+  let caught = null;
+  try { compile(conflict, { wat: false }); } catch (e) { caught = e; }
+  ok(caught instanceof CompileError && /違う初期値を 2 回置いている/.test(caught.message),
+    'initial: 選ばれた枝どうしが食い違えばエラー', caught ? caught.message : 'エラーにならなかった');
 }
 
 // ------------------------------------------------------------------ 階層参照
@@ -1384,6 +1431,81 @@ endmodule`;
   tv.setInput('a', 5).eval();
   eq(tv.get('p'), 10, 'parameter: 1 個目のインスタンスは N=1');
   eq(tv.get('q'), 40, 'parameter: 2 個目のインスタンスは N=3');
+
+  // --- 幅のキャッシュがインスタンスをまたがないこと ---
+  //
+  // 自己決定幅は AST ノードごとにキャッシュしてあるが、答えはスコープと
+  // パラメータの値で変わる。捨て忘れると 1 個目のインスタンスの幅が 2 個目に
+  // 流用され、**エラーにならずに値が変わる**。文脈幅が配られる位置では
+  // max(自己決定幅, 文脈幅) が受け止めてしまうので、自己決定の位置
+  // (連接のパート・比較のオペランド・リダクション・シフト量・function の戻り値)
+  // を並べて確かめる。
+  const leaf = `module leaf #(parameter W = 4) (input [W-1:0] a,
+    output [15:0] cat, output eqAll, output andAll, output [15:0] fn, output [15:0] amt);
+    function [W-1:0] pass(input [W-1:0] x); pass = x; endfunction
+    assign cat    = {a, 4'h0};        // 連接のパートは自己決定
+    assign eqAll  = a == {W{1'b1}};   // 比較のオペランドも自己決定
+    assign andAll = &a;               // リダクションは全ビットを見る
+    assign fn     = {pass(a), 4'h0};  // function の戻り値の幅もパラメータで変わる
+    assign amt    = 16'h8000 >> a;    // シフト量は自己決定
+  endmodule`;
+  const ports = (n) => `.a(${n === 4 ? 'd[3:0]' : 'd'}), .cat(cat${n}), .eqAll(eqAll${n}),`
+    + ` .andAll(andAll${n}), .fn(fn${n}), .amt(amt${n})`;
+  // W ごとの期待値。d は 8 ビット入力で、W=4 のインスタンスは下位 4 ビットだけ見る
+  const want = (W, d) => {
+    const a = W === 4 ? d & 15 : d;
+    return {
+      cat: (a << 4) & 0xFFFF,
+      eqAll: a === (1 << W) - 1 ? 1 : 0,
+      andAll: a === (1 << W) - 1 ? 1 : 0,
+      fn: (a << 4) & 0xFFFF,
+      amt: a >= 16 ? 0 : 0x8000 >> a,
+    };
+  };
+
+  // 狭いほうを先に書くと 2 個目が切り詰められる。広いほうを先に書くと
+  // ゼロ拡張がたまたま同じ答えを出すので、順番を入れ替えた両方を見る
+  for (const [first, second] of [[4, 8], [8, 4]]) {
+    const src = `${leaf}
+      module m(input [7:0] d,
+        output [15:0] cat${first}, output eqAll${first}, output andAll${first},
+        output [15:0] fn${first}, output [15:0] amt${first},
+        output [15:0] cat${second}, output eqAll${second}, output andAll${second},
+        output [15:0] fn${second}, output [15:0] amt${second});
+        leaf #(.W(${first}))  u0(${ports(first)});
+        leaf #(.W(${second})) u1(${ports(second)});
+      endmodule`;
+    const { all: ls } = await bothSims(src);
+    for (const d of [0x0F, 0x10, 0xFF]) {
+      for (const sim of ls) {
+        sim.setInput('d', d).eval();
+        for (const W of [first, second]) {
+          for (const [port, w] of Object.entries(want(W, d))) {
+            eq(sim.get(port + W), w,
+              `${sim.constructor.name} parameter: W=${first} を先に書いた ${port}${W} (d=${d})`);
+          }
+        }
+      }
+    }
+  }
+
+  // 階層が 2 段でも同じ (キャッシュを捨てるのは instantiate なので再帰的に効く)
+  const nested = `module leaf #(parameter W = 4) (input [7:0] d, output [15:0] y);
+    assign y = {d[W-1:0], 4'h0};
+  endmodule
+  module mid #(parameter W = 4) (input [7:0] d, output [15:0] y);
+    leaf #(.W(W)) u(d, y);
+  endmodule
+  module m(input [7:0] d, output [15:0] y4, output [15:0] y8);
+    mid #(.W(4)) m0(d, y4);
+    mid #(.W(8)) m1(d, y8);
+  endmodule`;
+  const { all: ns } = await bothSims(nested);
+  for (const sim of ns) {
+    sim.setInput('d', 0xAB).eval();
+    eq(sim.get('y4'), 0xB0, `${sim.constructor.name} parameter: 2 段の階層でも 1 個目は W=4`);
+    eq(sim.get('y8'), 0xAB0, `${sim.constructor.name} parameter: 2 段の階層でも 2 個目は W=8`);
+  }
 }
 
 // ------------------------------------------------------------ 非同期リセット
@@ -2692,7 +2814,11 @@ async function testIfCase() {
 endmodule`;
 
   const { compiled, wasm, ref } = await bothSims(src);
-  eqs(compiled.warnings.length, 0, 'if / case: 未駆動の警告なし', compiled.warnings.join(' / '));
+  // dup の 2 個目の 2'b01 は上が勝つので到達しない。警告はそれ 1 件だけ
+  eqs(compiled.warnings.length, 1, 'if / case: 到達しないラベルだけが警告になる',
+    compiled.warnings.join(' / '));
+  ok(/2'b01 は選ばれない/.test(compiled.warnings[0] ?? ''),
+    'if / case: 到達しないラベルを名指しする', compiled.warnings[0] ?? '');
 
   // 同じ意味を JS で素直に書いたもの
   const model = (st, sel, c, d, any) => ({
@@ -2903,6 +3029,188 @@ endmodule`);
     }
   }
   ok(!pbad, 'casez: priority8.v が全 256 通り正しい', pbad ?? '');
+
+  // --- casex ---
+  //
+  // 式の側が 2 値しかない以上、don't care はラベルにしか現れない。だから casex は
+  // casez とまったく同じ機構で落ち、**同じ don't care を書けば同じ回路になる**。
+  const zx = (kind, dc) => `module m(input clk, input [3:0] a, output reg [3:0] y);
+  always @(posedge clk)
+    ${kind} (a)
+      4'b1${dc}${dc}${dc}: y <= 4'h1;
+      4'b01${dc}${dc}: y <= 4'h2;
+      4'b001${dc}: y <= 4'h3;
+      default: y <= 4'h0;
+    endcase
+endmodule`;
+  const zSrc = zx('casez', '?');
+  const xSrc = zx('casex', 'x');
+  const zc = compile(zSrc, { wat: false });
+  const xc = compile(xSrc, { wat: false });
+  eqs(xc.stats.gates, zc.stats.gates,
+    'casex: 同じ表を casez で書いたのとゲート数が一致', `casex=${xc.stats.gates} casez=${zc.stats.gates}`);
+
+  const { all: xs } = await bothSims(xSrc);
+  let xbad = null;
+  for (const sim of xs) {
+    sim.reset();
+    for (let a = 0; a < 16; a++) {
+      sim.setInput('a', a).step();
+      const want = a & 8 ? 1 : a & 4 ? 2 : a & 2 ? 3 : 0;
+      if (Number(sim.get('y')) !== want && !xbad) {
+        xbad = `${sim.constructor.name} a=${a}: 期待 ${want} / 実際 ${sim.get('y')}`;
+      }
+    }
+  }
+  ok(!xbad, 'casex: 優先順位エンコーダが全 16 通り正しい', xbad ?? '');
+
+  // casex は x / z / ? を混ぜて書ける (どれも「比較しない桁」)
+  const mixedZX = await bothSims(`module m(input clk, input [3:0] a, output reg [3:0] y);
+  always @(posedge clk)
+    casex (a)
+      4'b1x?z: y <= 4'hA;
+      4'hx:    y <= 4'hB;      // 16 進の x は 4 ビットぶん = 常に一致
+    endcase
+endmodule`);
+  let zxbad = null;
+  for (const sim of mixedZX.all) {
+    sim.reset();
+    for (let a = 0; a < 16; a++) {
+      sim.setInput('a', a).step();
+      const want = a & 8 ? 0xA : 0xB;
+      if (Number(sim.get('y')) !== want && !zxbad) {
+        zxbad = `${sim.constructor.name} a=${a}: 期待 ${want} / 実際 ${sim.get('y')}`;
+      }
+    }
+  }
+  ok(!zxbad, 'casex: x / z / ? を混ぜても全 16 通り正しい', zxbad ?? '');
+}
+
+// --------------------------------------------- 到達しない case のラベル
+//
+// 回路は変えずに warnings に足すだけ。**見逃しはあっても誤検出はしない**のが
+// 作りの前提なので、「出ること」と同じくらい「出ないこと」を並べて確かめる。
+async function testCaseReach() {
+  const warn = (src) => compile(src, { wat: false }).warnings;
+  const seq = (body) => `module m(input clk, input [1:0] s, input [3:0] w, output reg [3:0] y);
+  always @(posedge clk)
+${body}
+endmodule`;
+
+  const dup = warn(seq(`    case (s)
+      2'b00: y <= 4'h1;
+      2'b01: y <= 4'h2;
+      2'b00: y <= 4'h3;
+      default: y <= 4'h0;
+    endcase`));
+  eqs(dup.length, 1, '到達しないラベル: 重複ラベルを 1 件だけ警告', dup.join(' / '));
+  ok(/2'b00 は選ばれない/.test(dup[0]) && /先に一致する/.test(dup[0]),
+    '到達しないラベル: ラベルと先に一致する側を名指しする', dup[0]);
+
+  // casez / casex では字面が違っても飲み込まれる
+  const swallowed = warn(`module m(input clk, input [3:0] a, output reg [3:0] y);
+  always @(posedge clk)
+    casez (a)
+      4'b1???: y <= 4'h1;
+      4'b1010: y <= 4'h2;
+      default: y <= 4'h0;
+    endcase
+endmodule`);
+  eqs(swallowed.length, 1, '到達しないラベル: casez の don\'t care に飲み込まれるラベル',
+    swallowed.join(' / '));
+  ok(/4'b1010 は選ばれない/.test(swallowed[0]), '到達しないラベル: 飲み込まれた側を名指しする',
+    swallowed[0]);
+
+  // 逆順なら飲み込まれない (狭いほうが先なら両方生きる)
+  eqs(warn(`module m(input clk, input [3:0] a, output reg [3:0] y);
+  always @(posedge clk)
+    casez (a)
+      4'b1010: y <= 4'h2;
+      4'b1???: y <= 4'h1;
+      default: y <= 4'h0;
+    endcase
+endmodule`).length, 0, '到達しないラベル: 狭いラベルが先なら警告しない');
+
+  // default が全網羅で潰されている
+  const dflt = warn(seq(`    case (s)
+      2'b00: y <= 4'h1;
+      2'b01: y <= 4'h2;
+      2'b10: y <= 4'h3;
+      2'b11: y <= 4'h4;
+      default: y <= 4'h0;
+    endcase`));
+  eqs(dflt.length, 1, '到達しない default: 全網羅なら警告', dflt.join(' / '));
+  ok(/default は選ばれない/.test(dflt[0]), '到達しない default: default を名指しする', dflt[0]);
+
+  // 1 通りでも空いていれば default は生きる
+  eqs(warn(seq(`    case (s)
+      2'b00: y <= 4'h1;
+      2'b01: y <= 4'h2;
+      2'b10: y <= 4'h3;
+      default: y <= 4'h0;
+    endcase`)).length, 0, '到達しない default: 1 通り空いていれば警告しない');
+
+  // don't care での全網羅も数えられる
+  ok(warn(`module m(input clk, input [1:0] s, output reg [3:0] y);
+  always @(posedge clk)
+    casez (s)
+      2'b0?: y <= 4'h1;
+      2'b1?: y <= 4'h2;
+      default: y <= 4'h0;
+    endcase
+endmodule`).some((w) => /default は選ばれない/.test(w)),
+    '到達しない default: don\'t care で埋め尽くしても数えられる');
+
+  // parameter で書いたラベルも定数に落として比べる
+  ok(warn(`module m(input clk, input [3:0] a, output reg [3:0] y);
+  localparam A = 5, B = 5;
+  always @(posedge clk)
+    case (a) A: y <= 4'h1; B: y <= 4'h2; default: y <= 4'h0; endcase
+endmodule`).some((w) => /は選ばれない/.test(w)), '到達しないラベル: parameter のラベルも見る');
+
+  // --- 誤検出しないこと ---
+  // 信号を含むラベルは落とせないので、飲み込む側からも飲み込まれる側からも外す
+  eqs(warn(`module m(input clk, input [3:0] a, input [3:0] k, output reg [3:0] y);
+  always @(posedge clk)
+    case (a) k: y <= 4'h1; 4'h5: y <= 4'h2; default: y <= 4'h0; endcase
+endmodule`).length, 0, '到達しないラベル: 信号を含むラベルでは誤検出しない');
+
+  // 幅が違うだけで値の違うラベル、複数ラベルの項目、default 無し
+  eqs(warn(seq(`    case (s)
+      2'b00, 2'b11: y <= 4'h5;
+      2'b01: y <= 4'h6;
+    endcase`)).length, 0, '到達しないラベル: 複数ラベル・default 無しでは警告しない');
+
+  // 幅が広くて数え上げない case は default を潰さない (見逃す側に倒す)
+  eqs(warn(`module m(input clk, input [15:0] a, output reg [3:0] y);
+  always @(posedge clk)
+    casez (a) 16'b????????????????: y <= 4'h1; default: y <= 4'h0; endcase
+endmodule`).length, 0, '到達しない default: 幅が大きいときは数え上げずに黙る');
+
+  // --- 同じ case を何度通っても警告は 1 件 ---
+  // for は展開のたびに case を通るし、同じ module を 2 回インスタンス化しても通る
+  eqs(warn(`module m(input clk, input [3:0] d, output reg [3:0] q); integer i;
+  always @(posedge clk)
+    for (i = 0; i < 4; i = i + 1)
+      case (d[i]) 1'b0: q[i] <= 1'b1; 1'b0: q[i] <= 1'b0; default: q[i] <= 1'b0; endcase
+endmodule`).length, 1, '到達しないラベル: for で 4 回展開しても警告は 1 件');
+
+  eqs(warn(`module leaf(input clk, input [1:0] s, output reg [3:0] y);
+  always @(posedge clk) case (s) 2'b00: y <= 1; 2'b00: y <= 2; default: y <= 0; endcase
+endmodule
+module m(input clk, input [1:0] s, output [3:0] a, output [3:0] b);
+  leaf u0(clk, s, a);
+  leaf u1(clk, s, b);
+endmodule`).length, 1, '到達しないラベル: 2 インスタンスでも警告は 1 件');
+
+  // examples とエディタのサンプルでは 1 件も出ない
+  const noisy = [];
+  for (const name of ['alu4.v', 'seqdet.v', 'priority8.v', 'alu_comb.v', 'shifter.v']) {
+    for (const w of compile(example(name), { wat: false }).warnings) {
+      if (/選ばれない/.test(w)) noisy.push(`${name}: ${w}`);
+    }
+  }
+  eqs(noisy.length, 0, '到達しないラベル: examples では 1 件も出ない', noisy.join(' / '));
 }
 
 // --------------------------------------------------------------- function
@@ -3527,10 +3835,21 @@ async function testErrors() {
       `module m(input clk, input d, output reg q);
        initial q = d; always @(posedge clk) q <= d; endmodule`,
       /initial の右辺は定数でなければならない/],
-    ['initial の中の if',
-      `module m(input clk, output reg q);
-       initial if (1) q = 1'b1; always @(posedge clk) q <= ~q; endmodule`,
-      /initial の中に書けるのは定数の代入だけ/],
+    // initial の if / case は定数で選ぶ。信号は読めないし、展開が要る for は断る
+    ['initial の中の if が信号を読んでいる',
+      `module m(input clk, input a, output reg q);
+       initial if (a) q = 1'b1; always @(posedge clk) q <= ~q; endmodule`,
+      /initial の if の条件は定数でなければならない/],
+    ['initial の中の case が信号を読んでいる',
+      `module m(input clk, input [1:0] s, output reg q);
+       initial case (s) 0: q = 1'b1; default: q = 1'b0; endcase
+       always @(posedge clk) q <= ~q; endmodule`,
+      /initial の case の選択式は定数でなければならない/],
+    ['initial の中の for',
+      `module m(input clk, output reg q); integer i;
+       initial for (i = 0; i < 2; i = i + 1) q = 1'b1;
+       always @(posedge clk) q <= ~q; endmodule`,
+      /initial の中に書けるのは定数の代入と、定数で選ぶ if \/ case だけ/],
     ['initial でノンブロッキング代入',
       `module m(input clk, output reg q);
        initial q <= 1'b1; always @(posedge clk) q <= ~q; endmodule`,
@@ -3563,6 +3882,10 @@ async function testErrors() {
       /generate の中の function は未対応/],
     ['generate の中の casez',
       `module m(output y); generate casez (1'b1) 1'b1: assign y=1'b0; endcase endgenerate endmodule`,
+      /generate の中では case だけ使える/],
+    // generate / endgenerate は省けるので、module の直下でも同じ断りにする
+    ['generate を省いた casex も同じ断り',
+      `module m(output y); casex (1'b1) 1'b1: assign y=1'b0; endcase endmodule`,
       /generate の中では case だけ使える/],
     ['endgenerate の書き忘れ',
       `module m(output y); generate assign y = 1'b0; endmodule`,
@@ -3777,28 +4100,35 @@ async function testErrors() {
        task t(input p, output q); q = ~p; endtask
        always @(posedge clk) t(a, y); endmodule`,
       /'task' は未対応/],
-    ['casex は未対応',
-      `module m(input clk, input [1:0] s, output reg q);
-       always @(posedge clk) casex (s) 2'b0?: q <= 1'b1; endcase endmodule`,
-      /casex は未対応/],
-    // z / ? は casez のラベルでだけ意味がある。他の場所で黙って 0 にすると
-    // 回路が静かに変わるので断る
+    // x / z / ? は casez / casex のラベルでだけ意味がある。他の場所で黙って 0 に
+    // すると回路が静かに変わるので断る。どの文字だったかで理由が変わる
     ['z を式の中に書いたら断る',
       `module m(output [3:0] y); assign y = 4'b1?01; endmodule`,
-      /casez のラベルでしか使えない/],
-    ['casez でない case のラベルの z は断る',
+      /z \/ \? は casez \/ casex のラベルでしか使えない/],
+    ['casez でも casex でもない case のラベルの z は断る',
       `module m(input clk, input [3:0] a, output reg y);
        always @(posedge clk) case (a) 4'b1???: y <= 1'b1; default: y <= 1'b0; endcase endmodule`,
-      /casez のラベルでしか使えない/],
+      /z \/ \? は casez \/ casex のラベルでしか使えない/],
     ['parameter の z も断る',
       `module m #(parameter W = 4'bz1) (output y); assign y = 1'b0; endmodule`,
-      /casez のラベルでしか使えない/],
-    ['x は値として断る',
+      /z \/ \? は casez \/ casex のラベルでしか使えない/],
+    ['x を式の中に書いたら断る',
       `module m(output [3:0] y); assign y = 4'bx1; endmodule`,
-      /x は未対応/],
+      /x は casex のラベルでしか使えない/],
+    ['casez のラベルの x は断る (決して選ばれない枝になる)',
+      `module m(input clk, input [3:0] a, output reg y);
+       always @(posedge clk) casez (a) 4'b1xxx: y <= 1'b1; default: y <= 1'b0; endcase endmodule`,
+      /casez のラベルに x は書けない/],
+    ['素の case のラベルの x も断る',
+      `module m(input clk, input [3:0] a, output reg y);
+       always @(posedge clk) case (a) 4'b1xxx: y <= 1'b1; default: y <= 1'b0; endcase endmodule`,
+      /x は casex のラベルでしか使えない/],
     ["10 進の z は断る",
       `module m(output [3:0] y); assign y = 4'dz; endmodule`,
-      /10 進のリテラルでは z \/ \? は使えない/],
+      /10 進のリテラルでは x \/ z \/ \? は使えない/],
+    ["10 進の x も断る",
+      `module m(output [3:0] y); assign y = 4'dx; endmodule`,
+      /10 進のリテラルでは x \/ z \/ \? は使えない/],
     ['endcase 忘れ',
       `module m(input clk, input [1:0] s, output reg q);
        always @(posedge clk) case (s) 2'b00: q <= 1'b1; endmodule`,
@@ -3822,6 +4152,8 @@ async function testErrors() {
       `module m(input clk, input a, output y); always @(posedge clk) if (a) y <= 1'b1; endmodule`,
       /reg 宣言が必要/],
   ];
+
+  errorKinds = cases.length;      // README の「N 種類のコンパイルエラー」の N
 
   for (const [label, src, pattern] of cases) {
     let caught = null;
@@ -4131,6 +4463,131 @@ async function testRandomDiff() {
   ok(missing.length === 0, 'ランダム差分: 生成器が全構文を出している',
     `出ていない構文: ${missing.join(', ')} / 内訳 ${JSON.stringify(seen)}`);
   ok(!mismatch, `ランダム差分テスト (${designs} 回路 × 12 ベクタ)`, mismatch ?? '');
+}
+
+// ------------------------------------------------- インスタンスの独立性
+//
+// ランダム差分テスト (WASM vs 参照実装) はここには効かない。両者は同じ
+// ネットリストを見ているので、elaborate が幅を間違えれば揃って間違う。
+//
+// そこで**コンパイルを 2 回して突き合わせる**。突き合わせるのは 1 個の性質だけ:
+//
+//   あるインスタンスの振る舞いは、隣に何を並べたかで変わってはいけない
+//
+// Verilog の意味論のモデルが要らないのが利点で、幅に限らず「インスタンスを
+// またいで状態が漏れる」たぐい (幅・符号のキャッシュ、スコープ、パラメータ、
+// function の表) をまとめて捕まえられる。
+//
+// 生成する子 module は、**パラメータで幅が変わる値を自己決定幅の位置に置く**。
+// 文脈幅が配られる位置は max(自己決定幅, 文脈幅) が食い違いを吸収してしまうので、
+// 連接のパート・比較のオペランド・リダクション・シフト量・function の戻り値、
+// といった「自己決定幅がそのまま結果の幅になる」場所を狙う。
+function randomLeaf(rng) {
+  const tags = new Set();
+  const pick = (arr) => arr[Math.floor(rng() * arr.length)];
+
+  // W 幅の値。ここがパラメータで幅の変わる部分
+  const wide = () => pick(['a', 'b', 'rf(a)', "{W{1'b1}}", '(a ^ b)', '(a + b)']);
+
+  // 自己決定幅の位置に W 幅の値を置く形
+  const selfDet = () => {
+    const w = wide();
+    const [text, tag] = pick([
+      [`{${w}, 4'h0}`, '連接'],
+      [`{2'b10, ${w}}`, '連接'],
+      [`(${w} == ${wide()})`, '比較'],
+      [`(${w} < ${wide()})`, '比較'],
+      [`(&${w})`, 'リダクション'],
+      [`(^${w})`, 'リダクション'],
+      [`(16'h8000 >> ${w})`, 'シフト量'],
+      [`(d << ${w})`, 'シフト量'],
+      [`{rf(${w}), 1'b0}`, 'function'],
+      [`{sa >>> 2, 1'b0}`, 'signed'],
+      [`(sa < 0)`, 'signed'],
+      [`{a[W-1:W-1], b[0:0]}`, '部分選択'],
+    ]);
+    tags.add(tag);
+    return text;
+  };
+
+  const expr = (depth) => (depth === 0 ? selfDet()
+    : `(${expr(depth - 1)} ${pick(['+', '-', '^', '&', '|', '*'])} ${expr(depth - 1)})`);
+
+  const source = `module rndleaf #(parameter W = 4) (input [7:0] d, output [15:0] y);
+  wire [W-1:0] a = d[W-1:0];
+  wire [W-1:0] b = d[7:8-W];
+  wire signed [W-1:0] sa = d[W-1:0];
+  function [W-1:0] rf(input [W-1:0] x); rf = x ^ {W{1'b1}}; endfunction
+  assign y = ${expr(2)};
+endmodule`;
+  return { source, tags: [...tags] };
+}
+
+async function testInstanceIndependence() {
+  const rng = makeRng(20260816);
+  const seen = {
+    連接: 0, 比較: 0, リダクション: 0, シフト量: 0, function: 0, signed: 0, 部分選択: 0,
+  };
+  let bad = null;
+  let designs = 0;
+
+  for (let d = 0; d < 20 && !bad; d++) {
+    const leaf = randomLeaf(rng);
+    for (const t of leaf.tags) seen[t]++;
+
+    const w1 = 1 + Math.floor(rng() * 8);
+    const w2 = w1 === 8 ? 1 + Math.floor(rng() * 7) : w1 + 1 + Math.floor(rng() * (8 - w1));
+    const alone = (w) => `${leaf.source}
+module m(input [7:0] d, output [15:0] y);
+  rndleaf #(.W(${w})) u(d, y);
+endmodule`;
+    // 順番の両方を見る。狭いほうを先に書くと 2 個目が切り詰められ、広いほうを
+    // 先に書くとゼロ拡張がたまたま同じ答えを出して正しく見えることがある
+    const pair = (wa, wb) => `${leaf.source}
+module m(input [7:0] d, output [15:0] y0, output [15:0] y1);
+  rndleaf #(.W(${wa})) u0(d, y0);
+  rndleaf #(.W(${wb})) u1(d, y1);
+endmodule`;
+
+    let sims;
+    try {
+      sims = {
+        a1: new RefSimulator(compile(alone(w1))),
+        a2: new RefSimulator(compile(alone(w2))),
+        p12: new RefSimulator(compile(pair(w1, w2))),
+        p21: new RefSimulator(compile(pair(w2, w1))),
+      };
+    } catch (e) {
+      failures.push(`インスタンスの独立性: コンパイル失敗 ${e.message}\n${leaf.source}`);
+      continue;
+    }
+    designs++;
+
+    for (let t = 0; t < 8 && !bad; t++) {
+      const v = Math.floor(rng() * 256);
+      for (const sim of Object.values(sims)) sim.setInput('d', v).eval();
+      // 「1 個だけ書いたとき」を正解として、並べたときの各インスタンスと比べる
+      const want = { [w1]: sims.a1.get('y'), [w2]: sims.a2.get('y') };
+      const got = [
+        [`W=${w1} を先に書いた 1 個目`, w1, sims.p12.get('y0')],
+        [`W=${w1} を先に書いた 2 個目`, w2, sims.p12.get('y1')],
+        [`W=${w2} を先に書いた 1 個目`, w2, sims.p21.get('y0')],
+        [`W=${w2} を先に書いた 2 個目`, w1, sims.p21.get('y1')],
+      ];
+      for (const [what, w, value] of got) {
+        if (value !== want[w] && !bad) {
+          bad = `${what} (W=${w}) が単体と違う: 単体=${want[w]} 並べたとき=${value}`
+            + ` (d=${v})\n${leaf.source}`;
+        }
+      }
+    }
+  }
+
+  ok(designs === 20, 'インスタンスの独立性: 20 回路すべてコンパイルできた', `designs=${designs}`);
+  const missing = Object.entries(seen).filter(([, n]) => n === 0).map(([k]) => k);
+  ok(missing.length === 0, 'インスタンスの独立性: 生成器が自己決定幅の全形を出している',
+    `出ていない形: ${missing.join(', ')} / 内訳 ${JSON.stringify(seen)}`);
+  ok(!bad, `インスタンスの独立性 (${designs} 回路 × 8 ベクタ × 幅 2 通り × 順番 2 通り)`, bad ?? '');
 }
 
 // ------------------------------------------------------------- WAT 出力
@@ -4838,7 +5295,52 @@ async function testConstants() {
   eq(hw.get(gateProbe.name), gateProbe.name === 'n3' ? 0 : 1, '回路グラフ: ゲート出力を読める');
 }
 
+// ------------------------------------------------------- README の件数の照合
+//
+// テストの件数は README に手書きしてある。放っておけば必ず古くなるので、
+// ランナー自身に読み合わせさせる。
+//
+// **ここで ok() を使わないのが要点。** 照合そのものを 1 件と数えると、README に
+// 書くべき数がその照合を含むかどうかで決まらなくなる (自己言及になる)。
+// テストではなく校正なので、件数の外で報告する。
+const README = join(HERE, '..', 'README.md');
+
+// 数は必ずマッチの先頭に置く (書き戻しがその前提で成り立っている)
+const README_NUMBERS = [
+  { what: 'テストの件数', re: /^(\d+) 件成功, 0 件失敗$/m, actual: () => passed },
+  { what: 'コンパイルエラーの種類', re: /(\d+) 種類のコンパイルエラー/, actual: () => errorKinds },
+];
+
+/** @param mode 'check' | 'update' | 'notice' */
+function checkReadme(mode) {
+  let text = readFileSync(README, 'utf8');
+  const stale = [];
+  for (const n of README_NUMBERS) {
+    const m = text.match(n.re);
+    if (!m) { stale.push(`${n.what}: README の中に見つからない (${n.re})`); continue; }
+    const want = String(n.actual());
+    if (m[1] === want) continue;
+    stale.push(`${n.what}: README は ${m[1]} だが実際は ${want}`);
+    text = text.replace(n.re, (hit, num) => want + hit.slice(num.length));
+  }
+
+  if (stale.length === 0) {
+    if (mode !== 'notice') console.log('README の件数は最新です');
+    return;
+  }
+  if (mode === 'update') {
+    writeFileSync(README, text);
+    console.log(`README を更新しました:\n${stale.map((s) => `  ${s}`).join('\n')}`);
+    return;
+  }
+  console.log(`\nREADME の件数が古い:\n${stale.map((s) => `  ${s}`).join('\n')}`);
+  console.log('  → node test/run.js --update-readme で書き換えられます');
+  if (mode === 'check') process.exitCode = 1;
+}
+
 // ---------------------------------------------------------------- 実行
+const args = new Set(process.argv.slice(2));
+
 const suites = [
   ['全加算器', testFullAdder],
   ['ゲートプリミティブ', testGates],
@@ -4863,7 +5365,8 @@ const suites = [
   ['シフト', testShift],
   ['シフト回路', testShifter],
   ['if / case', testIfCase],
-  ['casez', testCasez],
+  ['casez / casex', testCasez],
+  ['到達しない case のラベル', testCaseReach],
   ['function', testFunction],
   ['for', testForLoop],
   ['FSM (列検出)', testSeqDet],
@@ -4880,6 +5383,7 @@ const suites = [
   ['eval / commit の分離', testEvalCommit],
   ['エラー検出', testErrors],
   ['ランダム差分', testRandomDiff],
+  ['インスタンスの独立性', testInstanceIndependence],
   ['WAT 出力', testWat],
   ['GUI 回路グラフ', testSchematic],
   ['メモリと回路グラフ', testBlockMemory],
@@ -4907,4 +5411,9 @@ if (failures.length > 0) {
   for (const f of failures.slice(0, 25)) console.log(`  × ${f}`);
   if (failures.length > 25) console.log(`  … 他 ${failures.length - 25} 件`);
   process.exitCode = 1;
+}
+
+// 全部通ったときだけ照合する。落ちている最中の件数と README を比べても意味がない
+if (failures.length === 0) {
+  checkReadme(args.has('--update-readme') ? 'update' : args.has('--check-readme') ? 'check' : 'notice');
 }

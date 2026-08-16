@@ -150,10 +150,13 @@ export function parse(src) {
 
     if (t.type === 'num') {
       next();
-      // mask は casez のラベルで「比較しない桁」。それ以外の場所では elaborate が断る
+      // mask / xmask は casez / casex のラベルで「比較しない桁」。
+      // それ以外の場所に出てきたら elaborate が名指しで断る
       return {
-        type: 'num', width: t.width, bits: t.bits, mask: t.mask ?? 0n,
-        unsized: !!t.unsized, signed: !!t.signed, line: t.line,
+        type: 'num', width: t.width, bits: t.bits,
+        mask: t.mask ?? 0n, xmask: t.xmask ?? 0n,
+        // text は書いたとおりの字面。警告で「どのラベルか」を指すのに使う
+        text: t.value, unsized: !!t.unsized, signed: !!t.signed, line: t.line,
       };
     }
 
@@ -327,7 +330,7 @@ export function parse(src) {
   // 文は入れ子になるので、フラットな列ではなく木で返す:
   //   { type:'nb',   lhs, rhs }              … lhs <= rhs
   //   { type:'if',   cond, then:[], else }   … else は文の列か null
-  //   { type:'case', sel, items:[{labels,stmts}], default }
+  //   { type:'case', kind, sel, items:[{labels,stmts}], default }  … kind は case/casez/casex
 
   /**
    * function の宣言。戻り値は関数名そのものへの代入で決まる (Verilog の決まり)。
@@ -463,10 +466,7 @@ export function parse(src) {
     if (at('repeat')) return parseRepeat(ctx);
     // forever は終わりが定数に決まらないので展開できない
     if (at('forever')) throw err('forever は未対応 (繰り返しは回数が定数に決まるものだけ)');
-    if (at('case') || at('casez')) return parseCase(ctx);
-    // casex は x も don't care にする。x を値として持たないので z との差が出ず、
-    // 「x なら何でも一致」を装うことになるので断る (casez なら z / ? で足りる)
-    if (at('casex')) throw err('casex は未対応 (x を値として扱わない。casez を使う)');
+    if (at('case') || at('casez') || at('casex')) return parseCase(ctx);
     const line = peek().line;
     const lhs = parseLValue();
     // function と always @(*) はレジスタではなくその場で値が決まるので blocking 代入。
@@ -576,9 +576,10 @@ export function parse(src) {
   }
 
   function parseCase(ctx = null) {
-    // casez はラベルの z / ? をその桁だけ比較から外す。式の側は 2 値しか無いので
-    // 「ラベルの don't care」だけを見れば Verilog と同じ結果になる
-    const casez = at('casez');
+    // casez / casex はラベルの don't care をその桁だけ比較から外す (casez は z / ?、
+    // casex は x も)。式の側は 2 値しか無いので、「ラベルの don't care」だけを
+    // 見れば Verilog と同じ結果になる
+    const kind = peek().value;
     const line = next().line;
     expect('(');
     const sel = parseExpr();
@@ -605,7 +606,7 @@ export function parse(src) {
     }
     expect('endcase');
     if (items.length === 0 && !dflt) throw err('case の中身が空');
-    return { type: 'case', casez, sel, items, default: dflt, line };
+    return { type: 'case', kind, sel, items, default: dflt, line };
   }
 
   /** posedge x / negedge x。どちらがクロックでどちらがリセットかは elaborate が決める */
@@ -761,8 +762,10 @@ export function parse(src) {
         expect('endgenerate');
         // generate / endgenerate 自体はスコープを作らない (ラベル無し)
         items.push({ type: 'genblock', label: null, items: gitems, line: gline });
-      } else if (v === 'for' || v === 'if' || v === 'case') {
-        // generate / endgenerate は省ける。module の直下の for / if / case は generate 構文
+      } else if (v === 'for' || v === 'if' || v === 'case' || v === 'casez' || v === 'casex') {
+        // generate / endgenerate は省ける。module の直下の for / if / case は generate 構文。
+        // casez / casex もここへ回すのは、parseGenItem に「generate では case だけ」の
+        // 断り書きがあるため ― 素通りさせるとインスタンス化に見えて遠いエラーになる
         parseGenItem(items);
       } else {
         parseModuleItem(items, params);
