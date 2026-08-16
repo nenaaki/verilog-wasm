@@ -722,6 +722,30 @@ export function elaborate(mod, all = [mod], opts = {}) {
   }
 
   /**
+   * 「オペランドに 1 ビットでも x があれば、結果は全部 x」を被せる。
+   *
+   * **Verilog はここで演算子を 2 種類に分けている**（Icarus Verilog で実測した）:
+   *
+   *   ビットごとに伝わる … `& | ^ ~`、リダクション、連接、`==`、`?:`、シフトの値側
+   *   まとめて x になる  … `+ - * / %` と単項 `-`、`< <= > >=`、シフトの**量**
+   *
+   * 前者はゲートをそのまま流せばこの処理系の 4 値評価と一致する。後者だけが
+   * 「桁上げを追えば決まる桁も x にする」という Verilog 側の割り切りなので、
+   * こうして上から被せる。`4'b001x * 4'b0000` すら `xxxx` になるのがその例。
+   *
+   * `any` は必ず確実な 0 / 1 になる（`isx` の出力なので）ので、mux は濁らない。
+   */
+  function allXIfAny(bits, sources, extra = null) {
+    if (!xstate) return bits;
+    let any = extra;
+    for (const n of sources) {
+      const isx = newGate('isx', [n]);
+      any = any === null ? isx : newGate('or', [any, isx]);
+    }
+    return any === null ? bits : bits.map((n) => newGate('mux', [any, CONSTX, n]));
+  }
+
+  /**
    * cond が 1 なら 2 の補数で符号反転、0 ならそのまま。
    * ~x + 1 の「~」を xor(x, cond)、「+1」を桁上げ入力 cond にしたもの。
    * cond が定数 0 なら畳み込みが全部消すので、符号なしの経路に負担はかからない。
@@ -905,10 +929,16 @@ export function elaborate(mod, all = [mod], opts = {}) {
 
     // **Verilog の case は「そっくり同じか」で比べる** (== ではない)。
     // 2 値では x がどこにも無いので差分ビットの OR で済み、回路も従来のまま。
+    //
+    // 4 値では `casex` だけ別扱いになる。Verilog の定義は「**どちらのオペランド**の
+    // x も比較から外す」で、2 値なら式の側に x が来ないぶんラベルだけ見れば済んだが、
+    // 4 値では式の側にも来る。その桁は「何であっても一致」にする。
     if (xstate) {
       let acc = null;
       for (const i of cmp) {
-        const hit = bitMatch(sel[i], bits[i]);
+        const hit = kind === 'casex'
+          ? newGate('or', [newGate('isx', [sel[i]]), bitMatch(sel[i], bits[i])])
+          : bitMatch(sel[i], bits[i]);
         acc = acc === null ? hit : newGate('and', [acc, hit]);
       }
       return acc;
@@ -1082,6 +1112,20 @@ export function elaborate(mod, all = [mod], opts = {}) {
   }
 
   const reduceOr = (bits) => reduce(bits, 'or');
+
+  /**
+   * **手続き的な `if` の条件。** Verilog は「0 でも x でも z でも else 側へ行く」と
+   * 決めているので、**確実に 1 のときだけ真**にする。
+   *
+   * 三項演算子 `?:` とはここが違う ―― あちらは条件が x なら両枝を突き合わせて
+   * 「同じ確実な値なら決まる」になる。同じ「条件」でも扱いが別なのが Verilog の
+   * 決まりで、Icarus Verilog との差分テストで実際にここがずれていた。
+   */
+  function condBit(e) {
+    const r = reduceOr(evalExpr(e));
+    if (!xstate) return r;
+    return newGate('and', [r, newGate('not', [newGate('isx', [r])])]);
+  }
 
   // 前置に書いたときのリダクション。~& / ~| は `~` と割れても
   // 「1 ビットの結果を反転」になるので、ここでは扱わなくてよい。
@@ -1303,9 +1347,9 @@ export function elaborate(mod, all = [mod], opts = {}) {
         const a = evalExpr(e.a, w, sg);    // ~ と単項 - は文脈依存 (符号も降ろす)
         if (e.op === '~') return a.map((n) => newGate('not', [n]));
         if (e.op === '-') {
-          // 2 の補数で符号反転
+          // 2 の補数で符号反転。算術なので x はまとめて広がる
           const inv = a.map((n) => newGate('not', [n]));
-          return addBits(inv, Array(w).fill(CONST0), CONST1);
+          return allXIfAny(addBits(inv, Array(w).fill(CONST0), CONST1), a);
         }
         throw new CompileError(`未対応の単項演算子 '${e.op}'`, e.line);
       }
@@ -1331,7 +1375,9 @@ export function elaborate(mod, all = [mod], opts = {}) {
           // == / != はビット列が同じかどうかなので、符号の分岐は要らない。
           // === / !== は x どうしも一致とみなすので別の作り方になる
           const isCase = e.op === '===' || e.op === '!==';
-          const bits = CMP[e.op] ? compareBits(l, r, e.op, cs)
+          // 大小比較だけは「1 ビットでも x なら x」。== は確実に違う桁があれば
+          // 0 に決まる (どちらも Icarus Verilog で実測した挙動)
+          const bits = CMP[e.op] ? allXIfAny(compareBits(l, r, e.op, cs), [...l, ...r])
             : isCase ? caseEqBits(l, r, e.op) : equalBits(l, r, e.op);
           return resize(bits, w);
         }
@@ -1344,22 +1390,31 @@ export function elaborate(mod, all = [mod], opts = {}) {
           // 算術右シフトで空いた上位に詰めるのは符号ビット。signed でなければ
           // >>> は >> と同じ (Verilog の規則そのもの)
           const fill = kind === 'arith' && sg ? a[a.length - 1] : CONST0;
-          // リテラルなら並べ替えだけ、信号ならバレルシフタ
-          return e.b.type === 'num'
-            ? shiftFixed(a, Number(e.b.bits), dir, fill)
-            : barrelShift(a, evalExpr(e.b), dir, fill);
+          // **シフト量に x があると結果は全部 x**。値の側の x はビットごとに
+          // ずれていくだけ (どちらも実測した挙動)
+          if (e.b.type === 'num') {
+            if (xstate && e.b.xmask) return Array(w).fill(CONSTX);
+            return shiftFixed(a, Number(e.b.bits), dir, fill);
+          }
+          const amt = evalExpr(e.b);
+          return allXIfAny(barrelShift(a, amt, dir, fill), amt);
         }
 
         // --- 残り (ビット演算・算術) は両辺とも文脈依存 ---
         const a = evalExpr(e.a, w, sg);
         const b = evalExpr(e.b, w, sg);
         // + - * と & | ^ は 2 の補数なら符号で結果が変わらない (下位 w ビットが同じ)。
-        // 符号を見るのは割り算だけ
-        if (e.op === '+' || e.op === '-') return addSub(a, b, e.op);
-        if (e.op === '*') return mulBits(a, b);
+        // 符号を見るのは割り算だけ。算術は x がまとめて広がる
+        const both = () => [...a, ...b];
+        if (e.op === '+' || e.op === '-') return allXIfAny(addSub(a, b, e.op), both());
+        if (e.op === '*') return allXIfAny(mulBits(a, b), both());
         if (e.op === '/' || e.op === '%') {
           const r = sg ? divRemSigned(a, b) : divRem(a, b);
-          return e.op === '/' ? r.quot : r.rem;
+          const out = e.op === '/' ? r.quot : r.rem;
+          if (!xstate) return out;
+          // **0 で割ったときも x**。2 値では「回路が出す値」を仕様にしていたが、
+          // 4 値なら Verilog と同じものを返せる (b に x があれば上の判定で先に立つ)
+          return allXIfAny(out, both(), newGate('not', [reduceOr(b)]));
         }
         // 中置の ~^ / ^~ はビットごとの XNOR
         if (e.op === '~^' || e.op === '^~') {
@@ -1687,7 +1742,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
       }
 
       if (st.type === 'if') {
-        const cond = reduceOr(evalExpr(st.cond));
+        const cond = condBit(st.cond);
         const thenB = runFuncStmts(st.then, new Map(cur));
         syncEnv(cur);                   // else 側は if に入る前の値から始める
         const elseB = st.else ? runFuncStmts(st.else, new Map(cur)) : new Map(cur);
@@ -1763,7 +1818,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
       }
 
       if (st.type === 'if') {
-        const cond = reduceOr(evalExpr(st.cond));
+        const cond = condBit(st.cond);
         const thenState = runStmts(st.then, new Map(cur));
         const elseState = st.else ? runStmts(st.else, new Map(cur)) : new Map(cur);
         cur = mergeStates(cond, thenState, elseState, cur);
@@ -1858,7 +1913,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
     return {
       clkName: clkEdge.name,
       clkEdge: clkEdge.kind,
-      rstCond: reduceOr(evalExpr(st.cond)),
+      rstCond: condBit(st.cond),
       rstStmts: st.then,
       body: st.else ?? [],          // else が無ければ「リセット以外では保持」
     };

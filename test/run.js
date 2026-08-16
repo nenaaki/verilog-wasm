@@ -4769,6 +4769,62 @@ async function testXState() {
       `${kind} 4 値: 比較する桁が x なら一致しない`);
   }
 
+  // ---- どの演算子が「ビットごと」でどれが「まとめて x」か ----
+  //
+  // **Verilog はここを演算子ごとに決めている。** 読んだだけでは取り違えるので、
+  // 本物のシミュレータ (Icarus Verilog) で実測した挙動をここに書き写してある。
+  // 網としては test/verilog-diff.js が本体で、こちらは代表値を固定するもの。
+  const rules = `module m(input [3:0] a, input [3:0] b, input [1:0] s,
+    output [3:0] add, output [3:0] mul, output [3:0] band, output [3:0] bxor,
+    output lt, output eq, output redand, output lnot,
+    output [3:0] shv, output [3:0] shk, output [3:0] tern,
+    output [3:0] divz, output reg [3:0] iff);
+    assign add    = a + b;      // 算術は 1 ビットでも x なら全部 x
+    assign mul    = a * b;
+    assign band   = a & b;      // ビット演算はビットごと
+    assign bxor   = a ^ b;
+    assign lt     = a < b;      // 大小比較は 1 ビットでも x なら x
+    assign eq     = a == b;     // 等価は確実に違う桁があれば 0
+    assign redand = &a;         // リダクションはビットごとの畳み込み
+    assign lnot   = !a;
+    assign shv    = a << s;     // シフト量に x があれば全部 x
+    assign shk    = a << 1;     // 値の x はビットごとにずれる
+    assign tern   = a[0] ? a : b;   // ?: は両枝が同じ確実な値なら決まる
+    assign divz   = a / b;      // 0 除算は x
+    always @(*) begin iff = 4'h0; if (a[0]) iff = 4'hF; end   // if の x は偽
+  endmodule`;
+  const crules = compile(rules, { wat: false, xstate: true });
+  for (const sim of [await WasmSimulator.create(crules), new RefSimulator(crules)]) {
+    const kind = sim.constructor.name;
+    const at = (a, b, s = '00') => { sim.setInput('a', a).setInput('b', b).setInput('s', s).eval(); return sim; };
+
+    at('001x', '0001');
+    eqs(sim.getBits('add'), 'xxxx', `${kind} 忠実度: 算術は 1 ビットでも x なら全部 x`);
+    eqs(sim.getBits('band'), '000x', `${kind} 忠実度: ビット演算はビットごと`);
+    eqs(sim.getBits('bxor'), '001x', `${kind} 忠実度: XOR もビットごと`);
+    eqs(sim.getBits('lt'), 'x', `${kind} 忠実度: 大小比較は x が混ざれば x`);
+    eqs(sim.getBits('eq'), '0', `${kind} 忠実度: 等価は確実に違う桁があれば 0`);
+    eqs(sim.getBits('redand'), '0', `${kind} 忠実度: リダクションは 0 があれば 0`);
+    eqs(sim.getBits('lnot'), '0', `${kind} 忠実度: ! は 1 のビットがあれば 0`);
+    eqs(sim.getBits('shk'), '01x0', `${kind} 忠実度: 値の x はビットごとにずれる`);
+    eqs(sim.getBits('tern'), '00xx', `${kind} 忠実度: ?: は両枝が同じなら決まる`);
+    eqs(sim.getBits('iff'), '0000', `${kind} 忠実度: if の条件が x なら else 側`);
+
+    // 確実に違う桁があっても、大小比較は x のまま (等価との違い)
+    at('1x01', '0101');
+    eqs(sim.getBits('eq'), '0', `${kind} 忠実度: == は確実な不一致で 0`);
+    eqs(sim.getBits('lt'), 'x', `${kind} 忠実度: < は確実に決まっても x`);
+
+    // 0 が確実に決めても、算術は x のまま (ビット演算との違い)
+    at('001x', '0000');
+    eqs(sim.getBits('band'), '0000', `${kind} 忠実度: 0 & x = 0`);
+    eqs(sim.getBits('mul'), 'xxxx', `${kind} 忠実度: 0 を掛けても算術は x`);
+    eqs(sim.getBits('divz'), 'xxxx', `${kind} 忠実度: 0 除算は x`);
+
+    at('0011', '0001', '0x');
+    eqs(sim.getBits('shv'), 'xxxx', `${kind} 忠実度: シフト量に x があれば全部 x`);
+  }
+
   // ---- 2. WASM と参照実装が食い違っていないか ----
   const rng = makeRng(20260817);
   let mismatch = null;
