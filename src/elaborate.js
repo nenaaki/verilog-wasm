@@ -1822,11 +1822,15 @@ export function elaborate(mod, all = [mod], opts = {}) {
   function splitReset(item) {
     const { edges } = item;
 
+    // **エッジの向きは「全部が同じかどうか」しか見ない。**
+    // step() がクロックエッジそのもので連続時間を持たないので、negedge だけの設計は
+    // posedge だけの設計と観測上まったく区別が付かない (位相は step() を打つ側が決める)。
+    // 区別が要るのは posedge と negedge を混ぜた 2 相の設計で、そちらは runItem が断る。
     if (edges.length === 1) {
-      if (edges[0].kind !== 'posedge') {
-        throw new CompileError('negedge は未対応 (posedge のみ)', item.line);
-      }
-      return { clkName: edges[0].name, rstCond: null, rstStmts: null, body: item.stmts };
+      return {
+        clkName: edges[0].name, clkEdge: edges[0].kind,
+        rstCond: null, rstStmts: null, body: item.stmts,
+      };
     }
 
     const st = item.stmts.length === 1 ? item.stmts[0] : null;
@@ -1846,10 +1850,6 @@ export function elaborate(mod, all = [mod], opts = {}) {
     }
     const rstEdge = hits[0];
     const clkEdge = edges.find((e) => e !== rstEdge);
-    if (clkEdge.kind !== 'posedge') {
-      throw new CompileError(
-        `クロック '${clkEdge.name}' は posedge でなければならない (negedge は未対応)`, item.line);
-    }
     const rstSig = lookup(rstEdge.name, item.line);
     if (rstSig.width !== 1) {
       throw new CompileError(`非同期リセット '${rstEdge.name}' は 1 ビットでなければならない`, item.line);
@@ -1857,6 +1857,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
 
     return {
       clkName: clkEdge.name,
+      clkEdge: clkEdge.kind,
       rstCond: reduceOr(evalExpr(st.cond)),
       rstStmts: st.then,
       body: st.else ?? [],          // else が無ければ「リセット以外では保持」
@@ -2123,6 +2124,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
   // ---- 項目の処理 ----------------------------------------------------------
   let clock = null;        // クロックのルートネット (buf をたどった先)
   let clockName = null;    // エラー表示用の名前
+  let clockEdge = null;    // 'posedge' / 'negedge'。混ぜられるかどうかだけに使う
 
   function itemPass(mod, prefix, isTop, depth, stack) {
     for (const item of mod.items) runItem(item, mod, prefix, isTop, depth, stack);
@@ -2279,7 +2281,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
     }
 
     if (item.type === 'always') {
-      const { clkName, rstCond, rstStmts, body } = splitReset(item);
+      const { clkName, clkEdge, rstCond, rstStmts, body } = splitReset(item);
 
       const clk = lookup(clkName, item.line);
       if (clk.width !== 1) throw new CompileError(`クロック '${clkName}' は 1 ビットでなければならない`, item.line);
@@ -2289,8 +2291,17 @@ export function elaborate(mod, all = [mod], opts = {}) {
       if (clock !== null && clock !== clkRoot) {
         throw new CompileError(`複数クロックは未対応 ('${clockName}' と '${clk.name}')`, item.line);
       }
+      // **向きは混ぜられない。** negedge だけの設計は posedge だけの設計と
+      // 区別が付かないので通るが、混ぜると 1 クロックの中に 2 つのエッジが要る
+      // (2 相) ので、step() = エッジ 1 個というモデルからはみ出す。
+      if (clockEdge !== null && clockEdge !== clkEdge) {
+        throw new CompileError(
+          `同じクロック '${clk.name}' に posedge と negedge を混ぜた 2 相の設計は未対応`
+          + ' (step() がクロックエッジそのものなので、全部を同じ向きで書けば通る)', item.line);
+      }
       clock = clkRoot;
       clockName = clk.name;
+      clockEdge = clkEdge;
       clk.isClock = true;
 
       // 文を上から順に辿り、レジスタの各ビットについて「次の値」を組み立てる。

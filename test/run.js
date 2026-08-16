@@ -1623,6 +1623,35 @@ endmodule`;
     eq(sim.get('q'), 0, `${kind} 同期リセット: クロックで 0 になる`);
   }
 
+  // ---- negedge ----
+  //
+  // **step() がクロックエッジそのもの**で連続時間を持たないので、全部が negedge の
+  // 設計は全部が posedge の設計と観測上まったく区別が付かない (位相は step() を
+  // 打つ側が決める)。だから同じ回路になることを、値とゲート数の両方で押さえる。
+  const negBody = (edge) => `module m(input clk, input rst_n, input [3:0] d,
+    output reg [3:0] q, output reg [3:0] r);
+    always @(${edge} clk) q <= q + d;
+    always @(${edge} clk or negedge rst_n) if (!rst_n) r <= 4'hF; else r <= d;
+  endmodule`;
+  const posC = compile(negBody('posedge'), { wat: false });
+  const negC = compile(negBody('negedge'), { wat: false });
+  eqs(negC.stats.gates, posC.stats.gates, 'negedge: posedge と同じゲート数になる',
+    `negedge=${negC.stats.gates} posedge=${posC.stats.gates}`);
+  eqs(negC.stats.wasmBytes, posC.stats.wasmBytes, 'negedge: WASM のバイト数まで同じ');
+
+  const { all: negSims } = await bothSims(negBody('negedge'));
+  for (const sim of negSims) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('rst_n', 1).setInput('d', 3).step();
+    eq(sim.get('q'), 3, `${kind} negedge: クロックで進む`);
+    eq(sim.get('r'), 3, `${kind} negedge: 非同期リセット付きでも動く`);
+    sim.step();
+    eq(sim.get('q'), 6, `${kind} negedge: もう 1 クロック`);
+    // 非同期リセットは negedge クロックでもクロックを待たない
+    sim.setInput('rst_n', 0).eval();
+    eq(sim.get('r'), 0xF, `${kind} negedge: eval() だけでリセットが効く`);
+  }
+
   // 64 レーンで別々にリセットをかける
   const { wasm: lw } = await bothSims(dffr);
   lw.reset();
@@ -3718,9 +3747,12 @@ async function testErrors() {
     ['範囲外のビット選択',
       `module m(input [3:0] a, output y); assign y = a[7]; endmodule`,
       /宣言範囲/],
-    ['単独の negedge は未対応',
-      `module m(input clk, a, output reg q); always @(negedge clk) q <= a; endmodule`,
-      /negedge/],
+    // negedge そのものは通る。断るのは向きを混ぜた 2 相だけ
+    ['posedge と negedge を混ぜられない',
+      `module m(input clk, a, b, output reg q, output reg r);
+       always @(posedge clk) q <= a;
+       always @(negedge clk) r <= b; endmodule`,
+      /posedge と negedge を混ぜた 2 相の設計は未対応/],
     ['非同期リセットの本体が if でない',
       `module m(input clk, rst, d, output reg q);
        always @(posedge clk or posedge rst) q <= d; endmodule`,
@@ -3729,10 +3761,11 @@ async function testErrors() {
       `module m(input clk, rst, c, d, output reg q);
        always @(posedge clk or posedge rst) if (c) q <= 1'b0; else q <= d; endmodule`,
       /どちらを見ているか決まらない/],
-    ['クロックが negedge',
-      `module m(input clk, rst, d, output reg q);
-       always @(negedge clk or posedge rst) if (rst) q <= 1'b0; else q <= d; endmodule`,
-      /posedge でなければならない/],
+    ['非同期リセット側でも向きは混ぜられない',
+      `module m(input clk, rst, d, e, output reg q, output reg r);
+       always @(negedge clk or posedge rst) if (rst) q <= 1'b0; else q <= d;
+       always @(posedge clk) r <= e; endmodule`,
+      /posedge と negedge を混ぜた 2 相の設計は未対応/],
     ['イベントが 3 つ',
       `module m(input clk, a, b, d, output reg q);
        always @(posedge clk or posedge a or posedge b) if (a) q <= 1'b0; else q <= d; endmodule`,
@@ -4185,11 +4218,20 @@ function makeRng(seed) {
   };
 }
 
-function randomDesign(rng, nWires) {
+/**
+ * @param opts.xstate 4 値のときだけ出せるもの (x を混ぜたリテラル) を許すか。
+ *   **`===` はこれが要点**で、`isx` は codegen と fourstate.js に実装が 2 つある。
+ *   手で書いたテストだけでなく、ここの網でも掛かるようにしておく。
+ */
+function randomDesign(rng, nWires, opts = {}) {
   const pick = (arr) => arr[Math.floor(rng() * arr.length)];
   const pool = ['a', 'b', 'c'];
   const lines = [];
   let inSub = false;         // 子モジュールの本体を組み立てている間だけ true
+
+  /** x を混ぜた 8 ビットのリテラル (4 値のときだけ) */
+  const xLit = () => `8'b${[...Array(8)]
+    .map(() => (rng() < 0.35 ? 'x' : String(Math.floor(rng() * 2)))).join('')}`;
 
   const expr = (depth) => {
     const r = rng();
@@ -4204,6 +4246,8 @@ function randomDesign(rng, nWires) {
       }
       if (k < 0.45) return `8'h${Math.floor(rng() * 256).toString(16)}`;
       if (k < 0.5) return `1'b${Math.floor(rng() * 2)}`;
+      // x を値として書いたリテラル (4 値のときだけ)
+      if (opts.xstate && k < 0.56) return xLit();
       return s;
     }
     if (r < 0.37) return `(~${expr(depth - 1)})`;
@@ -4229,12 +4273,15 @@ function randomDesign(rng, nWires) {
     if (r < 0.85) return `(${expr(depth - 1)} - ${expr(depth - 1)})`;
     if (r < 0.87) return `(-${expr(depth - 1)})`;
     if (r < 0.9) {
-      const cmp = ['==', '!=', '<', '<=', '>', '>='][Math.floor(rng() * 6)];
+      // === / !== も混ぜる。2 値では == / != と同じ答えになるが、4 値では
+      // isx を通る別の回路になる (実装が 2 つある部品なのでここに乗せたい)
+      const cmp = ['==', '!=', '<', '<=', '>', '>=', '===', '!=='][Math.floor(rng() * 8)];
       return `(${expr(depth - 1)} ${cmp} ${expr(depth - 1)})`;
     }
     if (r < 0.94) {
-      // リテラル量 (並べ替え) と信号量 (バレルシフタ) の両方を出す
-      const op = rng() < 0.5 ? '<<' : '>>';
+      // リテラル量 (並べ替え) と信号量 (バレルシフタ) の両方を出す。
+      // 算術シフトも混ぜる (signed が絡まなければ >> と同じ答えになるはず)
+      const op = pick(['<<', '>>', '<<<', '>>>']);
       const amt = rng() < 0.5 ? String(Math.floor(rng() * 10)) : expr(0);
       return `(${expr(depth - 1)} ${op} ${amt})`;
     }
@@ -4298,6 +4345,11 @@ function randomDesign(rng, nWires) {
   lines.push('  assign rout5 = rc;');
   pool.push('rc');
 
+  // signed の wire を 1 本プールに入れる。これが式に混ざると符号拡張・符号付きの
+  // 比較・除算・算術右シフトの経路に入る (混ざらない式は符号なしのまま)
+  lines.push(`  wire signed [7:0] ws = ${expr(2)};`);
+  pool.push('ws');
+
   for (let i = 0; i < nWires; i++) {
     // 半分は宣言と同時に代入する (assign に分けたのと同じ回路になるはず)
     if (rng() < 0.5) lines.push(`  wire [7:0] w${i} = ${expr(3)};`);
@@ -4330,12 +4382,15 @@ function randomDesign(rng, nWires) {
       const els = rng() < 0.5 ? ` else begin ${stmt(depth - 1)} end` : '';
       return `if (${expr(2)}) ${then}${els}`;
     }
-    // 半分は casez にして、ラベルの一部を don't care にする。式の側は 2 値なので
-    // 「その桁を比較しない」だけの違いになり、両実装で同じ結果になるはず
+    // 半分は casez / casex にして、ラベルの一部を don't care にする。
+    // casex は x も比較から外すので、同じ表を別の書き方で出せる
     if (rng() < 0.5) {
-      const arms = [`2'b0?: begin ${stmt(depth - 1)} end`, `2'b1?: begin ${stmt(depth - 1)} end`];
+      const kind = rng() < 0.5 ? 'casez' : 'casex';
+      const dc = kind === 'casez' ? '?' : 'x';
+      const arms = [`2'b0${dc}: begin ${stmt(depth - 1)} end`,
+        `2'b1${dc}: begin ${stmt(depth - 1)} end`];
       if (rng() < 0.5) arms.push(`default: begin ${stmt(depth - 1)} end`);
-      return `casez (${expr(1)}) ${arms.join(' ')} endcase`;
+      return `${kind} (${expr(1)}) ${arms.join(' ')} endcase`;
     }
     const arms = [`2'd0: begin ${stmt(depth - 1)} end`, `2'd1: begin ${stmt(depth - 1)} end`];
     if (rng() < 0.7) arms.push(`default: begin ${stmt(depth - 1)} end`);
@@ -4405,7 +4460,7 @@ async function testRandomDiff() {
   const seen = {
     'if': 0, 'case': 0, 'casez': 0, 'function': 0, '+ / -': 0, '* / %': 0, 'generate': 0,
     'always @(*)': 0, '{n{x}}': 0, 'wire t = 式': 0, 'repeat': 0, 'while': 0,
-    '比較': 0, 'シフト': 0, '論理': 0,
+    '比較': 0, 'シフト': 0, '論理': 0, '=== / !==': 0, 'casex': 0, '算術シフト': 0, 'signed': 0,
     '非同期リセット': 0, '階層': 0, 'parameter': 0, 'リダクション': 0,
   };
 
@@ -4425,6 +4480,10 @@ async function testRandomDiff() {
     if (src.includes('while (li')) seen['while']++;
     if (/(==|!=|<=|>=|< |> )/.test(src)) seen['比較']++;
     if (/(<<|>>)/.test(src)) seen['シフト']++;
+    if (/(===|!==)/.test(src)) seen['=== / !==']++;
+    if (/\bcasex \(/.test(src)) seen['casex']++;
+    if (/(<<<|>>>)/.test(src)) seen['算術シフト']++;
+    if (/wire signed/.test(src)) seen['signed']++;
     if (/(&&|\|\||\(!)/.test(src)) seen['論理']++;
     if (/or posedge rst/.test(src)) seen['非同期リセット']++;
     if (/rndsub s0\(/.test(src)) seen['階層']++;
@@ -4715,7 +4774,7 @@ async function testXState() {
   let mismatch = null;
   let designs = 0;
   for (let d = 0; d < 12 && !mismatch; d++) {
-    const rsrc = randomDesign(rng, 6);
+    const rsrc = randomDesign(rng, 6, { xstate: true });
     let c;
     try { c = compile(rsrc, { wat: false, xstate: true }); } catch (e) {
       failures.push(`4 値: コンパイル失敗 ${e.message}\n${rsrc}`);
