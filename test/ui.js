@@ -24,8 +24,10 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-// 共有リンクを作るためだけに使う (ブラウザに渡す回路をこちらで組み立てる)
-import { encodeCircuit, expandCircuit } from '../src/schematic.js';
+// 共有リンクと .json をこちらで組み立てて、ブラウザに渡す
+import { encodeCircuit, expandCircuit, packCircuit } from '../src/schematic.js';
+import { SAMPLE_CIRCUITS } from '../src/samples.js';
+import { circuitJson, libraryJson } from '../web/library.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.PORT ?? 8123);
@@ -389,6 +391,27 @@ const HELPERS = `
   window.__selected = () => document.getElementById('presets').value;
   window.__cname = () => document.getElementById('cname').value;
   window.__setName = (v) => { document.getElementById('cname').value = v; };
+  // ファイル選択の代わり。**本物の File を作って change を投げる**ので、
+  // 「ファイルを選んだ」ところから先はブラウザで動くのと同じ経路を通る
+  window.__dropJson = (name, text) => {
+    const input = document.getElementById('jsonFile');
+    const dt = new DataTransfer();
+    dt.items.add(new File([text], name, { type: 'application/json' }));
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change'));
+  };
+  // 書き出しの中身を捕まえる。ダウンロードそのものは headless では確かめられないので、
+  // Blob を作るところで横取りする (1 回だけ差し替えて元に戻す)
+  window.__grabbed = null;
+  window.__grabSave = () => {
+    const orig = URL.createObjectURL;
+    window.__grabbed = null;
+    URL.createObjectURL = (blob) => {
+      URL.createObjectURL = orig;
+      blob.text().then((t) => { window.__grabbed = t; });
+      return 'blob:grabbed';
+    };
+  };
   window.__saved = () => Object.keys(JSON.parse(localStorage.getItem('verilog-wasm/saved') ?? '{}')).join(',');
   window.__work = () => localStorage.getItem('verilog-wasm/work');
   window.__hash = () => location.hash;
@@ -969,6 +992,92 @@ ok(!(await js('__options()')).includes('u:'), '削除: リストからも消え�
 ok(await js('__nodeCount()') === savedNodes, '削除: 開いている回路はそのまま', String(await js('__nodeCount()')));
 await click(await js('__btn("delSave")'));
 ok((await js('__msg()')).includes('リストから保存した回路を選んで'), '削除: 対象が無ければ断る', await js('__msg()'));
+
+// ==================================================== .json と部品ライブラリ
+//
+// 書式と取り込みの判断そのものは web/library.js の単体テストで押さえてあるので、
+// ここで見るのは**ボタンからそこまでの配線**: ファイルを渡したら localStorage と
+// リストが実際に変わるか、書き出したものがそのまま読み戻せるか。
+const packed = (name) => packCircuit(expandCircuit(SAMPLE_CIRCUITS[name]));
+const andPack = packed('AND ゲート');
+const halfPack = packed('半加算器 (sum / carry)');
+const andNodes = expandCircuit(SAMPLE_CIRCUITS['AND ゲート']).nodes.length;
+
+ok(await js('__disabled("dlLib")'), 'ライブラリ: 保存が無いうちは書き出せない');
+
+// ---- 取り込み ----
+await js(`__dropJson("circuits.json", ${JSON.stringify(libraryJson({ libAnd: andPack, libHalf: halfPack }))})`);
+await sleep(600);
+ok((await js('__msg()')).includes('2 個追加'), 'ライブラリ: 取り込んだ数を伝える', await js('__msg()'));
+const savedAfter = await js('__saved()');
+ok(savedAfter.includes('libAnd') && savedAfter.includes('libHalf'),
+  'ライブラリ: localStorage に 2 個とも入る', savedAfter);
+const optsAfter = await js('__options()');
+ok(optsAfter.includes('u:libAnd') && optsAfter.includes('u:libHalf'),
+  'ライブラリ: リストに並ぶ', optsAfter);
+ok(!(await js('__disabled("dlLib")')), 'ライブラリ: 1 個入れば書き出せるようになる');
+ok(await js('__nodeCount()') > 0, 'ライブラリ: 開いている回路は差し替わらない',
+  String(await js('__nodeCount()')));
+
+// 取り込みは何度やっても増えない (同じ名前は上書き)
+await js(`__dropJson("circuits.json", ${JSON.stringify(libraryJson({ libAnd: andPack, libHalf: halfPack }))})`);
+await sleep(600);
+ok((await js('__msg()')).includes('2 個上書き'), 'ライブラリ: 2 回目は上書きになる', await js('__msg()'));
+ok((await js('__saved()')) === savedAfter, 'ライブラリ: 繰り返しても増えない', await js('__saved()'));
+
+// ---- 書き出し → 読み戻し ----
+await js('__grabSave()');
+await click(await js('__btn("dlLib")'));
+await sleep(500);
+const written = await js('__grabbed');
+ok(typeof written === 'string' && written.length > 0, 'ライブラリ: 書き出しの中身が取れる',
+  String(written).slice(0, 60));
+let writtenNames = '(読めない)';
+try { writtenNames = JSON.parse(written).circuits.map((c) => c.name).join(','); } catch { /* 下で落ちる */ }
+ok(writtenNames === 'libAnd,libHalf', 'ライブラリ: 保存した回路が全部入る (名前順)', writtenNames);
+ok((await js('__msg()')).includes('2 個の回路を書き出しました'),
+  'ライブラリ: 書き出した数を伝える', await js('__msg()'));
+
+// ---- 壊れた 1 個でライブラリ全体を落とさない ----
+const brokenLib = JSON.stringify({
+  circuits: [
+    { name: 'libOk', ...andPack },
+    { name: 'libNg', nodes: [[1, 'そんな部品はない', 0, 0, 0]], wires: [] },
+  ],
+});
+await js(`__dropJson("broken.json", ${JSON.stringify(brokenLib)})`);
+await sleep(600);
+ok((await js('__saved()')).includes('libOk'), 'ライブラリ: 通ったものは入る', await js('__saved()'));
+ok(!(await js('__saved()')).includes('libNg'), 'ライブラリ: 壊れたものは入らない', await js('__saved()'));
+ok((await js('__msg()')).includes('取り込めなかったもの'),
+  'ライブラリ: 落としたものを伝える', await js('__msg()'));
+
+// ---- 回路 1 個の .json は「取り込む」ではなく「開く」 ----
+await js(`__dropJson("one.json", ${JSON.stringify(`${circuitJson('ひとつだけ', andPack)}\n`)})`);
+await sleep(800);
+ok((await js('__msg()')).includes('読み込みました'), '.json: 回路 1 個は開く', await js('__msg()'));
+ok(await js('__cname()') === 'ひとつだけ', '.json: 名前欄に入る', await js('__cname()'));
+ok(await js('__nodeCount()') === andNodes, '.json: 中身が開く', String(await js('__nodeCount()')));
+ok(!(await js('__saved()')).includes('ひとつだけ'),
+  '.json: 回路 1 個は保存した回路に足さない', await js('__saved()'));
+
+// 開いている回路の書き出しも、同じ経路で読み戻せる
+await js('__grabSave()');
+await click(await js('__btn("dlJson")'));
+await sleep(500);
+let oneName = '(読めない)';
+try { oneName = JSON.parse(await js('__grabbed')).name; } catch { /* 下で落ちる */ }
+ok(oneName === 'ひとつだけ', '.json: 開いている回路を書き出せる', oneName);
+
+// 壊れたファイルは理由を出す
+await js('__dropJson("bad.json", "{ これは JSON ではない }")');
+await sleep(500);
+ok((await js('__msg()')).includes('読み込めませんでした'),
+  '.json: 壊れていれば断る', await js('__msg()'));
+
+// 後片付け。この先のテストは「保存した回路が無い」前提で始まる
+await js('localStorage.removeItem("verilog-wasm/saved")');
+await reopen();
 
 // ==================================================== 選択
 await js('__preset("半加算器")');
