@@ -9,7 +9,8 @@ import { evalGate } from './fourstate.js';
 
 export class RefSimulator extends SignalAccess {
   constructor(compiled) {
-    super(compiled.layout.signalTable, !!compiled.layout.xstate, compiled.layout.clocks ?? []);
+    super(compiled.layout.signalTable, !!compiled.layout.xstate, compiled.layout.clocks ?? [],
+      !!compiled.layout.zstate);
     this.netlist = compiled.netlist;
     this.order = compiled.order;
     this.layout = compiled.layout;
@@ -17,17 +18,22 @@ export class RefSimulator extends SignalAccess {
     this.values = new Array(this.netlist.nets.length).fill(0n);
     // 4 値のときの「不定の面」。2 値では触らない (src/fourstate.js の符号化)
     this.unknown = new Array(this.netlist.nets.length).fill(0n);
+    // 高インピーダンスの面。トライステートを含む回路だけが使う
+    this.hiz = new Array(this.netlist.nets.length).fill(0n);
     // レジスタごとの次状態 (WASM 側の専用 next スロットに対応)
     this.next = new Array(this.netlist.regs.length).fill(0n);
     this.nextX = new Array(this.netlist.regs.length).fill(0n);
+    this.nextZ = new Array(this.netlist.regs.length).fill(0n);
 
     // オフセット → ネット ID の逆引き (SignalAccess はオフセットで話すため)。
-    // 4 値では 8 バイト後ろが不定の面なので、そちらも同じ表に載せる
+    // 4 値では 8 バイト後ろが不定の面、その 8 バイト後ろが z の面
     this.netOfOffset = new Map();
     this.xOfOffset = new Map();
+    this.zOfOffset = new Map();
     for (const [netId, off] of this.layout.slots) {
       this.netOfOffset.set(off, netId);
       if (this.xstate) this.xOfOffset.set(off + 8, netId);
+      if (this.zstate) this.zOfOffset.set(off + 16, netId);
     }
 
     // WASM 側はデータセグメントで初期状態が入るので、こちらも同じ所から始める
@@ -35,13 +41,15 @@ export class RefSimulator extends SignalAccess {
   }
 
   readWord(offset) {
+    if (this.zOfOffset.has(offset)) return this.hiz[this.zOfOffset.get(offset)] & MASK64;
     if (this.xOfOffset.has(offset)) return this.unknown[this.xOfOffset.get(offset)] & MASK64;
     return this.values[this.netOfOffset.get(offset)] & MASK64;
   }
 
   writeWord(offset, value) {
     const v = BigInt(value) & MASK64;
-    if (this.xOfOffset.has(offset)) this.unknown[this.xOfOffset.get(offset)] = v;
+    if (this.zOfOffset.has(offset)) this.hiz[this.zOfOffset.get(offset)] = v;
+    else if (this.xOfOffset.has(offset)) this.unknown[this.xOfOffset.get(offset)] = v;
     else this.values[this.netOfOffset.get(offset)] = v;
   }
 
@@ -49,8 +57,10 @@ export class RefSimulator extends SignalAccess {
   reset() {
     this.values.fill(0n);
     this.unknown.fill(0n);
+    this.hiz.fill(0n);
     this.next.fill(0n);
     this.nextX.fill(0n);
+    this.nextZ.fill(0n);
     for (const [off, v] of this.layout.initWords) this.writeWord(off, v);
     return this;
   }
@@ -68,18 +78,26 @@ export class RefSimulator extends SignalAccess {
     const { gates, regs } = this.netlist;
     const v = this.values;
     const u = this.unknown;
-    const planeOf = (n) => ({ v: v[n], u: u[n] });
+    const z = this.hiz;
+    const planeOf = (n) => ({ v: v[n], u: u[n], z: z[n] });
 
     for (const gi of this.order) {
       const g = gates[gi];
       const r = evalGate(g.op, g.in.map(planeOf), g.value);
       v[g.out] = r.v & MASK64;
       u[g.out] = r.u & MASK64;
+      z[g.out] = r.z & MASK64;
     }
 
-    regs.forEach((rg, i) => { this.next[i] = v[rg.d]; this.nextX[i] = u[rg.d]; });
+    regs.forEach((rg, i) => {
+      this.next[i] = v[rg.d];
+      this.nextX[i] = u[rg.d];
+      this.nextZ[i] = z[rg.d];
+    });
     for (const rg of regs) {
-      if (rg.qAsync != null && rg.qAsync !== rg.q) { v[rg.q] = v[rg.qAsync]; u[rg.q] = u[rg.qAsync]; }
+      if (rg.qAsync != null && rg.qAsync !== rg.q) {
+        v[rg.q] = v[rg.qAsync]; u[rg.q] = u[rg.qAsync]; z[rg.q] = z[rg.qAsync];
+      }
     }
     return this;
   }
@@ -130,6 +148,7 @@ export class RefSimulator extends SignalAccess {
       if (rg.domain !== d) return;
       this.values[rg.q] = this.next[i];
       if (this.xstate) this.unknown[rg.q] = this.nextX[i];
+      if (this.zstate) this.hiz[rg.q] = this.nextZ[i];
     });
     return this;
   }

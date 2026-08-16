@@ -65,8 +65,10 @@ export function emitWasm(netlist, order, layout) {
   // nets.length ずらした番号**に置く。メモリ側は値の面の 8 バイト後ろ
   // (どちらも src/fourstate.js の符号化に合わせてある)。
   const xstate = !!layout.xstate;
+  const zstate = !!layout.zstate;
   const XL = nets.length;          // 不定の面の local 番号のずらし幅
-  const localCount = xstate ? nets.length * 2 : nets.length;
+  const ZL = nets.length * 2;      // z の面
+  const localCount = nets.length * (zstate ? 3 : xstate ? 2 : 1);
 
   // ---- eval 本体 ----
   const code = [];
@@ -75,6 +77,8 @@ export function emitWasm(netlist, order, layout) {
   const set = (netId) => emit(OP.local_set, ...uleb(netId));
   const getU = (netId) => emit(OP.local_get, ...uleb(XL + netId));
   const setU = (netId) => emit(OP.local_set, ...uleb(XL + netId));
+  const getZ = (netId) => emit(OP.local_get, ...uleb(ZL + netId));
+  const setZ = (netId) => emit(OP.local_set, ...uleb(ZL + netId));
   const allOnes = () => emit(OP.i64_const, ...sleb64(-1n));
   const zero = () => emit(OP.i64_const, ...sleb64(0n));
   const inv = () => { allOnes(); emit(OP.i64_xor); };          // 直前の値を反転
@@ -87,6 +91,10 @@ export function emitWasm(netlist, order, layout) {
     emit(OP.i32_const, ...sleb(0));
     emit(OP.i64_load, ...uleb(ALIGN_8), ...uleb(offset + 8));
     setU(netId);
+    if (!zstate) return;
+    emit(OP.i32_const, ...sleb(0));
+    emit(OP.i64_load, ...uleb(ALIGN_8), ...uleb(offset + 16));
+    setZ(netId);
   };
 
   // --- 1. 状態の読み込み ---
@@ -150,23 +158,34 @@ export function emitWasm(netlist, order, layout) {
   function emitGate4(g) {
     const out = g.out;
     if (g.op === 'const') {
+      if (g.value === 'z') { allOnes(); setU(out); zero(); set(out); allOnes(); setZ(out); return; }
       if (g.value === 'x') { allOnes(); setU(out); zero(); set(out); return; }
       zero(); setU(out);
       if (g.value) allOnes(); else zero();
       set(out);
       return;
     }
-    if (g.op === 'buf' || g.op === 'not') {
+    // **接続 (buf) だけが z をそのまま通す。** not / zx は z を x に落とすので、
+    // z の面を書かずに 0 のままにしておけばよい (local は 0 で始まる)
+    if (g.op === 'buf' || g.op === 'not' || g.op === 'zx') {
       const a = g.in[0];
       getU(a); setU(out);
       get(a); if (g.op === 'not') inv(); set(out);
+      if (zstate && g.op === 'buf') { getZ(a); setZ(out); }
       return;
     }
-    if (g.op === 'isx') {
-      // 「x か」を確実な 0 / 1 として取り出す。不定の面を値の面へ移すだけ
+    if (g.op === 'isx' || g.op === 'isz') {
+      // 「不定か / z か」を確実な 0 / 1 として取り出す。その面を値の面へ移すだけ
       const a = g.in[0];
       zero(); setU(out);
-      getU(a); set(out);
+      if (g.op === 'isx') getU(a); else getZ(a);
+      set(out);
+      return;
+    }
+    if (g.op === 'wire') {
+      let acc = g.in[0];
+      for (let k = 1; k < g.in.length; k++) { emitWire4(acc, g.in[k], out); acc = out; }
+      if (g.in.length === 1) { getU(acc); setU(out); get(acc); set(out); getZ(acc); setZ(out); }
       return;
     }
     if (g.op === 'mux') {
@@ -189,6 +208,17 @@ export function emitWasm(netlist, order, layout) {
       get(s); inv(); get(b); emit(OP.i64_and);
       emit(OP.i64_or);
       set(out);
+      if (!zstate) return;
+      // z = (~s.u & ((s.v & a.z) | (~s.v & b.z))) | (s.u & a.z & b.z)
+      // out は新しいネットなので s / a / b を潰さない。順番の制約もここには無い
+      getU(s); inv();
+      get(s); getZ(a); emit(OP.i64_and);
+      get(s); inv(); getZ(b); emit(OP.i64_and);
+      emit(OP.i64_or);
+      emit(OP.i64_and);
+      getU(s); getZ(a); emit(OP.i64_and); getZ(b); emit(OP.i64_and);
+      emit(OP.i64_or);
+      setZ(out);
       return;
     }
     // and / or / xor は 2 入力ずつ畳む。出力の local を累算器にする
@@ -219,6 +249,35 @@ export function emitWasm(netlist, order, layout) {
     get(a); get(b); emit(BINOP[op]); set(out);
   }
 
+  /**
+   * 多重ドライブの解決 1 段 (src/fourstate.js の wire2)。and / or と同じく
+   * 出力の local を累算器に使うので、**書く順番が決まっている**:
+   * u は a.v と a.z を読み、v は a.v と a.z を読み、z は a.z を読む。
+   * u → v → z の順なら、次に要る面が潰れる前に読み終わっている。
+   */
+  function emitWire4(a, b, out) {
+    const drivingA = () => { getZ(a); inv(); };
+    const drivingB = () => { getZ(b); inv(); };
+    // u = (a.u & ~a.z) | (b.u & ~b.z) | (~a.z & ~b.z & (a.v ^ b.v)) | (a.z & b.z)
+    getU(a); drivingA(); emit(OP.i64_and);
+    getU(b); drivingB(); emit(OP.i64_and);
+    emit(OP.i64_or);
+    drivingA(); drivingB(); emit(OP.i64_and);
+    get(a); get(b); emit(OP.i64_xor); emit(OP.i64_and);
+    emit(OP.i64_or);
+    getZ(a); getZ(b); emit(OP.i64_and);
+    emit(OP.i64_or);
+    setU(out);
+    // v = (a.v & ~a.z) | (b.v & ~b.z)
+    get(a); drivingA(); emit(OP.i64_and);
+    get(b); drivingB(); emit(OP.i64_and);
+    emit(OP.i64_or);
+    set(out);
+    // z = a.z & b.z
+    getZ(a); getZ(b); emit(OP.i64_and);
+    setZ(out);
+  }
+
   // --- 3. 書き出し (出力ポート + レジスタ次状態) ---
   const storeFromLocal = (offset, valueNet) => {
     emit(OP.i32_const, ...sleb(0));
@@ -228,6 +287,10 @@ export function emitWasm(netlist, order, layout) {
     emit(OP.i32_const, ...sleb(0));
     getU(valueNet);
     emit(OP.i64_store, ...uleb(ALIGN_8), ...uleb(offset + 8));
+    if (!zstate) return;
+    emit(OP.i32_const, ...sleb(0));
+    getZ(valueNet);
+    emit(OP.i64_store, ...uleb(ALIGN_8), ...uleb(offset + 16));
   };
   for (const n of layout.outputNets) storeFromLocal(slots.get(n), n);
   regs.forEach((r, i) => storeFromLocal(regNext[i], r.d));
@@ -265,6 +328,7 @@ export function emitWasm(netlist, order, layout) {
     for (const [r, i] of mine) {
       copyWord(regNext[i], slots.get(r.q));
       if (xstate) copyWord(regNext[i] + 8, slots.get(r.q) + 8);
+      if (zstate) copyWord(regNext[i] + 16, slots.get(r.q) + 16);
     }
     commitCode.push(OP.end);
   }

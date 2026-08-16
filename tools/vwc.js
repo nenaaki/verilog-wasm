@@ -57,8 +57,8 @@ try {
     const sim = await WasmSimulator.create(compiled);
     for (const pair of values('--set')) {
       const [name, v] = pair.split('=');
-      // x を混ぜたビット文字列はそのまま渡す (SignalAccess が振り分ける)
-      sim.setInput(name, /[xX]/.test(v) ? v : BigInt(v));
+      // x / z を混ぜたビット文字列はそのまま渡す (SignalAccess が振り分ける)
+      sim.setInput(name, /[xXzZ]/.test(v) ? v : BigInt(v));
     }
 
     sim.eval(); // 初期入力に対する組合せ出力を確定させる

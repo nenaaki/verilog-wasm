@@ -24,27 +24,61 @@
 // 上のコメントを参照。
 
 import { CompileError } from './errors.js';
-import { GATE_PRIMITIVES } from './parser.js';
+import { GATE_PRIMITIVES, TRISTATE_GATES } from './parser.js';
 
 const MAX_DEPTH = 16;   // インスタンスの入れ子の上限
 
-// z / ? と x は「その桁を比較しない」印としてだけ扱う。値としての x / z は
-// 持たないので、ラベル以外の場所に出てきたら断る (黙って 0 にすると回路が静かに
-// 変わる)。どちらを比較から外すかは case の種類で違う:
+/**
+ * この設計はトライステートを使うか。**展開を始める前に AST を見て決める。**
+ *
+ * 途中で気づく形にすると順番の問題が出る ―― `a & 1'b1` を `a` に畳んだ後で
+ * a が z を運ぶと分かっても畳み直せない (`z & 1` は x で、z ではない)。
+ * 宣言的に先に決めておけば、畳み込みの規則を最初から正しく選べる。
+ *
+ * 見るのは 3 つだけ:
+ *   - 値として書かれた z / ? (**case のラベルは除く** ― そこでは「比較しない桁」)
+ *   - inout ポート
+ *   - bufif / notif
+ */
+function usesTristate(mods) {
+  let found = false;
+  const walk = (n) => {
+    if (found || n === null || typeof n !== 'object') return;
+    if (Array.isArray(n)) { n.forEach(walk); return; }
+    if (n.type === 'num') { if (n.mask) found = true; return; }
+    if (n.type === 'gate' && TRISTATE_GATES.has(n.gate)) { found = true; return; }
+    if (n.type === 'decl' && n.dir === 'inout') { found = true; return; }
+    if (n.type === 'case' || n.type === 'gencase') {
+      // ラベルの z / ? は don't care なので数えない。式と本体だけを見る
+      walk(n.sel);
+      for (const it of n.items) walk(it.stmts ?? it.body);
+      walk(n.default);
+      return;
+    }
+    for (const k of Object.keys(n)) walk(n[k]);
+  };
+  mods.forEach(walk);
+  return found;
+}
+
+// 2 値では z / ? と x は「その桁を比較しない」印としてだけ扱う。値としての
+// x / z を持たないので、ラベル以外の場所に出てきたら断る (黙って 0 にすると
+// 回路が静かに変わる)。どちらを比較から外すかは case の種類で違う:
 //   casez … z / ?
 //   casex … z / ? と x
 const DONT_CARE_MSG = {
-  z: 'z / ? は casez / casex のラベルでしか使えない (値としての z は扱わない)',
+  z: 'z / ? を値として書けるのは 4 値 (xstate) のときだけ。'
+    + '2 値では casez / casex のラベルの「比較しない桁」にしかならない',
   x: 'x は casex のラベルでしか使えない (値としての x は扱わない)',
 };
 
 /**
  * 比較しない桁が「そこに書けない場所」に出ていないか。x を先に見て理由を分ける。
- * 4 値なら x は値として書けるので、断るのは z だけになる。
+ * 4 値なら x も z も値として書けるので、この検査は 2 値のときだけ働く。
  */
 function checkNoDontCare(e, xstate = false) {
   if (e.xmask && !xstate) throw new CompileError(DONT_CARE_MSG.x, e.line);
-  if (e.mask) throw new CompileError(DONT_CARE_MSG.z, e.line);
+  if (e.mask && !xstate) throw new CompileError(DONT_CARE_MSG.z, e.line);
 }
 
 /**
@@ -54,6 +88,8 @@ function checkNoDontCare(e, xstate = false) {
 export function elaborate(mod, all = [mod], opts = {}) {
   // 4 値 (0 / 1 / x) で評価するか。既定は 2 値のまま (README「x を値として扱う」参照)
   const xstate = !!opts.xstate;
+  // トライステート (z の面) を持つか。**AST から先に決める** (usesTristate 参照)
+  const zstate = xstate && usesTristate(all);
   const modules = new Map(all.map((m) => [m.name, m]));
   const instanceNames = new Set();
   const nets = [];
@@ -61,6 +97,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
   const regs = [];
   const signals = new Map();
   const drivers = new Map(); // netId -> 駆動元の説明 (多重ドライブ検出用)
+  const wired = new Map();   // netId -> 接続のゲート (2 本目が来たら wire に化ける)
   const warnings = [];       // 回路は変えずに伝えたいこと (到達しない case のラベルなど)
 
   const newNet = (name) => {
@@ -83,11 +120,20 @@ export function elaborate(mod, all = [mod], opts = {}) {
     drivers.set(CONSTX, '定数');
   }
 
+  // 高インピーダンスの定数。トライステートを使う設計だけが持つ
+  const CONSTZ = zstate ? newNet('$constz') : null;
+  if (zstate) {
+    gates.push({ op: 'const', value: 'z', out: CONSTZ, in: [] });
+    drivers.set(CONSTZ, '定数');
+  }
+
+  const multiDriveError = (netId, prev, what, line) => new CompileError(
+    `${nets[netId].name} が多重にドライブされている (${prev} と ${what})`
+    + (zstate ? '' : '。バスにするなら、駆動しない側が z を出すように書く'), line);
+
   const setDriver = (netId, what, line) => {
     const prev = drivers.get(netId);
-    if (prev) {
-      throw new CompileError(`${nets[netId].name} が多重にドライブされている (${prev} と ${what})`, line);
-    }
+    if (prev) throw multiDriveError(netId, prev, what, line);
     drivers.set(netId, what);
   };
 
@@ -118,39 +164,72 @@ export function elaborate(mod, all = [mod], opts = {}) {
   // 定数を相手にする規則 (a & 0 = 0 など) は 4 値でもそのまま成り立つので残す。
   const foldsIdentity = !xstate;
 
+  // z が値として流れると「その線をそのまま返す」形の畳み込みが崩れる。
+  // Verilog は**式の中では z を x として扱う**ので `z & 1'b1` は z ではなく x、
+  // つまり `a & 1` を a に畳むと z がそのまま下流へ漏れてしまう。
+  // 崩れるのは「入力の 1 本をそのまま返す規則」だけで、定数を返す規則
+  // (a & 0 = 0、a | 1 = 1) や、not をかぶせる規則は z でも成り立つ。
+  const foldsPassThrough = !zstate;
+
   /** たためたら結果のネット ID、たためなければ null */
   function fold(op, ins) {
     if (op === 'isx') {
-      // 定数なら「x か」は展開時に決まる。`a === 4'bxx01` のようにリテラルと
+      // 定数なら「不定か」は展開時に決まる。`a === 4'bxx01` のようにリテラルと
       // 比べる形はこれで半分が消えるので、比較器がだいぶ小さくなる
       const [a] = ins;
       if (a === CONST0 || a === CONST1) return CONST0;
-      if (a === CONSTX) return CONST1;
+      if (a === CONSTX || a === CONSTZ) return CONST1;
+      return null;
+    }
+    if (op === 'isz') {
+      const [a] = ins;
+      if (a === CONSTZ) return CONST1;
+      if (a === CONST0 || a === CONST1 || a === CONSTX) return CONST0;
+      return null;
+    }
+    if (op === 'zx') {
+      // z を x に落とすだけ。z が来ようのないものは素通し
+      const [a] = ins;
+      if (a === CONSTZ) return CONSTX;
+      if (a === CONST0 || a === CONST1 || a === CONSTX) return a;
+      const g = gateOf.get(a);
+      // z を作らない演算の出力なら、もう落とすものが無い
+      if (g && g.op !== 'buf' && g.op !== 'mux' && g.op !== 'wire' && g.op !== 'const') return a;
+      return null;
+    }
+    if (op === 'wire') {
+      // 駆動していない (z の) ドライバは結果に効かない。全員 z なら結果も z
+      const live = ins.filter((n) => n !== CONSTZ);
+      if (live.length === 0) return CONSTZ;
+      if (live.length === 1) return live[0];
+      if (live.length !== ins.length) return newGate('wire', live);
       return null;
     }
     if (op === 'not') {
       const [a] = ins;
       if (a === CONST0) return CONST1;
       if (a === CONST1) return CONST0;
+      if (a === CONSTZ) return CONSTX;                 // ~z = x
       const g = gateOf.get(a);
-      if (g && g.op === 'not') return g.in[0];          // ~~x = x
+      // ~~z = x なので、z が流れる回路では二重否定を消せない
+      if (g && g.op === 'not' && foldsPassThrough) return g.in[0];   // ~~x = x
       return null;
     }
     if (op === 'and') {
       const [a, b] = ins;
       if (a === CONST0 || b === CONST0) return CONST0;
-      if (a === CONST1) return b;
-      if (b === CONST1) return a;
-      if (a === b) return a;                           // x & x = x (4 値でも成り立つ)
+      if (foldsPassThrough && a === CONST1) return b;
+      if (foldsPassThrough && b === CONST1) return a;
+      if (foldsPassThrough && a === b) return a;       // x & x = x (4 値でも成り立つ)
       // x & ~x = 0 は 4 値では成り立たない (x のときは x)
       return foldsIdentity && isInverseOf(a, b) ? CONST0 : null;
     }
     if (op === 'or') {
       const [a, b] = ins;
       if (a === CONST1 || b === CONST1) return CONST1;
-      if (a === CONST0) return b;
-      if (b === CONST0) return a;
-      if (a === b) return a;                           // x | x = x (4 値でも成り立つ)
+      if (foldsPassThrough && a === CONST0) return b;
+      if (foldsPassThrough && b === CONST0) return a;
+      if (foldsPassThrough && a === b) return a;       // x | x = x (4 値でも成り立つ)
       // x | ~x = 1 も 4 値では成り立たない
       return foldsIdentity && isInverseOf(a, b) ? CONST1 : null;
     }
@@ -158,18 +237,20 @@ export function elaborate(mod, all = [mod], opts = {}) {
       const [a, b] = ins;
       // x ^ x = 0 は 4 値では成り立たない (x のときは x)
       if (foldsIdentity && a === b) return CONST0;
-      if (a === CONST0) return b;
-      if (b === CONST0) return a;
-      if (a === CONST1) return newGate('not', [b]);    // 1 ^ x = ~x
+      if (foldsPassThrough && a === CONST0) return b;
+      if (foldsPassThrough && b === CONST0) return a;
+      if (a === CONST1) return newGate('not', [b]);    // 1 ^ x = ~x (not が z を落とす)
       if (b === CONST1) return newGate('not', [a]);
       return null;
     }
     if (op === 'mux') {
       const [s, a, b] = ins;
-      if (s === CONST1) return a;
+      if (s === CONST1) return a;                      // 選択が定数なら z もそのまま通る
       if (s === CONST0) return b;
       if (a === b) return a;
-      if (a === CONST1 && b === CONST0) return s;      // s ? 1 : 0 = s
+      // s ? 1 : 0 = s は s が z のとき崩れる (mux は x、s そのままなら z)。
+      // 逆向きの s ? 0 : 1 = ~s は not が z を落とすので成り立つ
+      if (foldsPassThrough && a === CONST1 && b === CONST0) return s;
       if (a === CONST0 && b === CONST1) return newGate('not', [s]);
       // 選ばれる側が選択信号そのもの / その反転なら、その枝の値は定数に決まる。
       // 割り算の剰余の上位ビットがちょうどこの形 (s ? ~s : 0) になり、
@@ -934,11 +1015,15 @@ export function elaborate(mod, all = [mod], opts = {}) {
     // x も比較から外す」で、2 値なら式の側に x が来ないぶんラベルだけ見れば済んだが、
     // 4 値では式の側にも来る。その桁は「何であっても一致」にする。
     if (xstate) {
+      // 式の側の「比較から外す桁」。casex は x も z も (isx が両方に立つ)、
+      // casez は z だけ。素の case は外さない
+      const skipOf = kind === 'casex' ? (n) => newGate('isx', [n])
+        : kind === 'casez' && zstate ? (n) => newGate('isz', [n])
+          : null;
       let acc = null;
       for (const i of cmp) {
-        const hit = kind === 'casex'
-          ? newGate('or', [newGate('isx', [sel[i]]), bitMatch(sel[i], bits[i])])
-          : bitMatch(sel[i], bits[i]);
+        const m = bitMatch(sel[i], bits[i]);
+        const hit = skipOf ? newGate('or', [skipOf(sel[i]), m]) : m;
         acc = acc === null ? hit : newGate('and', [acc, hit]);
       }
       return acc;
@@ -993,15 +1078,21 @@ export function elaborate(mod, all = [mod], opts = {}) {
   }
 
   /**
-   * 1 ビットぶんの「そっくり同じか」。x どうしも一致で、結果は必ず 0 か 1。
+   * 1 ビットぶんの「そっくり同じか」。x どうし・z どうしも一致で、結果は必ず 0 か 1。
    * 4 値のときだけ isx が要る (2 値では x が無いので XNOR そのもの)。
+   * トライステートがあるときは **x と z を見分ける**ので isz も要る
+   * (`1'bx === 1'bz` は 0)。
    */
   function bitMatch(a, b) {
     const same = newGate('not', [newGate('xor', [a, b])]);
     if (!xstate) return same;
     const xa = newGate('isx', [a]);
     const xb = newGate('isx', [b]);
-    const bothX = newGate('and', [xa, xb]);
+    let bothX = newGate('and', [xa, xb]);
+    if (zstate) {
+      const sameZ = newGate('not', [newGate('xor', [newGate('isz', [a]), newGate('isz', [b])])]);
+      bothX = newGate('and', [bothX, sameZ]);
+    }
     const neitherX = newGate('and', [newGate('not', [xa]), newGate('not', [xb])]);
     return newGate('or', [bothX, newGate('and', [neitherX, same])]);
   }
@@ -1312,14 +1403,17 @@ export function elaborate(mod, all = [mod], opts = {}) {
       case 'num': {
         checkNoDontCare(e, xstate);
         // 自分の幅より上は符号ビット (符号なしなら 0)。ここでマスクしないと
-        // 4'hFF が 255 のまま広がる。**最上位が x なら符号拡張も x になる**
+        // 4'hFF が 255 のまま広がる。**最上位が x / z なら符号拡張もそれになる**
         const topBit = BigInt(e.width - 1);
         const topX = ((e.xmask >> topBit) & 1n) === 1n;
+        const topZ = ((e.mask >> topBit) & 1n) === 1n;
         const top = (e.bits >> topBit) & 1n;
-        const fill = sg && topX ? CONSTX : sg && top === 1n ? CONST1 : CONST0;
+        const fill = sg && topZ ? CONSTZ : sg && topX ? CONSTX
+          : sg && top === 1n ? CONST1 : CONST0;
         const out = [];
         for (let b = 0; b < w; b++) {
           if (b >= e.width) { out.push(fill); continue; }
+          if ((e.mask >> BigInt(b)) & 1n) { out.push(CONSTZ); continue; }
           if ((e.xmask >> BigInt(b)) & 1n) { out.push(CONSTX); continue; }
           out.push(((e.bits >> BigInt(b)) & 1n) === 1n ? CONST1 : CONST0);
         }
@@ -1925,18 +2019,66 @@ export function elaborate(mod, all = [mod], opts = {}) {
   }
 
   /**
+   * 制御端子付きのゲート 1 ビットぶん。
+   *
+   * | 制御 | bufif1 / notif1 | bufif0 / notif0 |
+   * | --- | --- | --- |
+   * | 効いている | 入力 (notif なら反転) | 同左 |
+   * | 効いていない | z | z |
+   * | x / z | x | x |
+   *
+   * 入力側の z は x に落ちる (`zx`)。notif は not が同じことをするので要らない。
+   *
+   * **Verilog の L / H は x にまとめている。** 制御が x のとき本来は
+   * 「0 か z」「1 か z」という弱い不定になるが、この処理系は 4 値なので
+   * いちばん弱い x で表す (どちらも「決まっていない」の側に倒す)。
+   */
+  function triGate(kind, inBit, enBit) {
+    const activeHigh = kind === 'bufif1' || kind === 'notif1';
+    const inverting = kind === 'notif0' || kind === 'notif1';
+    const on = activeHigh ? enBit : newGate('not', [enBit]);
+    const drive = inverting ? newGate('not', [inBit]) : newGate('zx', [inBit]);
+    return newGate('mux', [
+      newGate('isx', [enBit]), CONSTX, newGate('mux', [on, drive, CONSTZ]),
+    ]);
+  }
+
+  /**
    * ネット列どうしを接続する (buf ゲートで橋渡し)。
    * signed は「右辺が狭いときに符号拡張するか」。式から来る場合は evalExpr が
    * 文脈幅まで広げ終えているので、効くのはネット列を直に渡す出力ポートだけ。
    */
   function connectNets(lhs, rhsBits, what, line, signed = false) {
     const src = extend(rhsBits, lhs.length, signed);
-    lhs.forEach((q, i) => {
-      setDriver(q, what, line);
-      const gate = { op: 'buf', out: q, in: [src[i]] };
-      gates.push(gate);
-      gateOf.set(q, gate);   // bufRoot がたどれるように記録する
-    });
+    lhs.forEach((q, i) => addDriver(q, src[i], what, line));
+  }
+
+  /**
+   * ネット 1 本にドライバを 1 本つなぐ。
+   *
+   * **2 本目からはバスになる。** 最初の buf をそのまま wire ゲート (解決規則) に
+   * 変えて、以降のドライバをその入力に足す ―― 解決の表は src/fourstate.js。
+   * トライステートを使っていない設計では 2 本目は今までどおりエラーで、
+   * 「つなぎ間違い」がバスとして黙って通ってしまうことはない。
+   *
+   * レジスタや定数が先に握っているネットは wired に載っていないので、
+   * `assign` と `always` の二重駆動はどちらの順でもエラーのまま。
+   */
+  function addDriver(q, srcNet, what, line) {
+    const prev = drivers.get(q);
+    if (prev) {
+      const bus = zstate ? wired.get(q) : null;
+      if (!bus) throw multiDriveError(q, prev, what, line);
+      bus.op = 'wire';
+      bus.in.push(srcNet);
+      drivers.set(q, `${prev} と ${what}`);
+      return;
+    }
+    drivers.set(q, what);
+    const gate = { op: 'buf', out: q, in: [srcNet] };
+    gates.push(gate);
+    gateOf.set(q, gate);   // bufRoot がたどれるように記録する
+    wired.set(q, gate);
   }
 
   /** 左辺のネット列に右辺を接続する */
@@ -2324,6 +2466,26 @@ export function elaborate(mod, all = [mod], opts = {}) {
       const [outNode, ...inNodes] = item.args;
       if (outNode.type !== 'ref') throw new CompileError('ゲートの第1引数は出力信号名', item.line);
 
+      if (TRISTATE_GATES.has(item.gate)) {
+        if (inNodes.length !== 2) {
+          throw new CompileError(
+            `${item.gate} の端子は (出力, 入力, 制御) の 3 本 `
+            + `(${item.args.length} 本指定された)`, item.line);
+        }
+        const inBits = evalExpr(inNodes[0]);
+        const enBits = evalExpr(inNodes[1]);
+        const outBits = refBits(outNode);
+        if (inBits.length !== 1 || enBits.length !== 1 || outBits.length !== 1) {
+          throw new CompileError(
+            `${item.gate} の端子は 3 本とも 1 ビット `
+            + `(出力 ${outBits.length} / 入力 ${inBits.length} / 制御 ${enBits.length} ビット)。`
+            + 'バス幅で駆動するなら assign と ?: で書く', item.line);
+        }
+        connect(outNode, [triGate(item.gate, inBits[0], enBits[0])],
+          `${item.gate} ゲート`, item.line);
+        return;
+      }
+
       const unary = item.gate === 'not' || item.gate === 'buf';
       if (unary && inNodes.length !== 1) {
         throw new CompileError(`${item.gate} は入力 1 本 (${inNodes.length} 本指定された)`, item.line);
@@ -2344,6 +2506,10 @@ export function elaborate(mod, all = [mod], opts = {}) {
         let acc = padded[0][b];
         if (base) for (let k = 1; k < padded.length; k++) acc = newGate(base, [acc, padded[k][b]]);
         if (invert) acc = newGate('not', [acc]);
+        // **プリミティブの buf は z を通さない** (Verilog の表では入力 z → 出力 x)。
+        // 同じ op を使う assign の接続とはここが違う。他のゲートは z を x として
+        // 扱う式になっているので、落とすのは buf だけでよい
+        if (item.gate === 'buf' && zstate) acc = newGate('zx', [acc]);
         result.push(acc);
       }
       connect(outNode, result, `${item.gate} ゲート`, item.line);
@@ -2480,6 +2646,22 @@ export function elaborate(mod, all = [mod], opts = {}) {
         }
         connectNets(refBits(conn.expr), port.bits,
           `${item.name} の出力ポート ${pname}`, item.line, port.signed);
+      } else if (port.dir === 'inout') {
+        // **双方向は橋渡しではなく「同じネット」にする。** buf でつなぐと
+        // 向きが片方に決まってしまうので、子のポートのネットを親のネットで
+        // 置き換える。子の中身はこの後で展開するので、以降の参照は全部
+        // 親のネットを指す (declPass で作った子のネットは使われずに残る)
+        if (conn.expr.type !== 'ref') {
+          throw new CompileError(
+            `inout ポート '${pname}' には信号名をつなぐ (式は双方向にできない)`, item.line);
+        }
+        const outer = refBits(conn.expr);
+        if (outer.length !== port.bits.length) {
+          throw new CompileError(
+            `inout ポート '${pname}' は ${port.bits.length} ビットだが `
+            + `${outer.length} ビットをつないでいる (双方向は幅をそろえる)`, item.line);
+        }
+        port.bits = outer;
       } else {
         throw new CompileError(`ポート '${pname}' の方向が宣言されていない`, item.line);
       }
@@ -2510,6 +2692,20 @@ export function elaborate(mod, all = [mod], opts = {}) {
   // top の input だけは外部から与えられるので「駆動済み」とみなす
   for (const s of signals.values()) {
     if (s.isTop && s.dir === 'input') s.bits.forEach((n) => drivers.set(n, '入力ポート'));
+  }
+  // top の inout は「ホストも 1 本のドライバ」として扱う。
+  //
+  // ホストが書く値を別のネット (driveBits) で受け、バス本体はその解決結果にする。
+  // 1 つのスロットを読み書き両方に使うと eval のたびにホストの駆動が消えるので、
+  // **書く場所と読む場所を分ける** ―― 名前は 1 つのまま、setInput は driveBits へ、
+  // get / getBits はバス本体を見る (src/signals.js)。
+  // 駆動しないときはホストが z を書く (`sim.setInput('bus', 'zzzz')`)。
+  for (const s of signals.values()) {
+    if (!s.isTop || s.dir !== 'inout') continue;
+    s.driveBits = s.bits.map(
+      (_, b) => newNet(s.width > 1 ? `${s.name}$drv[${b + s.lsb}]` : `${s.name}$drv`));
+    s.driveBits.forEach((n) => drivers.set(n, '入出力ポート (ホストが書く)'));
+    s.bits.forEach((q, i) => addDriver(q, s.driveBits[i], 'ホストからの駆動', mod.line));
   }
   itemPass(mod, '', true, 0, [mod.name]);
 
@@ -2566,6 +2762,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
     clocks: clockDomains,
     portOrder: mod.portOrder,
     xstate,
+    zstate,
     warnings: [
       ...(undriven.length
         ? [`未駆動の信号を ${xstate ? 'x' : '0'} にしました: ${undriven.join(', ')}`] : []),

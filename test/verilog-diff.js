@@ -300,6 +300,91 @@ endmodule`;
     [{ name: 'd', w: 4 }, { name: 'e', w: 4 }], vecs);
 }
 
+// ============================================================ トライステート
+//
+// **z は「読み違えたら揃って間違える」の見本**なので、ここで本物と突き合わせる意味が
+// いちばん大きい。見るのは 3 つ:
+//   1. wire の解決表 (2 本のドライバの 4×4 = 16 通りを総当たり)
+//   2. 式の中の z は x として振る舞うか (算術・ビット演算・== と ===)
+//   3. bufif / notif と、階層をまたぐ inout
+//
+// **`bufif` の制御が x のときだけは合わない。** Verilog はそこを L / H
+// (「0 か z」「1 か z」) という弱い値にするが、この処理系は 4 値なので x にまとめる。
+// 制御に x を入れるベクタは外してある (src/elaborate.js の triGate を参照)。
+const ZPATS = ['0000', '1111', '0101', 'zzzz', '00zz', 'z1z0', 'xxxx', '0x1z', 'x0z1'];
+const ZPAIRS = [];
+for (const a of ZPATS) for (const b of ZPATS) ZPAIRS.push([a, b]);
+
+{
+  // a と b がそのままバスのドライバになる。解決表そのものを総当たりで見る形
+  const ZOPS = [
+    ['bus', 'w', 4],                       // 解決の結果そのもの
+    ['plus', 'w + 4\'d1', 4],              // 式に入れると z は x になる
+    ['band', 'w & 4\'hF', 4], ['bnot', '~w', 4],
+    ['eq', 'a == b', 1], ['ceq', 'a === b', 1], ['cne', 'a !== b', 1],
+    ['red', '|w', 1], ['tern', 'a[0] ? a : b', 4],
+    ['cat', '{a[1:0], b[1:0]}', 4],
+    ['zlit', 'a[0] ? a : 4\'bz', 4],       // 駆動しない側を z にする定番の書き方
+  ];
+  const ports = ZOPS.map(([n, , w]) => ({ name: n, w }));
+  const src = `module tris(input [3:0] a, input [3:0] b, ${
+    ports.map((p) => `output ${p.w > 1 ? `[${p.w - 1}:0] ` : ''}${p.name}`).join(', ')});
+  wire [3:0] w;
+  assign w = a;
+  assign w = b;
+${ZOPS.map(([n, e]) => `  assign ${n} = ${e};`).join('\n')}
+endmodule`;
+  compare('トライステート: wire の解決と式の中の z', 'tris', src, ports,
+    [{ name: 'a', w: 4 }, { name: 'b', w: 4 }], ZPAIRS);
+}
+
+{
+  // casez は式の側の z も don't care にする (casex は x と z の両方)。
+  // 素の case は「そっくり同じか」なので z も普通に比べる
+  const src = `module zcase(input [3:0] a, input [3:0] b,
+  output reg [3:0] cc, output reg [3:0] cz, output reg [3:0] cx, output [3:0] keep);
+  always @(*) case (a)
+    4'b0001: cc = 4'h1; 4'bzz11: cc = 4'h2; 4'bz1z0: cc = 4'h3; default: cc = 4'h0;
+  endcase
+  always @(*) casez (a)
+    4'b1???: cz = 4'h1; 4'b01??: cz = 4'h2; 4'b001?: cz = 4'h3; default: cz = 4'h0;
+  endcase
+  always @(*) casex (a)
+    4'b1xxx: cx = 4'h1; 4'b01xx: cx = 4'h2; 4'b001x: cx = 4'h3; default: cx = 4'h0;
+  endcase
+  assign keep = b[0] ? 4'bz : 4'bz;
+endmodule`;
+  const ports = ['cc', 'cz', 'cx', 'keep'].map((n) => ({ name: n, w: 4 }));
+  compare('トライステート: case と z', 'zcase', src, ports,
+    [{ name: 'a', w: 4 }, { name: 'b', w: 4 }], ZPAIRS);
+}
+
+{
+  // 制御端子付きのゲートと、階層をまたぐ双方向。**制御に x / z は入れない**
+  // (Verilog はそこで L / H を出すので、4 値のこちらとは原理的に合わない)
+  const src = `module pad(inout w, input d, input oe);
+  assign w = oe ? d : 1'bz;
+endmodule
+module gates(input [3:0] a, input [3:0] b,
+  output g1, output g0, output n1, output n0, output bf, output nt, output bus);
+  bufif1 t1(g1, a[0], b[0]);
+  bufif0 t0(g0, a[0], b[0]);
+  notif1 f1(n1, a[0], b[0]);
+  notif0 f0(n0, a[0], b[0]);
+  buf   ub(bf, a[0]);
+  not   un(nt, a[0]);
+  pad p1(.w(bus), .d(a[1]), .oe(b[1]));
+  pad p2(.w(bus), .d(a[2]), .oe(b[2]));
+endmodule`;
+  const ports = ['g1', 'g0', 'n1', 'n0', 'bf', 'nt', 'bus'].map((n) => ({ name: n, w: 1 }));
+  // 制御 (b) は確定値だけ。データ (a) は z / x も入れる
+  const ctrl = ZPATS.filter((p) => !/[xz]/.test(p));
+  const vecs = [];
+  for (const a of ZPATS) for (const b of ctrl) vecs.push([a, b]);
+  compare('トライステート: bufif / notif / inout', 'gates', src, ports,
+    [{ name: 'a', w: 4 }, { name: 'b', w: 4 }], vecs);
+}
+
 // ============================================================ 2 値モード
 //
 // **ここが実際に使われるモード**で、しかも 4 値では見えない仕組みが動いている。

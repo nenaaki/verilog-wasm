@@ -96,6 +96,19 @@ export function lex(src) {
       const width = widthStr ? parseInt(widthStr, 10) : UNSIZED_WIDTH;
       if (width < 1 || width > 4096) throw new CompileError(`ビット幅 ${width} が不正`, line);
       const wm = (1n << BigInt(width)) - 1n;
+
+      // 桁がサイズに足りないぶんの上位は 0 で埋まる。**ただし左端の桁が x / z なら
+      // そこまで x / z が広がる** (Verilog の規則)。`4'bx` は 000x ではなく xxxx、
+      // `16'hz1` は zzzzzzzzzzzz0001 になる。埋めるのはリテラル自身のサイズまでで、
+      // そこから先 (式の文脈幅) はふつうの 0 拡張 / 符号拡張 (elaborate 側)。
+      const perDigit = { 2: 1, 8: 3, 16: 4 }[radix] ?? 0;
+      const given = digits.length * perDigit;
+      if (given < width && perDigit) {
+        const head = digits[0];
+        const fill = ((1n << BigInt(width)) - (1n << BigInt(given)));
+        if (head === 'z' || head === 'Z' || head === '?') mask |= fill;
+        else if (head === 'x' || head === 'X') xmask |= fill;
+      }
       tokens.push({
         type: 'num', value: raw, line, width, bits: value & wm,
         mask: mask & wm, xmask: xmask & wm, signed: !!signChar,

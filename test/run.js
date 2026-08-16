@@ -21,7 +21,7 @@ import {
 } from '../src/schematic.js';
 import { SAMPLE_CIRCUITS } from '../src/samples.js';
 import { circuitJson, isLibrary, libraryJson, mergeLibrary } from '../web/library.js';
-import { and2, muxOf, notOf, or2, xor2 } from '../src/fourstate.js';
+import { and2, isxOf, iszOf, muxOf, notOf, or2, wire2, xor2, zxOf } from '../src/fourstate.js';
 import { makeRng, randomDesign } from './random-design.js';
 
 const MAX_DEPTH_TEST = 10;   // src 側の上限 (8) より深くする
@@ -3871,9 +3871,9 @@ async function testErrors() {
     ['4 値でも定数式に x は書けない',
       `module m(output [7:0] y); localparam K = 4'bx1; assign y = K; endmodule`,
       /定数式に x は書けない/, { xstate: true }],
-    ['4 値でも z は値にならない',
+    ['2 値では z は値にならない',
       `module m(input [3:0] a, output y); assign y = a === 4'bz1; endmodule`,
-      /z \/ \? は casez \/ casex のラベルでしか使えない/, { xstate: true }],
+      /z \/ \? を値として書けるのは 4 値/],
     // signed は通るようになったが、parameter は 32 ビットの signed 固定なので
     // 幅も符号も書かせない
     ['parameter の signed 指定は未対応',
@@ -4165,14 +4165,14 @@ async function testErrors() {
     // すると回路が静かに変わるので断る。どの文字だったかで理由が変わる
     ['z を式の中に書いたら断る',
       `module m(output [3:0] y); assign y = 4'b1?01; endmodule`,
-      /z \/ \? は casez \/ casex のラベルでしか使えない/],
+      /z \/ \? を値として書けるのは 4 値/],
     ['casez でも casex でもない case のラベルの z は断る',
       `module m(input clk, input [3:0] a, output reg y);
        always @(posedge clk) case (a) 4'b1???: y <= 1'b1; default: y <= 1'b0; endcase endmodule`,
-      /z \/ \? は casez \/ casex のラベルでしか使えない/],
+      /z \/ \? を値として書けるのは 4 値/],
     ['parameter の z も断る',
       `module m #(parameter W = 4'bz1) (output y); assign y = 1'b0; endmodule`,
-      /z \/ \? は casez \/ casex のラベルでしか使えない/],
+      /z \/ \? を値として書けるのは 4 値/],
     ['x を式の中に書いたら断る',
       `module m(output [3:0] y); assign y = 4'bx1; endmodule`,
       /x は casex のラベルでしか使えない/],
@@ -4310,6 +4310,163 @@ async function testRandomDiff() {
   ok(!mismatch, `ランダム差分テスト (${designs} 回路 × 12 ベクタ)`, mismatch ?? '');
 }
 
+// --------------------------------------------- トライステート
+//
+// **z は「使う回路にだけ 3 枚目の面を作る」。** 値としての z / inout / bufif が
+// ソースに 1 つも無ければ、ネット数もバイト列もこれまでと 1 ビットも変わらない。
+// 4 状態の式そのものは testXState が総当たりで見るので、ここで見るのは
+// 「Verilog の書き方が正しくネットリストに落ちているか」。
+async function testTristate() {
+  const both = async (src, label) => {
+    const c = compile(src, { wat: false, xstate: true });
+    return [[await WasmSimulator.create(c), 'WASM'], [new RefSimulator(c), '参照']]
+      .map(([sim, kind]) => ({ sim, kind, c, label }));
+  };
+
+  // ---- 1. z を使わない回路は何も変わらない ----
+  const plain = `module m(input [3:0] a, input [3:0] b, output [3:0] y);
+    assign y = (a & 4'hF) | (b ^ 4'h0);
+  endmodule`;
+  const before = compile(plain, { wat: false, xstate: true });
+  ok(!before.layout.zstate, 'z を使わない回路には z の面を作らない');
+  eq(before.layout.byteSize % 16, 0, 'z が無ければ 1 ネット 16 バイトのまま');
+  // ?: の中の z / casez のラベルの ? は別物。ラベルの ? では面を増やさない
+  const zlabel = compile(`module m(input clk, input [3:0] a, output reg y);
+    always @(posedge clk) casez (a) 4'b1???: y <= 1'b1; default: y <= 1'b0; endcase
+  endmodule`, { wat: false, xstate: true });
+  ok(!zlabel.layout.zstate, 'casez のラベルの ? は「比較しない桁」なので z の面は要らない');
+
+  // ---- 2. wire の解決 ----
+  const bus = `module m(input ea, input eb, input [3:0] a, input [3:0] b, output [3:0] y);
+    wire [3:0] w;
+    assign w = ea ? a : 4'bz;
+    assign w = eb ? b : 4'bz;
+    assign y = w;
+  endmodule`;
+  const cbus = compile(bus, { wat: false, xstate: true });
+  ok(cbus.layout.zstate, 'z を使う回路には z の面ができる');
+  eq(cbus.layout.byteSize % 24, 0, 'z があると 1 ネット 24 バイト');
+  for (const { sim, kind } of await both(bus)) {
+    const at = (ea, eb, a, b) => {
+      sim.setInput('ea', ea).setInput('eb', eb).setInput('a', a).setInput('b', b).eval();
+      return sim.getBits('y');
+    };
+    eqs(at(0, 0, 5, 10), 'zzzz', `${kind} バス: 誰も駆動しなければ z`);
+    eqs(at(1, 0, 5, 10), '0101', `${kind} バス: 片方だけなら その値`);
+    eqs(at(0, 1, 5, 10), '1010', `${kind} バス: もう片方だけでも同じ`);
+    eqs(at(1, 1, 5, 10), 'xxxx', `${kind} バス: 食い違えば x`);
+    eqs(at(1, 1, 5, 5), '0101', `${kind} バス: 同じ値なら衝突ではない`);
+    eqs(sim.getZ('y').toString(2), '0', `${kind} バス: getZ で z のビットが分かる`);
+  }
+
+  // ---- 3. 式の中では z は x として振る舞う ----
+  for (const { sim, kind } of await both(`module m(input [3:0] a, output [3:0] plus,
+    output [3:0] band, output [3:0] bnot, output red, output ceq, output cne, output pass);
+    wire [3:0] w = a[0] ? a : 4'bz;
+    assign plus = w + 4'd1;
+    assign band = w & 4'hF;
+    assign bnot = ~w;
+    assign red  = |w;
+    assign ceq  = (w === 4'bz);
+    assign cne  = (w !== 4'bx);
+    assign pass = w[0];
+  endmodule`)) {
+    sim.setInput('a', '0000').eval();
+    eqs(sim.getBits('plus'), 'xxxx', `${kind} z + 1 は x`);
+    eqs(sim.getBits('band'), 'xxxx', `${kind} z & 1 は x (畳み込みを止めている)`);
+    eqs(sim.getBits('bnot'), 'xxxx', `${kind} ~z は x`);
+    eqs(sim.getBits('red'), 'x', `${kind} リダクションも x`);
+    eqs(sim.getBits('ceq'), '1', `${kind} === は z を z として比べる`);
+    eqs(sim.getBits('cne'), '1', `${kind} x と z は別物`);
+    eqs(sim.getBits('pass'), 'z', `${kind} 接続 (assign) は z をそのまま通す`);
+  }
+
+  // ---- 4. bufif / notif ----
+  for (const { sim, kind } of await both(`module m(input d, input e,
+    output y1, output y0, output n1, output n0, output bf);
+    bufif1 g1(y1, d, e);
+    bufif0 g0(y0, d, e);
+    notif1 f1(n1, d, e);
+    notif0 f0(n0, d, e);
+    buf    ub(bf, d);
+  endmodule`)) {
+    const at = (d, e) => {
+      sim.setInput('d', d).setInput('e', e).eval();
+      return ['y1', 'y0', 'n1', 'n0'].map((n) => sim.getBits(n)).join('');
+    };
+    eqs(at('1', '1'), '1z0z', `${kind} bufif: 制御が 1`);
+    eqs(at('0', '1'), '0z1z', `${kind} bufif: 制御が 1 で入力 0`);
+    eqs(at('1', '0'), 'z1z0', `${kind} bufif: 制御が 0 なら向きが入れ替わる`);
+    eqs(at('1', 'x'), 'xxxx', `${kind} bufif: 制御が x なら x (L / H は持たない)`);
+    // 効いているほう (bufif1 / notif1) だけが x になる。bufif0 / notif0 は
+    // 制御 1 で切れているので z のまま
+    eqs(at('z', '1'), 'xzxz', `${kind} bufif: 入力の z は x に落ちる`);
+    sim.setInput('d', 'z').eval();
+    eqs(sim.getBits('bf'), 'x', `${kind} プリミティブの buf も z を通さない`);
+  }
+
+  // ---- 5. inout: 階層をまたぐ双方向と、ホストからの駆動 ----
+  const pads = `module pad(inout w, input d, input oe);
+    assign w = oe ? d : 1'bz;
+  endmodule
+  module m(inout bus, input d1, input e1, input d2, input e2, output sense);
+    pad p1(.w(bus), .d(d1), .oe(e1));
+    pad p2(.w(bus), .d(d2), .oe(e2));
+    assign sense = bus;
+  endmodule`;
+  for (const { sim, kind } of await both(pads)) {
+    const at = (host, d1, e1, d2, e2) => {
+      sim.setInput('bus', host).setInput('d1', d1).setInput('e1', e1)
+        .setInput('d2', d2).setInput('e2', e2).eval();
+      return `${sim.getBits('bus')}${sim.getBits('sense')}`;
+    };
+    eqs(at('z', 0, 0, 0, 0), 'zz', `${kind} inout: 誰も駆動しなければ z`);
+    eqs(at('z', 1, 1, 0, 0), '11', `${kind} inout: 子が駆動すれば外から読める`);
+    eqs(at('z', 1, 1, 0, 1), 'xx', `${kind} inout: 子どうしの衝突は x`);
+    eqs(at('1', 0, 0, 0, 0), '11', `${kind} inout: ホストが駆動すれば中から読める`);
+    eqs(at('1', 0, 1, 0, 0), 'xx', `${kind} inout: ホストと子の衝突も x`);
+    eqs(at('z', 0, 1, 0, 1), '00', `${kind} inout: 子 2 つが同じ値なら衝突ではない`);
+  }
+
+  // ---- 6. レジスタも z を保つ ----
+  for (const { sim, kind } of await both(`module m(input clk, input oe, input d,
+    output reg q, output y);
+    always @(posedge clk) q <= oe ? d : 1'bz;
+    assign y = q;
+  endmodule`)) {
+    sim.reset().setInput('oe', 1).setInput('d', 1).step();
+    eqs(sim.getBits('q'), '1', `${kind} レジスタ: ふつうの値`);
+    sim.setInput('oe', 0).step();
+    eqs(sim.getBits('q'), 'z', `${kind} レジスタ: z も commit で運ばれる`);
+    eqs(sim.getBits('y'), 'z', `${kind} レジスタ: 下流にも z のまま出る`);
+  }
+
+  // ---- 7. リテラルの埋め方 (x / z は左端の桁が広がる) ----
+  for (const { sim, kind } of await both(`module m(output [3:0] a, output [3:0] b,
+    output [3:0] c, output [7:0] d);
+    assign a = 4'bz;
+    assign b = 4'bx1;
+    assign c = 4'bz01;
+    assign d = 4'bz;
+  endmodule`)) {
+    eqs(sim.eval().getBits('a'), 'zzzz', `${kind} リテラル: 4'bz は全桁 z`);
+    eqs(sim.getBits('b'), 'xxx1', `${kind} リテラル: 左端の x が広がる`);
+    eqs(sim.getBits('c'), 'zz01', `${kind} リテラル: 途中までしか書かなくても左端で決まる`);
+    eqs(sim.getBits('d'), '0000zzzz', `${kind} リテラル: 幅を超える拡張は 0 のまま`);
+  }
+
+  // ---- 8. z を使わないのに多重ドライブしたらエラーのまま ----
+  let caught = null;
+  try {
+    compile(`module m(input a, input b, output y);
+      wire w; assign w = a; assign w = b; assign y = w;
+    endmodule`, { wat: false, xstate: true });
+  } catch (e) { caught = e; }
+  ok(caught && /多重にドライブ/.test(caught.message),
+    'z が出てこない回路の多重ドライブは今までどおりエラー',
+    caught ? caught.message : 'エラーにならなかった');
+}
+
 // --------------------------------------------- 複数クロック / 2 相
 //
 // **クロックドメイン = (クロックのネット, エッジの向き)。** この 1 つの決め方で
@@ -4415,20 +4572,31 @@ async function testMultiClock() {
 //   2. 2 つの実装が食い違っていないか           … ランダム回路で WASM vs 参照実装
 async function testXState() {
   // ---- 1. 式が Verilog の定義と合っているか ----
-  const enc = (s) => (s === '0' ? { v: 0n, u: 0n } : s === '1' ? { v: 1n, u: 0n } : { v: 0n, u: 1n });
-  const dec = (p) => ((p.u & 1n) ? 'x' : String(p.v & 1n));
-  const S = ['0', '1', 'x'];
+  //
+  // **4 状態すべてで総当たりする。** z は「式の中では x と同じ」という規則があるので、
+  // 素朴なモデルの側もそう書いておくと、符号化 (z ⇒ u) が効いていることまで見える。
+  const enc = (s) => ({
+    v: s === '1' ? 1n : 0n,
+    u: s === 'x' || s === 'z' ? 1n : 0n,
+    z: s === 'z' ? 1n : 0n,
+  });
+  const dec = (p) => ((p.z & 1n) ? 'z' : (p.u & 1n) ? 'x' : String(p.v & 1n));
+  const S = ['0', '1', 'x', 'z'];
+  const un = (s) => (s === 'z' ? 'x' : s);           // 式の中では z は x
   // Verilog の定義そのまま (「確実に決まる入力があれば結果も決まる」)
   const model = {
     and: (a, b) => (a === '0' || b === '0' ? '0' : a === '1' && b === '1' ? '1' : 'x'),
     or: (a, b) => (a === '1' || b === '1' ? '1' : a === '0' && b === '0' ? '0' : 'x'),
-    xor: (a, b) => (a === 'x' || b === 'x' ? 'x' : a === b ? '0' : '1'),
+    xor: (a, b) => (un(a) === 'x' || un(b) === 'x' ? 'x' : a === b ? '0' : '1'),
+    // 多重ドライブの解決: 駆動していない (z) 側は無視、残りが食い違えば x
+    wire: (a, b) => (a === 'z' ? b : b === 'z' ? a
+      : un(a) === 'x' || un(b) === 'x' ? 'x' : a === b ? a : 'x'),
   };
   let bad = null;
   let cases = 0;
   for (const a of S) {
     for (const b of S) {
-      for (const [op, f] of [['and', and2], ['or', or2], ['xor', xor2]]) {
+      for (const [op, f] of [['and', and2], ['or', or2], ['xor', xor2], ['wire', wire2]]) {
         cases++;
         const got = dec(f(enc(a), enc(b)));
         if (got !== model[op](a, b) && !bad) bad = `${op}(${a},${b}) 期待 ${model[op](a, b)} / 実際 ${got}`;
@@ -4436,12 +4604,20 @@ async function testXState() {
     }
   }
   for (const a of S) {
-    cases++;
+    cases += 4;
+    const want = un(a) === 'x' ? 'x' : a === '0' ? '1' : '0';
     const got = dec(notOf(enc(a)));
-    const want = a === 'x' ? 'x' : a === '0' ? '1' : '0';
     if (got !== want && !bad) bad = `not(${a}) 期待 ${want} / 実際 ${got}`;
+    // isx は「不定か」(z も数える)、isz は z だけ、zx は z を x に落とす
+    const checks = [
+      ['isx', dec(isxOf(enc(a))), un(a) === 'x' ? '1' : '0'],
+      ['isz', dec(iszOf(enc(a))), a === 'z' ? '1' : '0'],
+      ['zx', dec(zxOf(enc(a))), un(a)],
+    ];
+    for (const [name, g, w] of checks) if (g !== w && !bad) bad = `${name}(${a}) 期待 ${w} / 実際 ${g}`;
   }
-  // mux は「選択が x でも両枝が同じ確実な値なら決まる」が要点
+  // mux は「選択が x でも両枝が同じ確実な値なら決まる」が要点。
+  // 両枝とも z なら結果も z になる (`x ? 1'bz : 1'bz` は z)
   for (const s of S) {
     for (const a of S) {
       for (const b of S) {
@@ -4449,6 +4625,17 @@ async function testXState() {
         const want = s === '1' ? a : s === '0' ? b : (a === b && a !== 'x' ? a : 'x');
         const got = dec(muxOf(enc(s), enc(a), enc(b)));
         if (got !== want && !bad) bad = `mux(${s},${a},${b}) 期待 ${want} / 実際 ${got}`;
+      }
+    }
+  }
+  // wire は 3 本以上を 2 本ずつ畳む。表が結合則を満たしていないと順番で答えが変わる
+  for (const a of S) {
+    for (const b of S) {
+      for (const c of S) {
+        cases++;
+        const left = dec(wire2(wire2(enc(a), enc(b)), enc(c)));
+        const right = dec(wire2(enc(a), wire2(enc(b), enc(c))));
+        if (left !== right && !bad) bad = `wire(${a},${b},${c}) 畳む順で違う (${left} / ${right})`;
       }
     }
   }
@@ -5763,6 +5950,7 @@ const suites = [
   ['ランダム差分', testRandomDiff],
   ['複数クロック / 2 相', testMultiClock],
   ['x を値として扱う', testXState],
+  ['トライステート', testTristate],
   ['インスタンスの独立性', testInstanceIndependence],
   ['WAT 出力', testWat],
   ['GUI 回路グラフ', testSchematic],

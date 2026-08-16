@@ -20,10 +20,13 @@ const ALL_ONES = (1n << 64n) - 1n;      // 64 レーンすべてを 1 にする�
 export function buildLayout(netlist) {
   const { signals, regs } = netlist;
   const xstate = !!netlist.xstate;
+  // トライステートを含む回路だけが 3 枚目 (z の面) を持つ。z を使わない回路の
+  // メモリ像とバイト列はこれまでと 1 バイトも変わらない
+  const zstate = !!netlist.zstate;
   // 4 値のときは 1 ネットが「値の面」と「不定の面」の 2 ワードになる。
-  // **不定の面は必ず値の面の 8 バイト後ろ**に置くので、オフセットの表は 1 本で済む
-  // (src/fourstate.js の符号化を参照)。
-  const SLOT = xstate ? 16 : 8;
+  // **不定の面は必ず値の面の 8 バイト後ろ、z の面はさらに 8 バイト後ろ**に置くので、
+  // オフセットの表は 1 本で済む (src/fourstate.js の符号化を参照)。
+  const SLOT = zstate ? 24 : xstate ? 16 : 8;
   const slots = new Map();
   let offset = 0;
 
@@ -36,12 +39,17 @@ export function buildLayout(netlist) {
 
   // スロットを持つのは top のポートだけ。階層を平坦化した後の子モジュールの
   // ポートはただの内部配線なので、ホストとの受け渡しには出てこない。
-  const isPort = (s) => s.isTop !== false && (s.dir === 'input' || s.dir === 'output');
+  //
+  // inout は**スロットを 2 組持つ**: バス本体 (ホストが読む) と、ホストが駆動する
+  // 側 (driveBits)。1 組で兼ねると eval のたびにホストの駆動が上書きされる。
+  const isPort = (s) => s.isTop !== false
+    && (s.dir === 'input' || s.dir === 'output' || s.dir === 'inout');
 
   const ports = [];
   for (const s of signals.values()) {
     if (isPort(s)) {
       s.bits.forEach(assign);
+      (s.driveBits ?? []).forEach(assign);
       ports.push(s);
     }
   }
@@ -58,13 +66,15 @@ export function buildLayout(netlist) {
   const regQ = new Set(regs.map((r) => r.q));
   const outputNets = [];
   for (const s of signals.values()) {
-    if (!isPort(s) || s.dir !== 'output') continue;
+    if (!isPort(s) || (s.dir !== 'output' && s.dir !== 'inout')) continue;
     for (const n of s.bits) if (!regQ.has(n)) outputNets.push(n);
   }
 
   const inputNets = [];
   for (const s of signals.values()) {
-    if (isPort(s) && s.dir === 'input') inputNets.push(...s.bits);
+    if (!isPort(s)) continue;
+    if (s.dir === 'input') inputNets.push(...s.bits);
+    if (s.dir === 'inout') inputNets.push(...(s.driveBits ?? []));
   }
 
   // initial で置いた電源投入時の値。1 のビットは 64 レーン全部を 1 にする
@@ -86,6 +96,7 @@ export function buildLayout(netlist) {
     regNext,
     initWords,
     xstate,
+    zstate,
     // クロックドメイン。`commit` はドメインごとに分かれるので、外から名前で指せるようにする
     clocks: (netlist.clocks ?? []).map((c) => c.name),
     byteSize: offset,
@@ -112,6 +123,8 @@ export function buildLayout(netlist) {
         width: s.width,
         isClock: !!s.isClock,
         offsets: s.bits.map((n) => slots.get(n) ?? null),
+        // inout だけ「書く先」が読む先と違う (setInput はこちらへ書く)
+        ...(s.driveBits ? { driveOffsets: s.driveBits.map((n) => slots.get(n) ?? null) } : {}),
       })),
   };
 }

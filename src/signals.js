@@ -9,9 +9,11 @@ export const MASK64 = (1n << 64n) - 1n;
 const ALL_ONES = MASK64;
 
 export class SignalAccess {
-  constructor(signalTable, xstate = false, clocks = []) {
+  constructor(signalTable, xstate = false, clocks = [], zstate = false) {
     this.signalTable = signalTable;
     this.xstate = xstate;
+    /** z の面を持つか。トライステートを含む回路だけ真 (src/fourstate.js の符号化) */
+    this.zstate = zstate;
     /** クロックドメインの名前。posedge はクロック信号名、negedge は `~clk` */
     this.clocks = clocks;
     this.byName = new Map(signalTable.map((s) => [s.name, s]));
@@ -56,9 +58,20 @@ export class SignalAccess {
   }
 
   /**
+   * 書き込み先のオフセット列。**inout だけ読む場所と違う。**
+   *
+   * 双方向のバスはホストも 1 本のドライバなので、ホストが書く値と、
+   * 回路まで含めて解決された値は別物になる。名前は 1 つのまま、
+   * `setInput` はホストの駆動を書き、`get` / `getBits` は解決結果を読む。
+   * 駆動しないときは z を書く (`setInput('bus', 'zzzz')`)。
+   */
+  _drive(s) { return s.driveOffsets ?? s.offsets; }
+
+  /**
    * 全 64 レーンに同じ値を書く。
    *
-   * **文字列は MSB 先頭のビット列**（`"0110"` / `"01x0"`）、数値と BigInt はそのままの値。
+   * **文字列は MSB 先頭のビット列**（`"0110"` / `"01x0"` / `"z0"`）、
+   * 数値と BigInt はそのままの値。
    * 10 進で渡したいときは数値を使う ―― 文字列かどうかで進数が変わるほうが、
    * 「x が入っているかどうか」で変わるより間違えにくい。
    */
@@ -66,31 +79,37 @@ export class SignalAccess {
     const s = this._sig(name);
     if (typeof value === 'string') return this._setBitString(s, value);
     const v = BigInt(value);
-    s.offsets.forEach((off, b) => {
+    this._drive(s).forEach((off, b) => {
       if (off === null) return;
       this.writeWord(off, (v >> BigInt(b)) & 1n ? ALL_ONES : 0n);
       if (this.xstate) this.writeWord(off + 8, 0n);
+      if (this.zstate) this.writeWord(off + 16, 0n);
     });
     return this;
   }
 
-  /** `"0110"` / `"01x0"` のような MSB 先頭のビット文字列を書く */
+  /** `"0110"` / `"01x0"` / `"z0"` のような MSB 先頭のビット文字列を書く */
   _setBitString(s, text) {
     const clean = text.trim().replace(/_/g, '');
-    if (!/^[01xX]*$/.test(clean)) {
-      throw new Error(`入力のビット列に使えるのは 0 / 1 / x だけ ('${text}')。`
+    if (!/^[01xXzZ]*$/.test(clean)) {
+      throw new Error(`入力のビット列に使えるのは 0 / 1 / x / z だけ ('${text}')。`
         + '10 進で渡すなら数値か BigInt を使う');
     }
-    if (!this.xstate && /x/i.test(clean)) {
-      throw new Error(`x を入力に書けるのは 4 値 (xstate) のときだけ ('${text}')`);
+    if (!this.xstate && /[xz]/i.test(clean)) {
+      throw new Error(`x / z を入力に書けるのは 4 値 (xstate) のときだけ ('${text}')`);
+    }
+    if (!this.zstate && /z/i.test(clean)) {
+      throw new Error(`z を入力に書けるのは、回路がトライステートを含むときだけ ('${text}')。`
+        + 'z の面はそれを使う回路にしか作らない');
     }
     const chars = [...clean].reverse();                // LSB 先頭に並べ替える
-    s.offsets.forEach((off, b) => {
+    this._drive(s).forEach((off, b) => {
       if (off === null) return;
-      const c = chars[b] ?? '0';
-      const isX = c === 'x' || c === 'X';
+      const c = (chars[b] ?? '0').toLowerCase();
+      // z は「不定でもある」(src/fourstate.js の z ⇒ u)
       this.writeWord(off, c === '1' ? ALL_ONES : 0n);
-      if (this.xstate) this.writeWord(off + 8, isX ? ALL_ONES : 0n);
+      if (this.xstate) this.writeWord(off + 8, c === 'x' || c === 'z' ? ALL_ONES : 0n);
+      if (this.zstate) this.writeWord(off + 16, c === 'z' ? ALL_ONES : 0n);
     });
     return this;
   }
@@ -100,13 +119,14 @@ export class SignalAccess {
     const s = this._sig(name);
     const v = BigInt(value);
     const bit = 1n << BigInt(lane);
-    s.offsets.forEach((off, b) => {
+    this._drive(s).forEach((off, b) => {
       if (off === null) return;
       const cur = this.readWord(off);
       const on = ((v >> BigInt(b)) & 1n) === 1n;
       this.writeWord(off, (on ? cur | bit : cur & (MASK64 ^ bit)) & MASK64);
       // 4 値では「そのレーンだけ確実な値にする」ので、不定の面はこのレーンだけ落とす
       if (this.xstate) this.writeWord(off + 8, this.readWord(off + 8) & (MASK64 ^ bit));
+      if (this.zstate) this.writeWord(off + 16, this.readWord(off + 16) & (MASK64 ^ bit));
     });
     return this;
   }
@@ -129,28 +149,41 @@ export class SignalAccess {
     return out;
   }
 
-  /** @returns {bigint} x になっているビットに 1 が立ったマスク (2 値なら常に 0) */
+  /**
+   * @returns {bigint} 不定 (x か z) になっているビットに 1 が立ったマスク。
+   * 2 値なら常に 0。x と z を分けたければ getZ と併せて見る
+   */
   getX(name, lane = 0) {
+    return this._plane(name, lane, 8, this.xstate);
+  }
+
+  /** @returns {bigint} z になっているビットに 1 が立ったマスク (トライステートが無ければ常に 0) */
+  getZ(name, lane = 0) {
+    return this._plane(name, lane, 16, this.zstate);
+  }
+
+  _plane(name, lane, delta, live) {
     const s = this._sig(name);
-    if (!this.xstate) return 0n;
+    if (!live) return 0n;
     const sh = BigInt(lane);
     let out = 0n;
     s.offsets.forEach((off, b) => {
       if (off === null) return;
-      out |= ((this.readWord(off + 8) >> sh) & 1n) << BigInt(b);
+      out |= ((this.readWord(off + delta) >> sh) & 1n) << BigInt(b);
     });
     return out;
   }
 
-  /** @returns {string} `"01x0"` のような MSB 先頭のビット文字列 */
+  /** @returns {string} `"01x0"` / `"z01"` のような MSB 先頭のビット文字列 */
   getBits(name, lane = 0) {
     const s = this._sig(name);
     const v = this.get(name, lane);
     const u = this.getX(name, lane);
+    const z = this.getZ(name, lane);
     let out = '';
     for (let b = s.width - 1; b >= 0; b--) {
       const i = BigInt(b);
-      out += (u >> i) & 1n ? 'x' : String((v >> i) & 1n);
+      out += (z >> i) & 1n ? 'z' : (u >> i) & 1n ? 'x' : String((v >> i) & 1n);
     }
     return out;
   }

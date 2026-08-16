@@ -14,14 +14,18 @@
 import { lex } from './lexer.js';
 import { CompileError } from './errors.js';
 
-const GATE_PRIMITIVES = new Set(['and', 'or', 'not', 'nand', 'nor', 'xor', 'xnor', 'buf']);
+// 制御端子付きのゲート。`bufif1(out, in, en)` の形で、en が効いていなければ z を出す
+const TRISTATE_GATES = new Set(['bufif0', 'bufif1', 'notif0', 'notif1']);
+const GATE_PRIMITIVES = new Set([
+  'and', 'or', 'not', 'nand', 'nor', 'xor', 'xnor', 'buf', ...TRISTATE_GATES,
+]);
 // module 本体に書けそうで書けないもの。名前を出して断る。こうしないと
 // 「<モジュール名> <インスタンス名>」に見えて、遠いところでエラーになる
 const UNSUPPORTED_ITEMS = new Set([
   'task', 'defparam', 'specify',
   'always_comb', 'always_ff', 'always_latch', 'real', 'time',
 ]);
-const DIRECTIONS = new Set(['input', 'output']);
+const DIRECTIONS = new Set(['input', 'output', 'inout']);
 const NET_KINDS = new Set(['wire', 'reg']);
 // module 本体にしか出てこない語。function の中で出会ったら endfunction の書き忘れ
 const FUNC_BODY_STOP = new Set([
@@ -724,7 +728,7 @@ export function parse(src) {
         do {
           if (ansi) {
             const pline = peek().line;
-            if (!DIRECTIONS.has(peek().value)) throw err('ANSI ポートリストでは input/output が必要');
+            if (!DIRECTIONS.has(peek().value)) throw err('ANSI ポートリストでは input / output / inout が必要');
             const dir = next().value;
             const kind = NET_KINDS.has(peek().value) ? next().value : null;
             const isSigned = parseSignedness();
@@ -944,4 +948,4 @@ export function parse(src) {
   return modules;
 }
 
-export { GATE_PRIMITIVES };
+export { GATE_PRIMITIVES, TRISTATE_GATES };

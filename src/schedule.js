@@ -20,6 +20,8 @@ export function schedule(netlist) {
   // ここでソース扱いすると順序が付かないまま並べてしまう)
   for (const s of signals.values()) {
     if (s.isTop !== false && s.dir === 'input') s.bits.forEach((n) => (available[n] = 1));
+    // inout はバス本体が計算結果 (解決) で、ソースになるのはホストが駆動する側
+    if (s.driveBits) s.driveBits.forEach((n) => (available[n] = 1));
   }
   for (const r of regs) available[r.q] = 1;
 
@@ -87,7 +89,7 @@ function reachable(netlist) {
   const live = new Uint8Array(gates.length);
   const stack = [];
   for (const s of signals.values()) {
-    if (s.dir === 'output') stack.push(...s.bits);
+    if (s.dir === 'output' || s.dir === 'inout') stack.push(...s.bits);
   }
   for (const r of regs) {
     stack.push(r.d);
