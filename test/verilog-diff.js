@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { compile, RefSimulator } from '../src/compile.js';
+import { makeRng, randomDesign } from './random-design.js';
 
 // ------------------------------------------------------ iverilog を探す
 const CANDIDATES = [
@@ -128,6 +129,11 @@ const OPS = [
   ['eq', 'a == b', 1], ['ne', 'a != b', 1], ['ceq', 'a === b', 1], ['cne', 'a !== b', 1],
   ['redand', '&a', 1], ['redor', '|a', 1], ['redxor', '^a', 1],
   ['redn', '~&a', 1], ['rednor', '~|a', 1],
+  // **反転するリダクションは幅の広い文脈にも置く。** 1 ビットの文脈だと
+  // 「1 トークンか、`~` と `&` に割れたか」の違いが出ない (割れると `~` が
+  // 文脈幅を受け取って 8 ビットの反転になる)。実際にここが壊れていた
+  ['nand4', '~&a', 4], ['nor4', '~|a', 4], ['xnor4', '~^a', 4],
+  ['norshift', '(~|a) << 1', 4], ['norcat', '{2\'b0, ~|a}', 4],
   ['lnot', '!a', 1], ['land', 'a && b', 1], ['lor', 'a || b', 1],
   ['cat', '{a[1:0], b[1:0]}', 4], ['rep', '{2{a[1:0]}}', 4], ['part', 'a[2:1]', 2],
   ['shl', 'a << b[1:0]', 4], ['shr', 'a >> b[1:0]', 4],
@@ -285,6 +291,93 @@ endmodule`;
   for (const d of PATS) for (const e of ['0011', '1x01', 'xxxx']) vecs.push([d, e]);
   compareSeq('順序回路 (レジスタ・x の保持)', 'seq', src, ports,
     [{ name: 'd', w: 4 }, { name: 'e', w: 4 }], vecs);
+}
+
+// ============================================================ ランダム回路
+//
+// **ここまでは「こちらが思いついた式」を並べていた。** それだと列挙から漏れたものが
+// そのまま残るので、[ランダム生成器](random-design.js)が出すものをそのまま流す。
+// 生成器は `generate`・階層・`for` / `while` / `repeat`・`function`・`casez` / `casex`・
+// `signed`・非同期リセット・`x` 混じりのリテラルを混ぜるので、**こちらが列挙しなかった
+// 組み合わせまで網に入る**。
+//
+// 1 サイクルを 2 点で見る:
+//   A … 入力を置いて落ち着かせた所 (組合せ + 非同期リセット)  ← eval()
+//   B … クロックを 1 発打った所     (レジスタ)               ← step()
+{
+  const rng = makeRng(20260818);
+  const IN = [{ name: 'a', w: 8 }, { name: 'b', w: 8 }, { name: 'c', w: 8 }, { name: 'rst', w: 1 }];
+  const OUT = ['y', 'rout', 'rout2', 'rout3', 'rout4', 'rout5'].map((n) => ({ name: n, w: 8 }));
+  // データには x を混ぜるが、**リセット線だけは 0 / 1 に固定する**。
+  // Verilog の `posedge rst` は x への遷移でも発火するので、rst を x にすると
+  // 「エッジで発火する Verilog」と「rst が真のあいだ上書きするこちら」の
+  // モデルの差が出る (README「クロックを待たない、を cycle-based でどう表すか」)。
+  // 実際の RTL がリセット線を x にすることは無いので、そこは測る対象から外す。
+  const pat = (w, allowX = true) => [...Array(w)]
+    .map(() => (allowX && rng() < 0.25 ? 'x' : String(Math.floor(rng() * 2)))).join('');
+
+  let designs = 0;
+  const bad = [];
+  let checked = 0;
+
+  for (let d = 0; d < 8; d++) {
+    const src = randomDesign(rng, 5, { xstate: true });
+    const vectors = [...Array(6)].map(() => IN.map((i) => pat(i.w, i.name !== 'rst')));
+
+    const fmt = OUT.map(() => ' %b').join('');
+    const args = OUT.map((p) => p.name).join(', ');
+    const body = vectors.map((v) => {
+      const set = IN.map((i, k) => `${i.name}=${i.w}'b${v[k]};`).join(' ');
+      return `    ${set} #1 $display("A ${v.join(' ')}${fmt}", ${args});\n`
+        + `    clk=1; #1 $display("B ${v.join(' ')}${fmt}", ${args}); clk=0; #1;`;
+    }).join('\n');
+    const tb = `${src}
+module tb;
+  reg clk; ${IN.map((i) => `reg [${i.w - 1}:0] ${i.name};`).join(' ')}
+  ${OUT.map((p) => `wire [${p.w - 1}:0] ${p.name};`).join(' ')}
+  rnd u(clk, rst, a, b, c, ${OUT.map((p) => p.name).join(', ')});
+  initial begin
+    clk = 0;
+${body}
+  end
+endmodule`;
+    const vsrc = join(dir, `rnd${d}.v`);
+    const vout = join(dir, `rnd${d}.vvp`);
+    writeFileSync(vsrc, tb);
+    let rows;
+    try {
+      execFileSync(iverilog, ['-o', vout, vsrc], { stdio: 'pipe' });
+      rows = execFileSync(vvp, [vout], { encoding: 'utf8' }).trim().split('\n')
+        .map((l) => l.trim().split(/\s+/));
+    } catch (e) {
+      failures.push(`ランダム回路 ${d}: iverilog が失敗した — ${String(e.stderr ?? e.message).slice(0, 300)}\n${src}`);
+      continue;
+    }
+    designs++;
+
+    const sim = new RefSimulator(compile(src, { wat: false, xstate: true }));
+    sim.reset();
+    for (const cols of rows) {
+      const [phase, ...rest] = cols;
+      IN.forEach((i, k) => sim.setInput(i.name, rest[k]));
+      // A で eval を 2 回呼ぶのは**非同期リセットの決まり**。`eval` は末尾で Q を
+      // 書くので、その回の組合せ論理は先頭で読んだ古い Q を使っている。
+      // 下流の組合せ出力まで追いつかせるには もう 1 回要る (README「クロックを
+      // 待たない、を cycle-based でどう表すか」)。step() は末尾に eval があるので不要。
+      if (phase === 'A') sim.eval().eval(); else sim.step();
+      OUT.forEach((p, k) => {
+        checked++;
+        const want = rest[IN.length + k];
+        const got = sim.getBits(p.name);
+        if (want !== got && bad.length < 2) {
+          bad.push(`回路 ${d} ${phase} ${p.name}: iverilog=${want} 自前=${got}`
+            + ` (${IN.map((i, j) => `${i.name}=${rest[j]}`).join(' ')})\n${src}`);
+        }
+      });
+    }
+  }
+  ok(designs === 8, 'ランダム回路: 8 個すべて iverilog が受け付けた', `通ったのは ${designs} 個`);
+  ok(bad.length === 0, `ランダム回路 (${designs} 個 × 6 ベクタ × 2 点 = ${checked} 件)`, bad.join('\n---\n'));
 }
 
 // ------------------------------------------------------------------ 結果

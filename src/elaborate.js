@@ -1131,6 +1131,10 @@ export function elaborate(mod, all = [mod], opts = {}) {
   // 「1 ビットの結果を反転」になるので、ここでは扱わなくてよい。
   const REDUCE = { '&': 'and', '|': 'or', '^': 'xor' };
 
+  // 反転するリダクション。**結果は必ず 1 ビット**なので、`~` に割ってはいけない
+  // (割ると ` ~` が文脈幅を受け取って 8 ビットの反転になる)
+  const NOTRED = { '~&': 'and', '~|': 'or', '~^': 'xor', '^~': 'xor' };
+
   // 等価比較 4 種。=== と !== は「ビット列がそっくり同じか」で、x どうしも一致とみなす
   const EQ = { '==': 1, '!=': 1, '===': 1, '!==': 1 };
 
@@ -1187,7 +1191,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
         return refBits(e).length;        // refBits は純粋 (既存のネット ID を返すだけ)
       case 'un':
         // 論理否定とリダクションは 1 ビット。残り (~ 単項 -) はオペランドの幅
-        if (e.op === '!' || REDUCE[e.op] || e.op === '~^' || e.op === '^~') return 1;
+        if (e.op === '!' || REDUCE[e.op] || NOTRED[e.op]) return 1;
         return selfWidth(e.a);
       case 'bin':
         if (e.op === '&&' || e.op === '||') return 1;
@@ -1263,7 +1267,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
       case 'un':
         // 結果が 1 ビットに決まるもの (論理否定・リダクション) は符号なし。
         // ~ と単項 - はオペランドの符号をそのまま引き継ぐ
-        if (e.op === '!' || REDUCE[e.op] || e.op === '~^' || e.op === '^~') return false;
+        if (e.op === '!' || REDUCE[e.op] || NOTRED[e.op]) return false;
         return signOf(e.a);
       case 'bin':
         if (e.op === '&&' || e.op === '||') return false;
@@ -1341,8 +1345,9 @@ export function elaborate(mod, all = [mod], opts = {}) {
         if (REDUCE[e.op]) {
           return resize([reduce(evalExpr(e.a), REDUCE[e.op])], w);
         }
-        if (e.op === '~^' || e.op === '^~') {
-          return resize([newGate('not', [reduce(evalExpr(e.a), 'xor')])], w);
+        // 反転するリダクション (~& ~| ~^ ^~)。中身を畳んでから 1 ビットを反転する
+        if (NOTRED[e.op]) {
+          return resize([newGate('not', [reduce(evalExpr(e.a), NOTRED[e.op])])], w);
         }
         const a = evalExpr(e.a, w, sg);    // ~ と単項 - は文脈依存 (符号も降ろす)
         if (e.op === '~') return a.map((n) => newGate('not', [n]));
