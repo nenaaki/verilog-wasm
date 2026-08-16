@@ -9,7 +9,7 @@ import { evalGate } from './fourstate.js';
 
 export class RefSimulator extends SignalAccess {
   constructor(compiled) {
-    super(compiled.layout.signalTable, !!compiled.layout.xstate);
+    super(compiled.layout.signalTable, !!compiled.layout.xstate, compiled.layout.clocks ?? []);
     this.netlist = compiled.netlist;
     this.order = compiled.order;
     this.layout = compiled.layout;
@@ -119,10 +119,15 @@ export class RefSimulator extends SignalAccess {
     return this;
   }
 
-  /** クロックエッジ: 次状態を Q に一括転送する */
-  commit() {
+  /**
+   * クロックエッジ: そのドメインの次状態を Q に一括転送する。
+   * **叩くのは 1 ドメインだけ** ―― 別のクロックのレジスタは動かない。
+   */
+  commit(clock) {
+    const d = this.clockIndex(clock);
     const { regs } = this.netlist;
     regs.forEach((rg, i) => {
+      if (rg.domain !== d) return;
       this.values[rg.q] = this.next[i];
       if (this.xstate) this.unknown[rg.q] = this.nextX[i];
     });
@@ -130,13 +135,13 @@ export class RefSimulator extends SignalAccess {
   }
 
   /** 1 クロック。終了時に組合せ出力は確定済み (codegen.js の step と同じ) */
-  step() {
-    return this.eval().commit().eval();
+  step(clock) {
+    return this.eval().commit(clock).eval();
   }
 
-  run(n) {
+  run(n, clock) {
     this.eval();
-    for (let i = 0; i < n; i++) this.commit().eval();
+    for (let i = 0; i < n; i++) this.commit(clock).eval();
     return this;
   }
 }

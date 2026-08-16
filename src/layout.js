@@ -86,6 +86,8 @@ export function buildLayout(netlist) {
     regNext,
     initWords,
     xstate,
+    // クロックドメイン。`commit` はドメインごとに分かれるので、外から名前で指せるようにする
+    clocks: (netlist.clocks ?? []).map((c) => c.name),
     byteSize: offset,
     pages: Math.max(1, Math.ceil(offset / 65536)),
     inputNets,

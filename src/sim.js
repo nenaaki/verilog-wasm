@@ -4,7 +4,7 @@ import { SignalAccess, MASK64 } from './signals.js';
 
 export class WasmSimulator extends SignalAccess {
   constructor(compiled, instance) {
-    super(compiled.layout.signalTable, !!compiled.layout.xstate);
+    super(compiled.layout.signalTable, !!compiled.layout.xstate, compiled.layout.clocks ?? []);
     this.compiled = compiled;
     this.instance = instance;
     this.exports = instance.exports;
@@ -37,19 +37,19 @@ export class WasmSimulator extends SignalAccess {
     return this;
   }
 
-  /** クロックエッジ: 次状態を Q に一括転送する */
-  commit() {
-    this.exports.commit();
+  /** クロックエッジ: そのドメインの次状態を Q に一括転送する */
+  commit(clock) {
+    this.exports.commit(this.clockIndex(clock));
     return this;
   }
 
-  step() {
-    this.exports.step();
+  step(clock) {
+    this.exports.step(this.clockIndex(clock));
     return this;
   }
 
-  run(n) {
-    this.exports.run(n);
+  run(n, clock) {
+    this.exports.run(this.clockIndex(clock), n);
     return this;
   }
 }

@@ -37,6 +37,8 @@ const OP = {
   i32_const: 0x41,
   i32_eqz: 0x45,
   i32_sub: 0x6b,
+  i32_eq: 0x46,
+  if_: 0x04,
   i64_const: 0x42,
   i64_load: 0x29,
   i64_store: 0x37,
@@ -240,7 +242,12 @@ export function emitWasm(netlist, order, layout) {
 
   const evalBody = [...vec([[...uleb(localCount), I64]]), ...code];
 
-  // ---- commit 本体: next スロット → Q スロットの一括コピー ----
+  // ---- commit(domain) 本体: next スロット → Q スロットの一括コピー ----
+  //
+  // **クロックドメインごとに分かれる。** 引数のドメイン番号と一致したブロックだけを
+  // 通し、別のクロックのレジスタは動かさない。ドメインが 1 個なら `if` は
+  // 畳まずにそのまま置く (1 個ぶんの比較なので、これまでとの差は数バイト)。
+  const domains = Math.max(1, layout.clocks.length);
   const commitCode = [];
   const copyWord = (from, to) => {
     commitCode.push(OP.i32_const, ...sleb(0));                                  // 宛先アドレス
@@ -248,37 +255,49 @@ export function emitWasm(netlist, order, layout) {
     commitCode.push(OP.i64_load, ...uleb(ALIGN_8), ...uleb(from));
     commitCode.push(OP.i64_store, ...uleb(ALIGN_8), ...uleb(to));
   };
-  regs.forEach((r, i) => {
-    copyWord(regNext[i], slots.get(r.q));
-    if (xstate) copyWord(regNext[i] + 8, slots.get(r.q) + 8);
-  });
+  for (let d = 0; d < domains; d++) {
+    const mine = regs.map((r, i) => [r, i]).filter(([r]) => (r.domain ?? 0) === d);
+    if (mine.length === 0) continue;
+    commitCode.push(OP.local_get, ...uleb(0));       // ドメイン番号
+    commitCode.push(OP.i32_const, ...sleb(d));
+    commitCode.push(OP.i32_eq);
+    commitCode.push(OP.if_, 0x40);
+    for (const [r, i] of mine) {
+      copyWord(regNext[i], slots.get(r.q));
+      if (xstate) copyWord(regNext[i] + 8, slots.get(r.q) + 8);
+    }
+    commitCode.push(OP.end);
+  }
   commitCode.push(OP.end);
   const commitBody = [...vec([]), ...commitCode];
 
-  // ---- step 本体 ----
+  // ---- step(domain) 本体 ----
   const stepBody = [
     ...vec([]),
     OP.call, ...uleb(F_EVAL),
+    OP.local_get, ...uleb(0),
     OP.call, ...uleb(F_COMMIT),
     OP.call, ...uleb(F_EVAL),
     OP.end,
   ];
 
-  // ---- run(n) 本体: eval → (commit → eval) × n ----
+  // ---- run(domain, n) 本体: eval → (commit → eval) × n ----
+  // local 0 = ドメイン番号、local 1 = 残り回数
   const runBody = [
     ...vec([]),
     OP.call, ...uleb(F_EVAL),
     OP.block, 0x40,
     OP.loop, 0x40,
-    OP.local_get, ...uleb(0),
+    OP.local_get, ...uleb(1),
     OP.i32_eqz,
     OP.br_if, ...uleb(1),
+    OP.local_get, ...uleb(0),
     OP.call, ...uleb(F_COMMIT),
     OP.call, ...uleb(F_EVAL),
-    OP.local_get, ...uleb(0),
+    OP.local_get, ...uleb(1),
     OP.i32_const, ...sleb(1),
     OP.i32_sub,
-    OP.local_set, ...uleb(0),
+    OP.local_set, ...uleb(1),
     OP.br, ...uleb(0),
     OP.end,
     OP.end,
@@ -289,8 +308,10 @@ export function emitWasm(netlist, order, layout) {
   const typeSec = section(1, vec([
     [0x60, ...uleb(0), ...uleb(0)],       // type 0: () -> ()
     [0x60, ...uleb(1), I32, ...uleb(0)],  // type 1: (i32) -> ()
+    [0x60, ...uleb(2), I32, I32, ...uleb(0)],  // type 2: (i32, i32) -> ()
   ]));
-  const funcSec = section(3, vec([[0], [0], [0], [1]].map((t) => [...uleb(t[0])])));
+  // eval: () -> ()、commit / step: (domain) -> ()、run: (domain, n) -> ()
+  const funcSec = section(3, vec([[0], [1], [1], [2]].map((t) => [...uleb(t[0])])));
   const memSec = section(5, vec([[0x00, ...uleb(layout.pages)]]));
   const exportSec = section(7, vec([
     [...encName('eval'), 0x00, ...uleb(F_EVAL)],

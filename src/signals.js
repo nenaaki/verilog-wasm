@@ -9,10 +9,34 @@ export const MASK64 = (1n << 64n) - 1n;
 const ALL_ONES = MASK64;
 
 export class SignalAccess {
-  constructor(signalTable, xstate = false) {
+  constructor(signalTable, xstate = false, clocks = []) {
     this.signalTable = signalTable;
     this.xstate = xstate;
+    /** クロックドメインの名前。posedge はクロック信号名、negedge は `~clk` */
+    this.clocks = clocks;
     this.byName = new Map(signalTable.map((s) => [s.name, s]));
+  }
+
+  /**
+   * `step()` / `commit()` / `run()` に渡すクロックの解決。
+   *
+   * **ドメインが 1 つなら名前は要らない**（これまでの `step()` がそのまま動く）。
+   * 2 つ以上あるときは、どれを叩くのか処理系の側では決めようがないので指定を求める
+   * ―― 時間を持たないモデルなので「どちらのエッジが先か」という答えが無い。
+   */
+  clockIndex(clock) {
+    if (clock === undefined || clock === null) {
+      if (this.clocks.length <= 1) return 0;
+      throw new Error(`クロックが ${this.clocks.length} 本あるので、どれを叩くか指定してください`
+        + ` (${this.clocks.join(' / ')})`);
+    }
+    if (typeof clock === 'number') {
+      if (clock >= 0 && clock < this.clocks.length) return clock;
+      throw new Error(`クロック番号 ${clock} は範囲外 (0〜${this.clocks.length - 1})`);
+    }
+    const i = this.clocks.indexOf(clock);
+    if (i < 0) throw new Error(`クロック '${clock}' は無い (${this.clocks.join(' / ') || 'クロック無し'})`);
+    return i;
   }
 
   /**

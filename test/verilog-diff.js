@@ -347,6 +347,83 @@ endmodule`;
     [{ name: 'a', w: 4 }, { name: 'b', w: 4 }], NOX_PAIRS, false);
 }
 
+// ============================================================ 複数クロック / 2 相
+//
+// **ここは本物と突き合わせる意味が大きい。** こちらは「ドメインを 1 つ叩く」という
+// モデルだが、Verilog は本物のクロック波形でエッジが起きる。同じ順番で叩けば
+// 同じ答えになるはず、というのが[クロックドメイン](../README.md#複数クロックと-2-相)の
+// 考え方そのものなので、それを外から確かめる。
+{
+  const src = `module mc(input c1, input c2, input [3:0] a, input [3:0] b,
+  output reg [3:0] q, output reg [3:0] r, output reg [3:0] s);
+  always @(posedge c1) q <= a + b;
+  always @(posedge c2) r <= q ^ b;      // 別ドメインの Q を読む
+  always @(negedge c1) s <= q;          // 2 相 (c1 の裏側)
+endmodule`;
+  // 叩く順番の台本。iverilog 側はクロック信号を上げ下げして同じ順番を作る
+  const script = [
+    ['c1', 'p'], ['c2', 'p'], ['c1', 'n'], ['c1', 'p'],
+    ['c2', 'p'], ['c1', 'n'], ['c1', 'p'], ['c1', 'n'],
+  ];
+  const OUTS = ['q', 'r', 's'];
+  const vals = [[3, 5], [9, 2], [15, 1], [4, 12], [7, 7], [0, 9], [11, 3], [6, 6]];
+
+  const lines = script.map(([clk, edge], i) => {
+    const [av, bv] = vals[i];
+    // posedge は 0→1、negedge は 1→0。c1 は 2 相なので上げ下げを台本どおりに刻む
+    const move = edge === 'p' ? `${clk}=1;` : `${clk}=0;`;
+    const back = clk === 'c2' ? ' c2=0;' : '';   // c2 は posedge しか使わないので毎回戻す
+    return `    a=4'd${av}; b=4'd${bv}; #1 ${move} #1 $display("%b %b %b", ${OUTS.join(', ')});${back} #1;`;
+  }).join('\n');
+
+  const tb = `${src}
+module tb;
+  reg c1, c2; reg [3:0] a, b;
+  wire [3:0] ${OUTS.join(', ')};
+  mc u(c1, c2, a, b, ${OUTS.join(', ')});
+  initial begin
+    c1 = 0; c2 = 0;
+${lines}
+  end
+endmodule`;
+  const vsrc = join(dir, 'mc.v');
+  const vout = join(dir, 'mc.vvp');
+  writeFileSync(vsrc, tb);
+  let rows;
+  try {
+    execFileSync(iverilog, ['-o', vout, vsrc], { stdio: 'pipe' });
+    rows = execFileSync(vvp, [vout], { encoding: 'utf8' }).trim().split('\n')
+      .map((l) => l.trim().split(/\s+/));
+  } catch (e) {
+    failures.push(`複数クロック: iverilog が失敗した — ${String(e.stderr ?? e.message).slice(0, 200)}`);
+    rows = null;
+  }
+  if (rows) {
+    // **4 値で回す。** 2 値だと initial の無いレジスタが 0 から始まり、
+    // まだ叩いていないドメインの Q が iverilog の x と食い違う
+    const sim = new RefSimulator(compile(src, { wat: false, xstate: true }));
+    sim.reset();
+    const bad = [];
+    let n = 0;
+    rows.forEach((cols, i) => {
+      const [clk, edge] = script[i];
+      const [av, bv] = vals[i];
+      sim.setInput('a', av).setInput('b', bv);
+      sim.step(edge === 'p' ? clk : `~${clk}`);
+      OUTS.forEach((p, k) => {
+        n++;
+        const want = cols[k];
+        const got = sim.getBits(p);
+        if (want !== got && bad.length < 3) {
+          bad.push(`${i} 回目 (${edge === 'p' ? 'posedge' : 'negedge'} ${clk}) ${p}: `
+            + `iverilog=${want} 自前=${got}`);
+        }
+      });
+    });
+    ok(bad.length === 0, `複数クロック / 2 相 (${n} 件)`, bad.join(' | '));
+  }
+}
+
 // ============================================================ ランダム回路
 //
 // **ここまでは「こちらが思いついた式」を並べていた。** それだと列挙から漏れたものが

@@ -2182,9 +2182,29 @@ export function elaborate(mod, all = [mod], opts = {}) {
   }
 
   // ---- 項目の処理 ----------------------------------------------------------
-  let clock = null;        // クロックのルートネット (buf をたどった先)
-  let clockName = null;    // エラー表示用の名前
-  let clockEdge = null;    // 'posedge' / 'negedge'。混ぜられるかどうかだけに使う
+  // ---- クロックドメイン ------------------------------------------------------
+  //
+  // **ドメイン = (クロックのネット, エッジの向き)。** この 1 つの決め方で、
+  // 複数クロックも 2 相も同じ形に収まる:
+  //
+  //   posedge clk だけ            … ドメイン 1 個 (これまでと同じ)
+  //   negedge clk だけ            … ドメイン 1 個 (posedge と区別が付かない)
+  //   posedge clk + negedge clk   … ドメイン 2 個 = 2 相
+  //   posedge clkA + posedge clkB … ドメイン 2 個 = 複数クロック
+  //
+  // どのドメインをいつ叩くかは**ホストが決める**。時間を持たないモデルなので、
+  // 「どのエッジが先か」を処理系の側で決める必要がない ―― step(ドメイン) を
+  // 呼ぶ順番がそのまま答えになる。
+  //
+  // 名前は posedge ならクロック信号名そのまま、negedge なら `~clk`。
+  const clockDomains = [];
+
+  function clockDomain(net, edge, sigName) {
+    const hit = clockDomains.findIndex((c) => c.net === net && c.edge === edge);
+    if (hit >= 0) return hit;
+    clockDomains.push({ net, edge, name: edge === 'posedge' ? sigName : `~${sigName}` });
+    return clockDomains.length - 1;
+  }
 
   function itemPass(mod, prefix, isTop, depth, stack) {
     for (const item of mod.items) runItem(item, mod, prefix, isTop, depth, stack);
@@ -2348,20 +2368,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
       // 階層をまたぐと親の clk と子の clk ポートは別ネットになるので、
       // buf をたどった元で同一性を見る
       const clkRoot = bufRoot(clk.bits[0]);
-      if (clock !== null && clock !== clkRoot) {
-        throw new CompileError(`複数クロックは未対応 ('${clockName}' と '${clk.name}')`, item.line);
-      }
-      // **向きは混ぜられない。** negedge だけの設計は posedge だけの設計と
-      // 区別が付かないので通るが、混ぜると 1 クロックの中に 2 つのエッジが要る
-      // (2 相) ので、step() = エッジ 1 個というモデルからはみ出す。
-      if (clockEdge !== null && clockEdge !== clkEdge) {
-        throw new CompileError(
-          `同じクロック '${clk.name}' に posedge と negedge を混ぜた 2 相の設計は未対応`
-          + ' (step() がクロックエッジそのものなので、全部を同じ向きで書けば通る)', item.line);
-      }
-      clock = clkRoot;
-      clockName = clk.name;
-      clockEdge = clkEdge;
+      const domain = clockDomain(clkRoot, clkEdge, clk.name);
       clk.isClock = true;
 
       // 文を上から順に辿り、レジスタの各ビットについて「次の値」を組み立てる。
@@ -2374,16 +2381,17 @@ export function elaborate(mod, all = [mod], opts = {}) {
       const touched = new Set([...next.keys(), ...(rstNext ? rstNext.keys() : [])]);
       for (const qn of touched) {
         const line = regLine.get(qn) ?? item.line;
-        setDriver(qn, `always @(posedge ${clockName})`, line);
+        setDriver(qn, `always @(${clkEdge} ${clk.name})`, line);
         const dNormal = next.get(qn) ?? qn;      // エッジでの次の値 (無ければ保持)
 
         if (rstCond === null) {
-          regs.push({ q: qn, d: dNormal, rst: null, rstD: null, qAsync: null, line });
+          regs.push({ q: qn, d: dNormal, rst: null, rstD: null, qAsync: null, domain, line });
           continue;
         }
         const rstD = rstNext.get(qn) ?? qn;      // リセットで触られないビットは保持
         regs.push({
           q: qn,
+          domain,
           // エッジでもリセットが優先する
           d: newGate('mux', [rstCond, rstD, dNormal]),
           rst: rstCond,
@@ -2555,7 +2563,7 @@ export function elaborate(mod, all = [mod], opts = {}) {
     gates,
     regs,
     signals,
-    clock,
+    clocks: clockDomains,
     portOrder: mod.portOrder,
     xstate,
     warnings: [

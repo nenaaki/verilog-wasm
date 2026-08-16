@@ -3777,12 +3777,6 @@ async function testErrors() {
     ['範囲外のビット選択',
       `module m(input [3:0] a, output y); assign y = a[7]; endmodule`,
       /宣言範囲/],
-    // negedge そのものは通る。断るのは向きを混ぜた 2 相だけ
-    ['posedge と negedge を混ぜられない',
-      `module m(input clk, a, b, output reg q, output reg r);
-       always @(posedge clk) q <= a;
-       always @(negedge clk) r <= b; endmodule`,
-      /posedge と negedge を混ぜた 2 相の設計は未対応/],
     ['非同期リセットの本体が if でない',
       `module m(input clk, rst, d, output reg q);
        always @(posedge clk or posedge rst) q <= d; endmodule`,
@@ -3791,11 +3785,6 @@ async function testErrors() {
       `module m(input clk, rst, c, d, output reg q);
        always @(posedge clk or posedge rst) if (c) q <= 1'b0; else q <= d; endmodule`,
       /どちらを見ているか決まらない/],
-    ['非同期リセット側でも向きは混ぜられない',
-      `module m(input clk, rst, d, e, output reg q, output reg r);
-       always @(negedge clk or posedge rst) if (rst) q <= 1'b0; else q <= d;
-       always @(posedge clk) r <= e; endmodule`,
-      /posedge と negedge を混ぜた 2 相の設計は未対応/],
     ['イベントが 3 つ',
       `module m(input clk, a, b, d, output reg q);
        always @(posedge clk or posedge a or posedge b) if (a) q <= 1'b0; else q <= d; endmodule`,
@@ -4319,6 +4308,101 @@ async function testRandomDiff() {
   ok(missing.length === 0, 'ランダム差分: 生成器が全構文を出している',
     `出ていない構文: ${missing.join(', ')} / 内訳 ${JSON.stringify(seen)}`);
   ok(!mismatch, `ランダム差分テスト (${designs} 回路 × 12 ベクタ)`, mismatch ?? '');
+}
+
+// --------------------------------------------- 複数クロック / 2 相
+//
+// **クロックドメイン = (クロックのネット, エッジの向き)。** この 1 つの決め方で
+// 複数クロックも 2 相も同じ形になる。どのドメインをいつ叩くかはホストが決めるので、
+// 「どちらのエッジが先か」を処理系の側で決める必要がない。
+async function testMultiClock() {
+  // ---- 複数クロック: 叩いたドメインのレジスタだけが動く ----
+  const two = `module m(input c1, input c2, input [3:0] a, input [3:0] b,
+    output reg [3:0] q, output reg [3:0] r);
+    always @(posedge c1) q <= a;
+    always @(posedge c2) r <= b;
+  endmodule`;
+  const ctwo = compile(two, { wat: false });
+  eqs(ctwo.netlist.clocks.map((c) => c.name).join(','), 'c1,c2', '複数クロック: ドメインが 2 つできる');
+
+  for (const sim of [await WasmSimulator.create(ctwo), new RefSimulator(ctwo)]) {
+    const kind = sim.constructor.name;
+    eqs(sim.clocks.join(','), 'c1,c2', `${kind} 複数クロック: 名前を出せる`);
+    sim.reset().setInput('a', 5).setInput('b', 9);
+
+    sim.step('c1');
+    eq(sim.get('q'), 5, `${kind} 複数クロック: c1 のレジスタが動く`);
+    eq(sim.get('r'), 0, `${kind} 複数クロック: c2 のレジスタは動かない`);
+    sim.step('c2');
+    eq(sim.get('r'), 9, `${kind} 複数クロック: c2 を叩けば動く`);
+
+    // 片方だけ何度も叩いても、もう片方は止まったまま
+    sim.setInput('a', 3).setInput('b', 12).run(4, 'c1');
+    eq(sim.get('q'), 3, `${kind} 複数クロック: run も片方だけ`);
+    eq(sim.get('r'), 9, `${kind} 複数クロック: もう片方は 4 クロック分止まったまま`);
+
+    // 番号でも指せる
+    sim.step(1);
+    eq(sim.get('r'), 12, `${kind} 複数クロック: 番号でも指せる`);
+
+    let caught = null;
+    try { sim.step(); } catch (e) { caught = e; }
+    ok(caught && /どれを叩くか指定してください/.test(caught.message),
+      `${kind} 複数クロック: 名前なしは断る`, caught ? caught.message : 'エラーにならなかった');
+  }
+
+  // ---- 2 相: 同じクロックの posedge と negedge が別ドメインになる ----
+  const phase = `module m(input clk, input [3:0] d, output reg [3:0] p, output reg [3:0] n);
+    always @(posedge clk) p <= d;
+    always @(negedge clk) n <= p;      // 前半で取り込んだ値を後半で受ける
+  endmodule`;
+  const cphase = compile(phase, { wat: false });
+  eqs(cphase.netlist.clocks.map((c) => c.name).join(','), 'clk,~clk',
+    '2 相: posedge と negedge が別ドメインになる');
+
+  for (const sim of [await WasmSimulator.create(cphase), new RefSimulator(cphase)]) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('d', 7);
+    sim.step('clk');
+    eq(sim.get('p'), 7, `${kind} 2 相: 立ち上がりで p が取り込む`);
+    eq(sim.get('n'), 0, `${kind} 2 相: n はまだ動かない`);
+    sim.step('~clk');
+    eq(sim.get('n'), 7, `${kind} 2 相: 立ち下がりで n が p を受ける`);
+
+    // 1 周期で 1 段ずつ進むパイプラインになる
+    sim.setInput('d', 2).step('clk').step('~clk');
+    eq(sim.get('p'), 2, `${kind} 2 相: 次の周期の前半`);
+    eq(sim.get('n'), 2, `${kind} 2 相: 後半で受け渡す`);
+  }
+
+  // ---- 単一クロックはこれまでどおり (名前を省ける・回路も変わらない) ----
+  const one = 'module m(input clk, input [3:0] d, output reg [3:0] q); always @(posedge clk) q <= d; endmodule';
+  const { all: ones } = await bothSims(one);
+  for (const sim of ones) {
+    const kind = sim.constructor.name;
+    eqs(sim.clocks.join(','), 'clk', `${kind} 単一クロック: ドメインは 1 つ`);
+    sim.reset().setInput('d', 6).step();
+    eq(sim.get('q'), 6, `${kind} 単一クロック: 名前なしの step が動く`);
+    sim.setInput('d', 1).run(3);
+    eq(sim.get('q'), 1, `${kind} 単一クロック: 名前なしの run も動く`);
+  }
+
+  // 非同期リセットもドメインごと。リセットは eval で効くので叩くドメインに関係ない
+  const rst = `module m(input c1, input c2, input rst, input [3:0] a, input [3:0] b,
+    output reg [3:0] q, output reg [3:0] r);
+    always @(posedge c1 or posedge rst) if (rst) q <= 4'hF; else q <= a;
+    always @(posedge c2) r <= b;
+  endmodule`;
+  const crst = compile(rst, { wat: false });
+  for (const sim of [await WasmSimulator.create(crst), new RefSimulator(crst)]) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('rst', 0).setInput('a', 3).setInput('b', 5);
+    sim.step('c1').step('c2');
+    eq(sim.get('q'), 3, `${kind} 複数クロック: 非同期リセット付きも動く`);
+    sim.setInput('rst', 1).eval();
+    eq(sim.get('q'), 0xF, `${kind} 複数クロック: リセットは eval だけで効く`);
+    eq(sim.get('r'), 5, `${kind} 複数クロック: 別ドメインのレジスタは触られない`);
+  }
 }
 
 // ------------------------------------------------------- x を値として扱う
@@ -5677,6 +5761,7 @@ const suites = [
   ['eval / commit の分離', testEvalCommit],
   ['エラー検出', testErrors],
   ['ランダム差分', testRandomDiff],
+  ['複数クロック / 2 相', testMultiClock],
   ['x を値として扱う', testXState],
   ['インスタンスの独立性', testInstanceIndependence],
   ['WAT 出力', testWat],

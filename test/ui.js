@@ -1763,7 +1763,12 @@ const probe = () => js(`document.getElementById('probeAll').getAttribute('aria-p
 const decls = () => js(`__verilog().split('\\n').filter(l => /^\\s+(wire|reg)\\s/.test(l)).join('/')`);
 const ports = () => js(`__verilog().split('\\n').filter(l => /^\\s+output/.test(l)).join('/')`);
 
+/** ツールバーの統計行から WASM のバイト数を読む */
+const wasmBytes = async () => Number(
+  (await js('document.getElementById(\'stats\').textContent')).match(/wasm=(\d+)B/)?.[1] ?? -1);
+
 ok(await probe() === 'true', '開発中: 既定は押されている', String(await probe()));
+const bytesOn = await wasmBytes();
 ok((await ports()).includes('n3'), '開発中: ON ならゲートの出力も output', await ports());
 ok(await decls() === '', '開発中: ON なら内部宣言は出ない', await decls());
 ok(await js('__nodeText("sum")') === 'sumE', '開発中: 9 + 5 = E', await js('__nodeText("sum")'));
@@ -1783,9 +1788,11 @@ const deadWires = () => js(`[...document.querySelectorAll('#gWires .wire')]
 ok(await deadWires() === 2, '開発中: OFF ではゲートが駆動する線が不明 (破線) になる',
   String(await deadWires()));
 ok(await js('__disabled("waveGates")'), '開発中: OFF では「内部の配線も出す」を止める');
-// 観測用のスロットが減るので WASM も小さくなる
-const smaller = await js(`document.getElementById('stats').textContent`);
-ok(/wasm=477B/.test(smaller), '開発中: OFF は観測用のスロットが減って小さくなる', smaller);
+// 観測用のスロットが減るので WASM も小さくなる。**バイト数を直に書かない** ――
+// コード生成が変わるたびに直すことになるし、見たいのは「減ったこと」なので
+const bytesOff = await wasmBytes();
+ok(bytesOff > 0 && bytesOff < bytesOn, '開発中: OFF は観測用のスロットが減って小さくなる',
+  `ON=${bytesOn}B OFF=${bytesOff}B`);
 
 // メモリは状態なのでスロットを持つ = OFF でも値が見える
 await js('__preset("クロックで反転する 1 ビットメモリ")');
