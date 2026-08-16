@@ -25,6 +25,7 @@ export function randomDesign(rng, nWires, opts = {}) {
   const pool = [{ n: 'a', w: 8 }, { n: 'b', w: 8 }, { n: 'c', w: 8 }];
   const lines = [];
   let inSub = false;         // 子モジュールの本体を組み立てている間だけ true
+  let dcKind = rng() < 0.5 ? 0 : 1;   // casez / casex を交互に出すための番号
 
   /** x を混ぜた 8 ビットのリテラル (4 値のときだけ) */
   const xLit = () => `8'b${[...Array(8)]
@@ -157,6 +158,24 @@ export function randomDesign(rng, nWires, opts = {}) {
   lines.push(`  wire signed [7:0] ws = ${expr(2)};`);
   pool.push({ n: 'ws', w: 8 });
 
+  // **パラメータで幅が決まる module を、違う幅で 3 回インスタンス化する。**
+  // ここが Verilog で一番込み入った 2 つ ―― 幅の規則と parameter ―― の交差点で、
+  // しかも「同じ module を別の幅で展開する」経路でもある
+  // (幅のキャッシュがインスタンスをまたぐと静かに壊れる所)。
+  //
+  // 中身は幅に効く形を集めてある: `[W-1:0]` の宣言、`2*W-1` の定数式、
+  // パラメータ境界の部分選択、`{W{…}}` の繰り返し連接、桁上げが 1 ビット残る加算、
+  // そしてリダクションを広い文脈に置く形。
+  //
+  // **プールに入れるのは早いうちに。** 後ろに置くと、式が組み上がった後になって
+  // ほとんど使われない (実際に 20 回路のうち 4 回路にしか届いていなかった)。
+  const widths = [1, 2, 3, 5, 8].sort(() => rng() - 0.5).slice(0, 3);
+  widths.forEach((w, i) => {
+    lines.push(`  wire [${w - 1}:0] pw${i};`);
+    lines.push(`  rndw #(.W(${w})) pw${i}_u(.p(${pick(pool).n}), .q(${pick(pool).n}), .r(pw${i}));`);
+    pool.push({ n: `pw${i}`, w });
+  });
+
   // **幅の違う wire をプールに入れる。** ここまでは全部 8 ビットで、幅が揃っていると
   // Verilog で一番込み入った所 ―― 自己決定幅と文脈幅の規則 ―― がほとんど動かない。
   // 狭いものと広いものを混ぜると、式のたびに切り詰めと拡張が起きる。
@@ -199,9 +218,11 @@ export function randomDesign(rng, nWires, opts = {}) {
       return `if (${expr(2)}) ${then}${els}`;
     }
     // 半分は casez / casex にして、ラベルの一部を don't care にする。
-    // casex は x も比較から外すので、同じ表を別の書き方で出せる
+    // casex は x も比較から外すので、同じ表を別の書き方で出せる。
+    // **どちらにするかは交互**にする ―― 毎回コインを投げると、don't care の case
+    // 自体が数個しか出ない回では片方が 1 度も現れないことがある (実際に起きた)
     if (rng() < 0.5) {
-      const kind = rng() < 0.5 ? 'casez' : 'casex';
+      const kind = dcKind++ % 2 === 0 ? 'casez' : 'casex';
       const dc = kind === 'casez' ? '?' : 'x';
       const arms = [`2'b0${dc}: begin ${stmt(depth - 1)} end`,
         `2'b1${dc}: begin ${stmt(depth - 1)} end`];
@@ -262,6 +283,18 @@ export function randomDesign(rng, nWires, opts = {}) {
   return `module rndsub #(parameter SH = 0) (input [7:0] p, input [7:0] q, output [7:0] r);
   localparam SH2 = SH + SH;
   assign r = (${subBody}) << SH2;
+endmodule
+
+// 幅がまるごとパラメータで決まる module。**同じものを違う W で何度も展開する**ので、
+// 幅の解決がインスタンスごとに独立していないと静かに壊れる
+module rndw #(parameter W = 4) (input [W-1:0] p, input [W-1:0] q, output [W-1:0] r);
+  localparam TOP = W - 1;
+  wire [W-1:0]   x1 = p ^ q;
+  wire [W:0]     x2 = p + q;          // 1 ビット広いので桁上げが残る
+  wire           x3 = ^x1;            // リダクション → 1 ビット
+  wire [2*W-1:0] x4 = {p, q};         // 連接 (幅は 2W)
+  wire [W-1:0]   x5 = {W{x3}};        // 繰り返し連接の回数がパラメータ
+  assign r = x3 ? x2[TOP:0] : (x4[W-1:0] | x5);
 endmodule
 
 module rnd(
