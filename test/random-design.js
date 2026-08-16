@@ -21,7 +21,8 @@ export function makeRng(seed) {
  */
 export function randomDesign(rng, nWires, opts = {}) {
   const pick = (arr) => arr[Math.floor(rng() * arr.length)];
-  const pool = ['a', 'b', 'c'];
+  // プールは { n: 名前, w: 幅 }。幅を持ち歩くのは添字を範囲内に収めるため
+  const pool = [{ n: 'a', w: 8 }, { n: 'b', w: 8 }, { n: 'c', w: 8 }];
   const lines = [];
   let inSub = false;         // 子モジュールの本体を組み立てている間だけ true
 
@@ -34,23 +35,33 @@ export function randomDesign(rng, nWires, opts = {}) {
     if (depth <= 0 || r < 0.25) {
       const s = pick(pool);
       const k = rng();
-      if (k < 0.2) return `${s}[${Math.floor(rng() * 8)}]`;
+      // **幅はプールが持っている。** 添字を幅の外に出すとコンパイルエラーになるし、
+      // 幅の混ざった式こそ Verilog の「自己決定幅 / 文脈幅」を突ける所なので、
+      // 信号ごとの幅を追いかける (実際に幅の文脈のバグがここから出た)
+      if (k < 0.2) return `${s.n}[${Math.floor(rng() * s.w)}]`;
       if (k < 0.35) {
-        const hi = Math.floor(rng() * 8);
+        const hi = Math.floor(rng() * s.w);
         const lo = Math.floor(rng() * (hi + 1));
-        return `${s}[${hi}:${lo}]`;
+        return `${s.n}[${hi}:${lo}]`;
       }
-      if (k < 0.45) return `8'h${Math.floor(rng() * 256).toString(16)}`;
+      if (k < 0.42) return `8'h${Math.floor(rng() * 256).toString(16)}`;
+      // 幅の違うリテラルも混ぜる (文脈幅の配られ方が変わる)
+      if (k < 0.47) { const w = 1 + Math.floor(rng() * 12); return `${w}'d${Math.floor(rng() * 4)}`; }
       if (k < 0.5) return `1'b${Math.floor(rng() * 2)}`;
       // x を値として書いたリテラル (4 値のときだけ)
       if (opts.xstate && k < 0.56) return xLit();
-      return s;
+      return s.n;
     }
     if (r < 0.37) return `(~${expr(depth - 1)})`;
     if (r < 0.4) {
-      // 乗除算。回路が他より一桁大きいので、右辺は葉に留めて深追いしない
+      // 乗除算。回路が他より一桁大きいので、右辺は葉に留めて深追いしない。
+      // **2 値と本物を比べるときは除数が 0 にならないようにする** ―― 0 除算は
+      // 2 値では「回路が出す値」(全ビット 1)、Verilog では x で、意図して違う
+      // (4 値では揃うので、そのときは 0 も通す)
       const md = ['*', '/', '%'][Math.floor(rng() * 3)];
-      return `(${expr(depth - 1)} ${md} ${expr(0)})`;
+      const rhs = expr(0);
+      const safe = md !== '*' && opts.avoidDivZero ? `(${rhs} | 8'h1)` : rhs;
+      return `(${expr(depth - 1)} ${md} ${safe})`;
     }
     if (r < 0.52) return `(${expr(depth - 1)} & ${expr(depth - 1)})`;
     if (r < 0.62) return `(${expr(depth - 1)} | ${expr(depth - 1)})`;
@@ -126,7 +137,7 @@ export function randomDesign(rng, nWires, opts = {}) {
   lines.push('      assign wg[gi] = t & c[gi];');
   lines.push('    end');
   lines.push('  end');
-  pool.push('wg');
+  pool.push({ n: 'wg', w: 8 });
 
   // 組合せ always を 1 本。ブロッキング代入と「既定値 → 分岐で上書き」を差分に通す。
   // 読むのは入力だけなので、pool に入れても組合せループにはならない
@@ -139,23 +150,32 @@ export function randomDesign(rng, nWires, opts = {}) {
   lines.push("    else if (c[1]) rc[3:0] = 4'hF;");
   lines.push('  end');
   lines.push('  assign rout5 = rc;');
-  pool.push('rc');
+  pool.push({ n: 'rc', w: 8 });
 
   // signed の wire を 1 本プールに入れる。これが式に混ざると符号拡張・符号付きの
   // 比較・除算・算術右シフトの経路に入る (混ざらない式は符号なしのまま)
   lines.push(`  wire signed [7:0] ws = ${expr(2)};`);
-  pool.push('ws');
+  pool.push({ n: 'ws', w: 8 });
+
+  // **幅の違う wire をプールに入れる。** ここまでは全部 8 ビットで、幅が揃っていると
+  // Verilog で一番込み入った所 ―― 自己決定幅と文脈幅の規則 ―― がほとんど動かない。
+  // 狭いものと広いものを混ぜると、式のたびに切り詰めと拡張が起きる。
+  // 1 ビットは「リダクションやビット選択の結果を広い文脈に置く」形を作りやすい
+  for (const w of [1, 3, 5, 12]) {
+    lines.push(`  wire [${w - 1}:0] n${w} = ${expr(2)};`);
+    pool.push({ n: `n${w}`, w });
+  }
 
   for (let i = 0; i < nWires; i++) {
     // 半分は宣言と同時に代入する (assign に分けたのと同じ回路になるはず)
     if (rng() < 0.5) lines.push(`  wire [7:0] w${i} = ${expr(3)};`);
     else { lines.push(`  wire [7:0] w${i};`); lines.push(`  assign w${i} = ${expr(3)};`); }
-    pool.push(`w${i}`);
+    pool.push({ n: `w${i}`, w: 8 });
   }
 
   // レジスタ (状態) も混ぜる。r は pool に入れて組合せ側からも参照させる
   lines.unshift('  reg [7:0] r;');
-  pool.push('r');
+  pool.push({ n: 'r', w: 8 });
   const regExpr = expr(3);
   lines.push(`  always @(posedge clk) r <= ${regExpr};`);
 
@@ -209,11 +229,21 @@ export function randomDesign(rng, nWires, opts = {}) {
   lines.push(`  assign rout3 = r3;`);
   lines.push(`  assign rout4 = subOut ^ subOut2;`);
 
+  // **2 値と本物を突き合わせるときは、レジスタに初期値を与える。**
+  // 2 値には x が無いので `initial` の無いレジスタは 0 から始まるが、Verilog は
+  // x から始まる。しかも `r <= r ^ …` のように自分を読むレジスタだと x が消えないので、
+  // クロックを空打ちしても揃わない。両方を同じ所から始めるには初期値が要る。
+  if (opts.seedRegs) {
+    for (const name of ['r', 'r2', 'r3']) {
+      lines.push(`  initial ${name} = 8'h${Math.floor(rng() * 256).toString(16).padStart(2, '0')};`);
+    }
+  }
+
   // 部品を 1 個インスタンス化する。境界をまたぐ buf と平坦化を差分テストに通す。
   // 子の中身は自分のポートだけで書く必要があるので、プールを一時的に差し替える
   const parentPool = [...pool];
   pool.length = 0;
-  pool.push('p', 'q');
+  pool.push({ n: 'p', w: 8 }, { n: 'q', w: 8 });
   inSub = true;
   const subBody = expr(2);
   inSub = false;
@@ -223,9 +253,9 @@ export function randomDesign(rng, nWires, opts = {}) {
   // パラメータ付きで 2 回インスタンス化して、同じ module が別の幅で展開されるのを見る
   const shiftBy = 1 + Math.floor(rng() * 4);
   lines.push(`  wire [7:0] subOut, subOut2;`);
-  lines.push(`  rndsub s0(.p(${pick(pool)}), .q(${pick(pool)}), .r(subOut));`);
-  lines.push(`  rndsub #(.SH(${shiftBy})) s1(.p(${pick(pool)}), .q(${pick(pool)}), .r(subOut2));`);
-  pool.push('subOut', 'subOut2');
+  lines.push(`  rndsub s0(.p(${pick(pool).n}), .q(${pick(pool).n}), .r(subOut));`);
+  lines.push(`  rndsub #(.SH(${shiftBy})) s1(.p(${pick(pool).n}), .q(${pick(pool).n}), .r(subOut2));`);
+  pool.push({ n: 'subOut', w: 8 }, { n: 'subOut2', w: 8 });
 
   lines.push(`  assign y = ${expr(3)};`);
 

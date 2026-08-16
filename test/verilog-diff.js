@@ -84,8 +84,15 @@ endmodule`;
     .map((l) => l.trim().split(/\s+/));
 }
 
-/** 同じソース・同じベクタを自前の 4 値評価に通して、iverilog と 1 件ずつ比べる */
-function compare(label, name, src, ports, inputs, vectors) {
+/**
+ * 同じソース・同じベクタを自前の評価に通して、iverilog と 1 件ずつ比べる。
+ *
+ * `xstate` を落とすと**既定の 2 値モード**を見る。こちらでしか動かない仕組みが
+ * あるので、4 値だけ見ていても守れない ―― 恒等式の畳み込み (`a & ~a = 0`) や
+ * mux の畳み込みは、4 値では成り立たないので**わざと無効にしてある**。
+ * 入力から `x` を抜けば同じソースをそのまま流せる。
+ */
+function compare(label, name, src, ports, inputs, vectors, xstate = true) {
   let rows;
   try {
     rows = runIverilog(name, src, ports, inputs, vectors);
@@ -93,7 +100,7 @@ function compare(label, name, src, ports, inputs, vectors) {
     failures.push(`${label}: iverilog が失敗した — ${String(e.stderr ?? e.message).slice(0, 200)}`);
     return;
   }
-  const sim = new RefSimulator(compile(src, { wat: false, xstate: true }));
+  const sim = new RefSimulator(compile(src, { wat: false, xstate }));
   const bad = [];
   let n = 0;
   for (const cols of rows) {
@@ -293,6 +300,53 @@ endmodule`;
     [{ name: 'd', w: 4 }, { name: 'e', w: 4 }], vecs);
 }
 
+// ============================================================ 2 値モード
+//
+// **ここが実際に使われるモード**で、しかも 4 値では見えない仕組みが動いている。
+// 恒等式の畳み込みと mux の畳み込みは 4 値だと成り立たないので無効にしてあり、
+// [定数畳み込みと CSE](../README.md) もこちらでしか本気で効かない。
+// 入力から `x` を抜いて同じ突き合わせをやる。
+const NOX = PATS.filter((p) => !p.includes('x'));
+const NOX_PAIRS = [];
+for (const a of NOX) for (const b of NOX) NOX_PAIRS.push([a, b]);
+
+{
+  // 演算子の全表を 2 値でもう一度。0 除算だけは 2 値の仕様が違う (全ビット 1) ので外す
+  const ops2 = OPS.filter(([n]) => n !== 'div' && n !== 'mod');
+  const ports = ops2.map(([n, , w]) => ({ name: n, w }));
+  const src = `module ops2(input [3:0] a, input [3:0] b, ${
+    ports.map((p) => `output ${p.w > 1 ? `[${p.w - 1}:0] ` : ''}${p.name}`).join(', ')});
+${ops2.map(([n, e]) => `  assign ${n} = ${e};`).join('\n')}
+endmodule`;
+  compare('2 値: 演算子の全表', 'ops2', src, ports,
+    [{ name: 'a', w: 4 }, { name: 'b', w: 4 }], NOX_PAIRS, false);
+}
+
+{
+  // **畳み込みが効く形だけを集めた回路。** ここは 2 値でしか動かない経路なので、
+  // 4 値の突き合わせでは 1 度も通っていなかった
+  const FOLDS = [
+    ['andInv', 'a & ~a', 4], ['orInv', 'a | ~a', 4], ['xorSelf', 'a ^ a', 4],
+    ['andSelf', 'a & a', 4], ['muxSame', 'b[0] ? a : a', 4],
+    ['muxOne', 'b[0] ? 4\'hF : 4\'h0', 4], ['muxZero', 'b[0] ? 4\'h0 : 4\'hF', 4],
+    // 選択信号そのもの / その反転が枝に来る形 (README が「除算が 4 倍変わる」と書いている畳み込み)
+    ['selSelf', 'b[0] ? b[0] : a[0]', 1], ['selZero', 'b[0] ? a[0] : b[0]', 1],
+    ['selInvA', '~b[0] ? a[0] : b[0]', 1], ['selInvB', 'b[0] ? a[0] : ~b[0]', 1],
+    ['notNot', '~(~a)', 4],
+    // 定数側が畳まれる算術
+    ['mulPow2', 'a * 4\'d4', 4], ['mulConst', 'a * 4\'d10', 4],
+    ['divConst', 'a / 4\'d3', 4], ['shiftConst', 'a << 2', 4],
+    ['unsized', 'a + 1', 4], ['unsizedShift', 'a >> (8 - b[1:0])', 4],
+  ];
+  const ports = FOLDS.map(([n, , w]) => ({ name: n, w }));
+  const src = `module folds(input [3:0] a, input [3:0] b, ${
+    ports.map((p) => `output ${p.w > 1 ? `[${p.w - 1}:0] ` : ''}${p.name}`).join(', ')});
+${FOLDS.map(([n, e]) => `  assign ${n} = ${e};`).join('\n')}
+endmodule`;
+  compare('2 値: 畳み込みが効く形', 'folds', src, ports,
+    [{ name: 'a', w: 4 }, { name: 'b', w: 4 }], NOX_PAIRS, false);
+}
+
 // ============================================================ ランダム回路
 //
 // **ここまでは「こちらが思いついた式」を並べていた。** それだと列挙から漏れたものが
@@ -320,9 +374,12 @@ endmodule`;
   const bad = [];
   let checked = 0;
 
-  for (let d = 0; d < 8; d++) {
-    const src = randomDesign(rng, 5, { xstate: true });
-    const vectors = [...Array(6)].map(() => IN.map((i) => pat(i.w, i.name !== 'rst')));
+  for (let d = 0; d < 24; d++) {
+    // **半分は 2 値で回す。** 畳み込みと CSE はそちらでしか動かないので、
+    // 4 値だけ見ていても守れない。2 値のときは入力から x を抜く
+    const xstate = d % 2 === 0;
+    const src = randomDesign(rng, 5, { xstate, seedRegs: !xstate, avoidDivZero: !xstate });
+    const vectors = [...Array(6)].map(() => IN.map((i) => pat(i.w, xstate && i.name !== 'rst')));
 
     const fmt = OUT.map(() => ' %b').join('');
     const args = OUT.map((p) => p.name).join(', ');
@@ -355,7 +412,7 @@ endmodule`;
     }
     designs++;
 
-    const sim = new RefSimulator(compile(src, { wat: false, xstate: true }));
+    const sim = new RefSimulator(compile(src, { wat: false, xstate }));
     sim.reset();
     for (const cols of rows) {
       const [phase, ...rest] = cols;
@@ -376,8 +433,8 @@ endmodule`;
       });
     }
   }
-  ok(designs === 8, 'ランダム回路: 8 個すべて iverilog が受け付けた', `通ったのは ${designs} 個`);
-  ok(bad.length === 0, `ランダム回路 (${designs} 個 × 6 ベクタ × 2 点 = ${checked} 件)`, bad.join('\n---\n'));
+  ok(designs === 24, 'ランダム回路: 24 個すべて iverilog が受け付けた', `通ったのは ${designs} 個`);
+  ok(bad.length === 0, `ランダム回路 (${designs} 個 = 4 値 12 + 2 値 12、× 6 ベクタ × 2 点 = ${checked} 件)`, bad.join('\n---\n'));
 }
 
 // ------------------------------------------------------------------ 結果
