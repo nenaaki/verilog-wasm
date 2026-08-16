@@ -19,7 +19,9 @@ if (argv.length === 0 || argv.includes('-h') || argv.includes('--help')) {
   -o <file>        .wasm を書き出す
   --top <name>     トップモジュールを指定
   --run <n>        n クロック実行して波形を表示
-  --set <sig>=<v>  入力 (または reg の初期値) を設定。複数指定可
+  --set <sig>=<v>  入力 (または reg の初期値) を設定。複数指定可。値に x を混ぜた
+                   ビット文字列も書ける (--xstate のとき。例: --set d=01x1)
+  --xstate         x を値として扱う 4 値モード (未駆動と initial 無しのレジスタが x)
 `);
   process.exit(argv.length === 0 ? 1 : 0);
 }
@@ -34,7 +36,7 @@ const values = (n) => argv.map((a, i) => (a === n ? argv[i + 1] : null)).filter(
 
 try {
   const src = readFileSync(file, 'utf8');
-  const compiled = compile(src, { top: value('--top') });
+  const compiled = compile(src, { top: value('--top'), xstate: flag('--xstate') });
 
   const s = compiled.stats;
   console.error(`${compiled.top}: nets=${s.nets} gates=${s.gates}`
@@ -55,7 +57,8 @@ try {
     const sim = await WasmSimulator.create(compiled);
     for (const pair of values('--set')) {
       const [name, v] = pair.split('=');
-      sim.setInput(name, BigInt(v));
+      // x を混ぜたビット文字列はそのまま渡す (SignalAccess が振り分ける)
+      sim.setInput(name, /[xX]/.test(v) ? v : BigInt(v));
     }
 
     sim.eval(); // 初期入力に対する組合せ出力を確定させる
@@ -64,7 +67,7 @@ try {
     console.log(['cyc'.padStart(4), ...cols.map((t) => t.name.padStart(w(t)))].join(' | '));
     console.log(['-'.repeat(4), ...cols.map((t) => '-'.repeat(w(t)))].join('-+-'));
     for (let i = 0; i <= Number(cycles); i++) {
-      const row = cols.map((t) => bits(sim.get(t.name), t.width).padStart(w(t)));
+      const row = cols.map((t) => sim.getBits(t.name).padStart(w(t)));
       console.log([String(i).padStart(4), ...row].join(' | '));
       if (i < Number(cycles)) sim.step();
     }

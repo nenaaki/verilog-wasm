@@ -5,44 +5,86 @@
 // 離れた場所に出るため、この比較対象があるかどうかで開発効率が段違いになる。
 
 import { SignalAccess, MASK64 } from './signals.js';
+import { evalGate } from './fourstate.js';
 
 export class RefSimulator extends SignalAccess {
   constructor(compiled) {
-    super(compiled.layout.signalTable);
+    super(compiled.layout.signalTable, !!compiled.layout.xstate);
     this.netlist = compiled.netlist;
     this.order = compiled.order;
     this.layout = compiled.layout;
 
     this.values = new Array(this.netlist.nets.length).fill(0n);
+    // 4 値のときの「不定の面」。2 値では触らない (src/fourstate.js の符号化)
+    this.unknown = new Array(this.netlist.nets.length).fill(0n);
     // レジスタごとの次状態 (WASM 側の専用 next スロットに対応)
     this.next = new Array(this.netlist.regs.length).fill(0n);
+    this.nextX = new Array(this.netlist.regs.length).fill(0n);
 
-    // オフセット → ネット ID の逆引き (SignalAccess はオフセットで話すため)
+    // オフセット → ネット ID の逆引き (SignalAccess はオフセットで話すため)。
+    // 4 値では 8 バイト後ろが不定の面なので、そちらも同じ表に載せる
     this.netOfOffset = new Map();
-    for (const [netId, off] of this.layout.slots) this.netOfOffset.set(off, netId);
+    this.xOfOffset = new Map();
+    for (const [netId, off] of this.layout.slots) {
+      this.netOfOffset.set(off, netId);
+      if (this.xstate) this.xOfOffset.set(off + 8, netId);
+    }
 
     // WASM 側はデータセグメントで初期状態が入るので、こちらも同じ所から始める
     this.reset();
   }
 
   readWord(offset) {
+    if (this.xOfOffset.has(offset)) return this.unknown[this.xOfOffset.get(offset)] & MASK64;
     return this.values[this.netOfOffset.get(offset)] & MASK64;
   }
 
   writeWord(offset, value) {
-    this.values[this.netOfOffset.get(offset)] = BigInt(value) & MASK64;
+    const v = BigInt(value) & MASK64;
+    if (this.xOfOffset.has(offset)) this.unknown[this.xOfOffset.get(offset)] = v;
+    else this.values[this.netOfOffset.get(offset)] = v;
   }
 
   /** 全状態を電源投入時に戻す (initial を書いていなければゼロクリア) */
   reset() {
     this.values.fill(0n);
+    this.unknown.fill(0n);
     this.next.fill(0n);
+    this.nextX.fill(0n);
     for (const [off, v] of this.layout.initWords) this.writeWord(off, v);
     return this;
   }
 
   /** 組合せ論理だけを評価する (クロックは打たない) */
   eval() {
+    return this.xstate ? this._eval4() : this._eval2();
+  }
+
+  /**
+   * 4 値の評価。式は src/fourstate.js に 1 箇所だけ書いてあり、WASM 側も
+   * 同じものをなぞる。**2 つが食い違っていないことはランダム差分テストが見る。**
+   */
+  _eval4() {
+    const { gates, regs } = this.netlist;
+    const v = this.values;
+    const u = this.unknown;
+    const planeOf = (n) => ({ v: v[n], u: u[n] });
+
+    for (const gi of this.order) {
+      const g = gates[gi];
+      const r = evalGate(g.op, g.in.map(planeOf), g.value);
+      v[g.out] = r.v & MASK64;
+      u[g.out] = r.u & MASK64;
+    }
+
+    regs.forEach((rg, i) => { this.next[i] = v[rg.d]; this.nextX[i] = u[rg.d]; });
+    for (const rg of regs) {
+      if (rg.qAsync != null && rg.qAsync !== rg.q) { v[rg.q] = v[rg.qAsync]; u[rg.q] = u[rg.qAsync]; }
+    }
+    return this;
+  }
+
+  _eval2() {
     const { gates, regs } = this.netlist;
     const v = this.values;
 
@@ -80,7 +122,10 @@ export class RefSimulator extends SignalAccess {
   /** クロックエッジ: 次状態を Q に一括転送する */
   commit() {
     const { regs } = this.netlist;
-    regs.forEach((rg, i) => { this.values[rg.q] = this.next[i]; });
+    regs.forEach((rg, i) => {
+      this.values[rg.q] = this.next[i];
+      if (this.xstate) this.unknown[rg.q] = this.nextX[i];
+    });
     return this;
   }
 

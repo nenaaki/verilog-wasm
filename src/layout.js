@@ -19,13 +19,18 @@ const ALL_ONES = (1n << 64n) - 1n;      // 64 レーンすべてを 1 にする�
 
 export function buildLayout(netlist) {
   const { signals, regs } = netlist;
+  const xstate = !!netlist.xstate;
+  // 4 値のときは 1 ネットが「値の面」と「不定の面」の 2 ワードになる。
+  // **不定の面は必ず値の面の 8 バイト後ろ**に置くので、オフセットの表は 1 本で済む
+  // (src/fourstate.js の符号化を参照)。
+  const SLOT = xstate ? 16 : 8;
   const slots = new Map();
   let offset = 0;
 
   const assign = (netId) => {
     if (!slots.has(netId)) {
       slots.set(netId, offset);
-      offset += 8;
+      offset += SLOT;
     }
   };
 
@@ -45,7 +50,7 @@ export function buildLayout(netlist) {
   // レジスタごとの専用 next スロット (エイリアスさせない)
   const regNext = regs.map(() => {
     const off = offset;
-    offset += 8;
+    offset += SLOT;
     return off;
   });
 
@@ -64,15 +69,23 @@ export function buildLayout(netlist) {
 
   // initial で置いた電源投入時の値。1 のビットは 64 レーン全部を 1 にする
   // (setInput と同じブロードキャスト)。0 のビットはメモリの既定値のままなので出さない。
+  //
+  // **4 値では「initial を書いていないレジスタ」が x から始まる。** 電源投入時に
+  // 値が決まっていないのはそのとおりで、リセットの書き忘れがそのまま x として
+  // 出力に出てくる。不定の面 (値の面 + 8) を 1 で埋めるだけで表せる。
+  // **`init` が 0 なのと「initial を書いていない」のを取り違えないこと。**
+  // 前者は「電源投入時は 0」で、後者だけが x になる (r.init は書いたときだけ入る)。
   const initWords = [];
   for (const r of regs) {
     if (r.init) initWords.push([slots.get(r.q), ALL_ONES]);
+    else if (xstate && r.init === undefined) initWords.push([slots.get(r.q) + 8, ALL_ONES]);
   }
 
   return {
     slots,
     regNext,
     initWords,
+    xstate,
     byteSize: offset,
     pages: Math.max(1, Math.ceil(offset / 65536)),
     inputNets,

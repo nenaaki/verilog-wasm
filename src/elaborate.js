@@ -38,9 +38,12 @@ const DONT_CARE_MSG = {
   x: 'x は casex のラベルでしか使えない (値としての x は扱わない)',
 };
 
-/** 比較しない桁が「そこに書けない場所」に出ていないか。x を先に見て理由を分ける */
-function checkNoDontCare(e) {
-  if (e.xmask) throw new CompileError(DONT_CARE_MSG.x, e.line);
+/**
+ * 比較しない桁が「そこに書けない場所」に出ていないか。x を先に見て理由を分ける。
+ * 4 値なら x は値として書けるので、断るのは z だけになる。
+ */
+function checkNoDontCare(e, xstate = false) {
+  if (e.xmask && !xstate) throw new CompileError(DONT_CARE_MSG.x, e.line);
   if (e.mask) throw new CompileError(DONT_CARE_MSG.z, e.line);
 }
 
@@ -48,7 +51,9 @@ function checkNoDontCare(e) {
  * @param {object} mod    top にする module の AST
  * @param {object[]} [all] インスタンス解決に使う module 一覧 (省略時は階層なし)
  */
-export function elaborate(mod, all = [mod]) {
+export function elaborate(mod, all = [mod], opts = {}) {
+  // 4 値 (0 / 1 / x) で評価するか。既定は 2 値のまま (README「x を値として扱う」参照)
+  const xstate = !!opts.xstate;
   const modules = new Map(all.map((m) => [m.name, m]));
   const instanceNames = new Set();
   const nets = [];
@@ -69,6 +74,14 @@ export function elaborate(mod, all = [mod]) {
   gates.push({ op: 'const', value: 1, out: CONST1, in: [] });
   drivers.set(CONST0, '定数');
   drivers.set(CONST1, '定数');
+
+  // 不定の定数。**4 値のときだけ作る** ―― 2 値のときに 1 本増やすと、
+  // 「同じ意味の書き方どうしでネット数・ゲート数が一致する」主張が全部ずれる
+  const CONSTX = xstate ? newNet('$constx') : null;
+  if (xstate) {
+    gates.push({ op: 'const', value: 'x', out: CONSTX, in: [] });
+    drivers.set(CONSTX, '定数');
+  }
 
   const setDriver = (netId, what, line) => {
     const prev = drivers.get(netId);
@@ -99,8 +112,22 @@ export function elaborate(mod, all = [mod]) {
     return !!(gb && gb.op === 'not' && gb.in[0] === a);
   }
 
+  // 4 値だと成り立たなくなる畳み込みがある。x を値として持つと
+  //   x & ~x = x    x | ~x = x    x ^ x = x
+  // になるので、**「同じ信号どうし」「互いの反転どうし」を定数に畳む規則だけ**を止める。
+  // 定数を相手にする規則 (a & 0 = 0 など) は 4 値でもそのまま成り立つので残す。
+  const foldsIdentity = !xstate;
+
   /** たためたら結果のネット ID、たためなければ null */
   function fold(op, ins) {
+    if (op === 'isx') {
+      // 定数なら「x か」は展開時に決まる。`a === 4'bxx01` のようにリテラルと
+      // 比べる形はこれで半分が消えるので、比較器がだいぶ小さくなる
+      const [a] = ins;
+      if (a === CONST0 || a === CONST1) return CONST0;
+      if (a === CONSTX) return CONST1;
+      return null;
+    }
     if (op === 'not') {
       const [a] = ins;
       if (a === CONST0) return CONST1;
@@ -114,20 +141,23 @@ export function elaborate(mod, all = [mod]) {
       if (a === CONST0 || b === CONST0) return CONST0;
       if (a === CONST1) return b;
       if (b === CONST1) return a;
-      if (a === b) return a;                           // x & x = x
-      return isInverseOf(a, b) ? CONST0 : null;        // x & ~x = 0
+      if (a === b) return a;                           // x & x = x (4 値でも成り立つ)
+      // x & ~x = 0 は 4 値では成り立たない (x のときは x)
+      return foldsIdentity && isInverseOf(a, b) ? CONST0 : null;
     }
     if (op === 'or') {
       const [a, b] = ins;
       if (a === CONST1 || b === CONST1) return CONST1;
       if (a === CONST0) return b;
       if (b === CONST0) return a;
-      if (a === b) return a;                           // x | x = x
-      return isInverseOf(a, b) ? CONST1 : null;        // x | ~x = 1
+      if (a === b) return a;                           // x | x = x (4 値でも成り立つ)
+      // x | ~x = 1 も 4 値では成り立たない
+      return foldsIdentity && isInverseOf(a, b) ? CONST1 : null;
     }
     if (op === 'xor') {
       const [a, b] = ins;
-      if (a === b) return CONST0;                      // x ^ x = 0
+      // x ^ x = 0 は 4 値では成り立たない (x のときは x)
+      if (foldsIdentity && a === b) return CONST0;
       if (a === CONST0) return b;
       if (b === CONST0) return a;
       if (a === CONST1) return newGate('not', [b]);    // 1 ^ x = ~x
@@ -143,7 +173,12 @@ export function elaborate(mod, all = [mod]) {
       if (a === CONST0 && b === CONST1) return newGate('not', [s]);
       // 選ばれる側が選択信号そのもの / その反転なら、その枝の値は定数に決まる。
       // 割り算の剰余の上位ビットがちょうどこの形 (s ? ~s : 0) になり、
-      // これを畳めるかどうかで非サイズリテラルの除算が 4 倍変わる
+      // これを畳めるかどうかで非サイズリテラルの除算が 4 倍変わる。
+      //
+      // **4 値では成り立たない。** 「選択が x でも両枝が同じ確実な値なら決まる」の
+      // 規則があるので、選択そのものを枝に置いた形は畳めない
+      // (s が x のとき mux(s, s, 1) は x だが、s | 1 は 1 になってしまう)。
+      if (!foldsIdentity) return null;
       if (a === s) return newGate('or', [s, b]);       // s ? 1 : b = s | b
       if (b === s) return newGate('and', [s, a]);      // s ? a : 0 = s & a
       if (isInverseOf(s, a)) return newGate('and', [a, b]);   // s ? 0 : b = ~s & b
@@ -233,6 +268,11 @@ export function elaborate(mod, all = [mod]) {
     const bool = (b) => (b ? 1n : 0n);
     switch (e.type) {
       case 'num': {
+        // 定数式は幅を持たない整数なので、4 値でも x は置けない
+        if (e.xmask && xstate) {
+          throw new CompileError(
+            '定数式に x は書けない (幅を持たない整数として計算するため)', e.line);
+        }
         checkNoDontCare(e);
         const v = e.bits & ((1n << BigInt(e.width)) - 1n);   // 自分の幅で切る
         // signed なら最上位ビットが符号。以降は幅を持たない整数として扱う
@@ -278,8 +318,9 @@ export function elaborate(mod, all = [mod]) {
           case '&': return a & b;
           case '|': return a | b;
           case '^': return a ^ b;
-          case '==': return bool(a === b);
-          case '!=': return bool(a !== b);
+          // 定数式に x は無いので === は == と同じもの
+          case '==': case '===': return bool(a === b);
+          case '!=': case '!==': return bool(a !== b);
           case '<': return bool(a < b);
           case '<=': return bool(a <= b);
           case '>': return bool(a > b);
@@ -762,6 +803,9 @@ export function elaborate(mod, all = [mod]) {
     // matchLabel / evalExpr と同じ伸ばし方をなぞる。don't care の桁は広がらないので、
     // 自分の幅より上は必ず「比較する」側に入る
     const dc = dontCareMask(label, kind);
+    // 4 値で「値としての x」を書いたラベルは (値, 比較する桁) に落とせないので見送る。
+    // 落とせないものは飲み込む側からも飲み込まれる側からも外す約束なので嘘は増えない
+    if (label.xmask & ~dc) return null;
     const w = BigInt(label.width);
     const raw = label.bits & ((1n << w) - 1n);
     const fill = cs && label.signed && ((raw >> (w - 1n)) & 1n) === 1n;
@@ -847,17 +891,32 @@ export function elaborate(mod, all = [mod]) {
    */
   function matchLabel(sel, label, cw, kind, signed) {
     const mask = dontCareMask(label, kind);
-    if (!mask) return equalBits(sel, evalExpr(label, cw, signed), '==')[0];
-    // don't care を落としたリテラルとして評価する (その桁には 0 が入っている)
-    const bits = evalExpr({ ...label, mask: 0n, xmask: 0n }, cw, signed);
-    const diffs = [];
+    // don't care を落としたリテラルとして評価する (その桁には 0 が入っている)。
+    // don't care が無ければリテラルそのままで、x を値として書いた桁は x のまま残る
+    const bits = mask
+      ? evalExpr({ ...label, mask: 0n, xmask: mask & label.xmask ? 0n : label.xmask }, cw, signed)
+      : evalExpr(label, cw, signed);
+    const cmp = [];
     for (let i = 0; i < cw; i++) {
       if ((mask >> BigInt(i)) & 1n) continue;
-      diffs.push(newGate('xor', [sel[i], bits[i]]));
+      cmp.push(i);
     }
-    if (diffs.length === 0) return CONST1;        // 全桁 don't care = 常に一致
-    let diff = diffs[0];
-    for (let i = 1; i < diffs.length; i++) diff = newGate('or', [diff, diffs[i]]);
+    if (cmp.length === 0) return CONST1;          // 全桁 don't care = 常に一致
+
+    // **Verilog の case は「そっくり同じか」で比べる** (== ではない)。
+    // 2 値では x がどこにも無いので差分ビットの OR で済み、回路も従来のまま。
+    if (xstate) {
+      let acc = null;
+      for (const i of cmp) {
+        const hit = bitMatch(sel[i], bits[i]);
+        acc = acc === null ? hit : newGate('and', [acc, hit]);
+      }
+      return acc;
+    }
+    let diff = newGate('xor', [sel[cmp[0]], bits[cmp[0]]]);
+    for (let k = 1; k < cmp.length; k++) {
+      diff = newGate('or', [diff, newGate('xor', [sel[cmp[k]], bits[cmp[k]]])]);
+    }
     return newGate('not', [diff]);
   }
 
@@ -874,6 +933,47 @@ export function elaborate(mod, all = [mod]) {
     let diff = newGate('xor', [aa[0], bb[0]]);
     for (let i = 1; i < w; i++) diff = newGate('or', [diff, newGate('xor', [aa[i], bb[i]])]);
     return op === '==' ? [newGate('not', [diff])] : [diff];
+  }
+
+  /**
+   * a === b / a !== b。**ビット列がそっくり同じか**を見る比較で、`==` と違って
+   * x どうしも「一致」とみなし、**結果は必ず 0 か 1 になる** (x を返さない)。
+   *
+   * 2 値では x がどこにも無いので `==` とまったく同じもの ―― そのまま equalBits に
+   * 回す。4 値でも足す部品は [isx](src/fourstate.js) 1 個だけで、残りは普通の
+   * ゲートで組める。ビット 1 桁ぶんは
+   *
+   *   一致 = (両方 x) | (どちらも x でない & 値が同じ)
+   *
+   * で、どの枝も確実な 0 / 1 になる (片方だけ x のとき `値が同じ` は x になるが、
+   * 確実な 0 との and に入るので 0 に落ちる)。
+   */
+  function caseEqBits(a, b, op) {
+    if (!xstate) return equalBits(a, b, op === '===' ? '==' : '!=');
+    const w = Math.max(a.length, b.length);
+    const aa = resize(a, w);
+    const bb = resize(b, w);
+    let acc = null;
+    for (let i = 0; i < w; i++) {
+      const hit = bitMatch(aa[i], bb[i]);
+      acc = acc === null ? hit : newGate('and', [acc, hit]);
+    }
+    if (acc === null) return [CONST1];               // 幅 0 どうしは一致
+    return [op === '===' ? acc : newGate('not', [acc])];
+  }
+
+  /**
+   * 1 ビットぶんの「そっくり同じか」。x どうしも一致で、結果は必ず 0 か 1。
+   * 4 値のときだけ isx が要る (2 値では x が無いので XNOR そのもの)。
+   */
+  function bitMatch(a, b) {
+    const same = newGate('not', [newGate('xor', [a, b])]);
+    if (!xstate) return same;
+    const xa = newGate('isx', [a]);
+    const xb = newGate('isx', [b]);
+    const bothX = newGate('and', [xa, xb]);
+    const neitherX = newGate('and', [newGate('not', [xa]), newGate('not', [xb])]);
+    return newGate('or', [bothX, newGate('and', [neitherX, same])]);
   }
 
   /**
@@ -987,6 +1087,9 @@ export function elaborate(mod, all = [mod]) {
   // 「1 ビットの結果を反転」になるので、ここでは扱わなくてよい。
   const REDUCE = { '&': 'and', '|': 'or', '^': 'xor' };
 
+  // 等価比較 4 種。=== と !== は「ビット列がそっくり同じか」で、x どうしも一致とみなす
+  const EQ = { '==': 1, '!=': 1, '===': 1, '!==': 1 };
+
   // シフト 4 種。`<<<` は signed でも `<<` と同じ結果になる (左シフトは常に 0 詰め)
   // ので同じ扱い。`>>>` だけが「signed なら符号ビットで埋める」算術右シフトになる。
   const SHIFT = { '<<': 'left', '<<<': 'left', '>>': 'right', '>>>': 'arith' };
@@ -1044,7 +1147,7 @@ export function elaborate(mod, all = [mod]) {
         return selfWidth(e.a);
       case 'bin':
         if (e.op === '&&' || e.op === '||') return 1;
-        if (e.op === '==' || e.op === '!=' || CMP[e.op]) return 1;
+        if (EQ[e.op] || CMP[e.op]) return 1;
         if (SHIFT[e.op]) return selfWidth(e.a);
         return Math.max(selfWidth(e.a), selfWidth(e.b));
       case 'tern':
@@ -1120,7 +1223,7 @@ export function elaborate(mod, all = [mod]) {
         return signOf(e.a);
       case 'bin':
         if (e.op === '&&' || e.op === '||') return false;
-        if (e.op === '==' || e.op === '!=' || CMP[e.op]) return false;
+        if (EQ[e.op] || CMP[e.op]) return false;
         if (SHIFT[e.op]) return signOf(e.a);          // シフト量の符号は関係ない
         return signOf(e.a) && signOf(e.b);
       case 'tern':
@@ -1159,15 +1262,18 @@ export function elaborate(mod, all = [mod]) {
       case 'sys':
         return extend(evalExpr(e.a), w, sg);
       case 'num': {
-        checkNoDontCare(e);
+        checkNoDontCare(e, xstate);
         // 自分の幅より上は符号ビット (符号なしなら 0)。ここでマスクしないと
-        // 4'hFF が 255 のまま広がる
-        const top = (e.bits >> BigInt(e.width - 1)) & 1n;
-        const fill = sg && top === 1n ? 1n : 0n;
+        // 4'hFF が 255 のまま広がる。**最上位が x なら符号拡張も x になる**
+        const topBit = BigInt(e.width - 1);
+        const topX = ((e.xmask >> topBit) & 1n) === 1n;
+        const top = (e.bits >> topBit) & 1n;
+        const fill = sg && topX ? CONSTX : sg && top === 1n ? CONST1 : CONST0;
         const out = [];
         for (let b = 0; b < w; b++) {
-          const bit = b < e.width ? (e.bits >> BigInt(b)) & 1n : fill;
-          out.push(bit === 1n ? CONST1 : CONST0);
+          if (b >= e.width) { out.push(fill); continue; }
+          if ((e.xmask >> BigInt(b)) & 1n) { out.push(CONSTX); continue; }
+          out.push(((e.bits >> BigInt(b)) & 1n) === 1n ? CONST1 : CONST0);
         }
         return out;
       }
@@ -1213,7 +1319,7 @@ export function elaborate(mod, all = [mod]) {
           const r = reduceOr(evalExpr(e.b));
           return resize([newGate(e.op === '&&' ? 'and' : 'or', [l, r])], w);
         }
-        if (e.op === '==' || e.op === '!=' || CMP[e.op]) {
+        if (EQ[e.op] || CMP[e.op]) {
           // 比較は外の文脈を受け取らないが、2 つのオペランドが互いの max(幅) に
           // 揃えられる。つまりオペランド 2 つだけで文脈を作る。
           // (8 ビットのリテラルと比べると、左辺の a - b も 8 ビットで計算される)
@@ -1222,8 +1328,11 @@ export function elaborate(mod, all = [mod]) {
           const cs = signOf(e.a) && signOf(e.b);
           const l = evalExpr(e.a, cw, cs);
           const r = evalExpr(e.b, cw, cs);
-          // == / != はビット列が同じかどうかなので、符号の分岐は要らない
-          const bits = CMP[e.op] ? compareBits(l, r, e.op, cs) : equalBits(l, r, e.op);
+          // == / != はビット列が同じかどうかなので、符号の分岐は要らない。
+          // === / !== は x どうしも一致とみなすので別の作り方になる
+          const isCase = e.op === '===' || e.op === '!==';
+          const bits = CMP[e.op] ? compareBits(l, r, e.op, cs)
+            : isCase ? caseEqBits(l, r, e.op) : equalBits(l, r, e.op);
           return resize(bits, w);
         }
 
@@ -2352,13 +2461,16 @@ export function elaborate(mod, all = [mod]) {
     });
   }
   if (undriven.length > 0) {
-    // 未駆動は 0 に固定して継続する (途中まで書いた RTL でも動かせるようにする)
+    // 未駆動は固定値にして継続する (途中まで書いた RTL でも動かせるようにする)。
+    // **4 値なら x にする** ―― 未駆動はまさに「値が決まっていない」ので、
+    // 0 に倒すより x のまま下流へ流れたほうが、繋ぎ忘れが結果に出る
+    const fill = xstate ? CONSTX : CONST0;
     for (const s of signals.values()) {
       if (s.isTop && s.dir === 'input') continue;
       s.bits.forEach((n) => {
         if (!drivers.has(n)) {
-          drivers.set(n, '未駆動 (0 固定)');
-          const gate = { op: 'buf', out: n, in: [CONST0] };
+          drivers.set(n, xstate ? '未駆動 (x)' : '未駆動 (0 固定)');
+          const gate = { op: 'buf', out: n, in: [fill] };
           gates.push(gate);
           gateOf.set(n, gate);
         }
@@ -2374,8 +2486,10 @@ export function elaborate(mod, all = [mod]) {
     signals,
     clock,
     portOrder: mod.portOrder,
+    xstate,
     warnings: [
-      ...(undriven.length ? [`未駆動の信号を 0 に固定しました: ${undriven.join(', ')}`] : []),
+      ...(undriven.length
+        ? [`未駆動の信号を ${xstate ? 'x' : '0'} にしました: ${undriven.join(', ')}`] : []),
       ...warnings,
     ],
     CONST0,

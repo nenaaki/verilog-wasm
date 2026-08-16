@@ -22,7 +22,8 @@ export { bits, LANES } from './signals.js';
 
 /**
  * @param {string} src Verilog サブセットのソース
- * @param {{ top?: string, wat?: boolean }} [opts]
+ * @param {{ top?: string, wat?: boolean, xstate?: boolean }} [opts]
+ *   xstate: x を値として扱う 4 値モード。既定は 2 値 (README「x を値として扱う」)
  */
 export function compile(src, opts = {}) {
   const modules = parse(src);
@@ -46,7 +47,7 @@ export function compile(src, opts = {}) {
     }
   }
 
-  const netlist = elaborate(mod, modules);
+  const netlist = elaborate(mod, modules, { xstate: opts.xstate });
   const order = schedule(netlist);
   const layout = buildLayout(netlist);
   const bytes = emitWasm(netlist, order, layout);

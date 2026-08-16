@@ -1,7 +1,7 @@
 // Verilog サブセット → AST
 //
 // 式の優先順位 (低い順):
-//   ?:  ||  &&  |  ^ ~^ ^~  &  == !=  < <= > >=  << >> <<< >>>  + -
+//   ?:  ||  &&  |  ^ ~^ ^~  &  == != === !==  < <= > >=  << >> <<< >>>  + -
 //   単項 (~ - + ! & | ^ ~^ ^~)  primary
 // これは Verilog 本来の優先順位と一致する。論理演算子 (|| &&) はビット演算より
 // 弱く、等価 (== !=) は関係 (< など) より弱く、関係はシフトより弱く、シフトは
@@ -104,7 +104,9 @@ export function parse(src) {
   // 算術シフト <<< >>> は普通のシフトと同じ優先順位
   const parseShift = binaryLevel(['<<<', '>>>', '<<', '>>'], parseAdd);
   const parseRel = binaryLevel(['<=', '>=', '<', '>'], parseShift);
-  const parseEq = binaryLevel(['==', '!='], parseRel);
+  // === !== は == != と同じ優先順位。3 文字のほうを先に並べる必要は無いが
+  // (字句解析で別のトークンになっている)、読む順に合わせておく
+  const parseEq = binaryLevel(['===', '!==', '==', '!='], parseRel);
   const parseAnd = binaryLevel('&', parseEq);
   const parseXor = binaryLevel(['^', '~^', '^~'], parseAnd);
   const parseOr = binaryLevel('|', parseXor);

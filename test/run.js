@@ -21,6 +21,7 @@ import {
 } from '../src/schematic.js';
 import { SAMPLE_CIRCUITS } from '../src/samples.js';
 import { circuitJson, isLibrary, libraryJson, mergeLibrary } from '../web/library.js';
+import { and2, muxOf, notOf, or2, xor2 } from '../src/fourstate.js';
 
 const MAX_DEPTH_TEST = 10;   // src 側の上限 (8) より深くする
 
@@ -3811,9 +3812,16 @@ async function testErrors() {
     ['定数式の 0 除算',
       `module m(output [7:0] y); localparam K = 3 / 0; assign y = K; endmodule`,
       /定数式で 0 除算/],
-    ['=== は未対応',
-      `module m(input [3:0] a, output y); assign y = a === 4'h3; endmodule`,
-      /=== は未対応/],
+    // x は 4 値 (xstate) のときだけ値として書ける。2 値では名指しで断る
+    ['2 値では x をリテラルに書けない',
+      `module m(input [3:0] a, output y); assign y = a === 4'bxx01; endmodule`,
+      /x は casex のラベルでしか使えない/],
+    ['4 値でも定数式に x は書けない',
+      `module m(output [7:0] y); localparam K = 4'bx1; assign y = K; endmodule`,
+      /定数式に x は書けない/, { xstate: true }],
+    ['4 値でも z は値にならない',
+      `module m(input [3:0] a, output y); assign y = a === 4'bz1; endmodule`,
+      /z \/ \? は casez \/ casex のラベルでしか使えない/, { xstate: true }],
     // signed は通るようになったが、parameter は 32 ビットの signed 固定なので
     // 幅も符号も書かせない
     ['parameter の signed 指定は未対応',
@@ -4156,9 +4164,10 @@ async function testErrors() {
 
   errorKinds = cases.length;      // README の「N 種類のコンパイルエラー」の N
 
-  for (const [label, src, pattern] of cases) {
+  // 4 番目は compile のオプション (4 値でしか出ないエラーを見るのに使う)
+  for (const [label, src, pattern, opts] of cases) {
     let caught = null;
-    try { compile(src); } catch (e) { caught = e; }
+    try { compile(src, opts); } catch (e) { caught = e; }
     if (!caught) ok(false, `エラー検出: ${label}`, 'エラーにならなかった');
     else ok(caught instanceof CompileError && pattern.test(caught.message),
       `エラー検出: ${label}`, `実際のメッセージ: ${caught.message}`);
@@ -4464,6 +4473,278 @@ async function testRandomDiff() {
   ok(missing.length === 0, 'ランダム差分: 生成器が全構文を出している',
     `出ていない構文: ${missing.join(', ')} / 内訳 ${JSON.stringify(seen)}`);
   ok(!mismatch, `ランダム差分テスト (${designs} 回路 × 12 ベクタ)`, mismatch ?? '');
+}
+
+// ------------------------------------------------------- x を値として扱う
+//
+// 4 値 (0 / 1 / x) はオプトイン。既定の 2 値は 1 ビットも変わらないことも含めて見る。
+//
+// **式は src/fourstate.js に 1 箇所だけ**あるが、実装は 2 つある (WASM を吐く
+// codegen と JS の参照実装)。だから確かめる筋道も 2 本立てになる:
+//   1. 式そのものが Verilog の定義と合っているか … 素朴なモデルと全通り突き合わせ
+//   2. 2 つの実装が食い違っていないか           … ランダム回路で WASM vs 参照実装
+async function testXState() {
+  // ---- 1. 式が Verilog の定義と合っているか ----
+  const enc = (s) => (s === '0' ? { v: 0n, u: 0n } : s === '1' ? { v: 1n, u: 0n } : { v: 0n, u: 1n });
+  const dec = (p) => ((p.u & 1n) ? 'x' : String(p.v & 1n));
+  const S = ['0', '1', 'x'];
+  // Verilog の定義そのまま (「確実に決まる入力があれば結果も決まる」)
+  const model = {
+    and: (a, b) => (a === '0' || b === '0' ? '0' : a === '1' && b === '1' ? '1' : 'x'),
+    or: (a, b) => (a === '1' || b === '1' ? '1' : a === '0' && b === '0' ? '0' : 'x'),
+    xor: (a, b) => (a === 'x' || b === 'x' ? 'x' : a === b ? '0' : '1'),
+  };
+  let bad = null;
+  let cases = 0;
+  for (const a of S) {
+    for (const b of S) {
+      for (const [op, f] of [['and', and2], ['or', or2], ['xor', xor2]]) {
+        cases++;
+        const got = dec(f(enc(a), enc(b)));
+        if (got !== model[op](a, b) && !bad) bad = `${op}(${a},${b}) 期待 ${model[op](a, b)} / 実際 ${got}`;
+      }
+    }
+  }
+  for (const a of S) {
+    cases++;
+    const got = dec(notOf(enc(a)));
+    const want = a === 'x' ? 'x' : a === '0' ? '1' : '0';
+    if (got !== want && !bad) bad = `not(${a}) 期待 ${want} / 実際 ${got}`;
+  }
+  // mux は「選択が x でも両枝が同じ確実な値なら決まる」が要点
+  for (const s of S) {
+    for (const a of S) {
+      for (const b of S) {
+        cases++;
+        const want = s === '1' ? a : s === '0' ? b : (a === b && a !== 'x' ? a : 'x');
+        const got = dec(muxOf(enc(s), enc(a), enc(b)));
+        if (got !== want && !bad) bad = `mux(${s},${a},${b}) 期待 ${want} / 実際 ${got}`;
+      }
+    }
+  }
+  ok(!bad, `4 値: 式が Verilog の定義と全 ${cases} 通りで一致`, bad ?? '');
+
+  // ---- x の出どころ ----
+  const src = `module m(input clk, input a, input b,
+    output andX, output orX, output xorX, output muxSame, output muxDiff,
+    output reg [3:0] free, output reg [3:0] seeded);
+    wire loose;                       // どこからも駆動されない
+    assign andX    = a & loose;       // a=0 なら 0、a=1 なら x
+    assign orX     = a | loose;       // a=1 なら 1、a=0 なら x
+    assign xorX    = a ^ loose;       // 常に x
+    assign muxSame = loose ? a : a;   // 両枝が同じなら選択が x でも決まる
+    assign muxDiff = loose ? a : b;
+    initial seeded = 4'h5;
+    always @(posedge clk) begin free <= free + 1; seeded <= seeded + 1; end
+  endmodule`;
+  const compiled4 = compile(src, { wat: false, xstate: true });
+  ok(compiled4.warnings.some((w) => /未駆動の信号を x にしました/.test(w)),
+    '4 値: 未駆動は x になる', compiled4.warnings.join(' / '));
+  const sims4 = [await WasmSimulator.create(compiled4), new RefSimulator(compiled4)];
+
+  for (const sim of sims4) {
+    const kind = sim.constructor.name;
+    sim.reset();
+    eqs(sim.getBits('free'), 'xxxx', `${kind} 4 値: initial の無いレジスタは x から始まる`);
+    eqs(sim.getBits('seeded'), '0101', `${kind} 4 値: initial を書いたレジスタはその値`);
+
+    // muxDiff の 2 つの枝を違う値にしておく (同じだと選択が x でも決まってしまう)
+    sim.setInput('a', 0).setInput('b', 1).eval();
+    eqs(sim.getBits('andX'), '0', `${kind} 4 値: 0 & x = 0 (x は広がらない)`);
+    eqs(sim.getBits('orX'), 'x', `${kind} 4 値: 0 | x = x`);
+    eqs(sim.getBits('xorX'), 'x', `${kind} 4 値: 0 ^ x = x`);
+    eqs(sim.getBits('muxSame'), '0', `${kind} 4 値: 両枝が同じなら選択が x でも決まる`);
+    eqs(sim.getBits('muxDiff'), 'x', `${kind} 4 値: 枝が違えば x`);
+
+    sim.setInput('a', 1).setInput('b', 0).eval();
+    eqs(sim.getBits('andX'), 'x', `${kind} 4 値: 1 & x = x`);
+    eqs(sim.getBits('orX'), '1', `${kind} 4 値: 1 | x = 1 (x は広がらない)`);
+
+    // x はレジスタを通っても消えない。initial を書いた側は数え続ける
+    sim.step();
+    eqs(sim.getBits('free'), 'xxxx', `${kind} 4 値: x を足しても x のまま`);
+    eqs(sim.getBits('seeded'), '0110', `${kind} 4 値: 決まっている側はクロックで進む`);
+  }
+
+  // ---- 入出力の見え方 ----
+  const io = `module m(input [3:0] d, output [3:0] y, output [3:0] inv);
+    assign y = d;
+    assign inv = ~d;
+  endmodule`;
+  const cio = compile(io, { wat: false, xstate: true });
+  for (const sim of [await WasmSimulator.create(cio), new RefSimulator(cio)]) {
+    const kind = sim.constructor.name;
+    sim.setInput('d', '01x1').eval();
+    eqs(sim.getBits('y'), '01x1', `${kind} 4 値: x を混ぜて入力できる`);
+    eqs(sim.getBits('inv'), '10x0', `${kind} 4 値: ~x = x`);
+    eq(sim.get('y'), 0b0101, `${kind} 4 値: get() は x を 0 として読む`);
+    eq(sim.getX('y'), 0b0010, `${kind} 4 値: getX() で x の桁が分かる`);
+
+    // レーンごとに独立。setInputLane は そのレーンだけ確実な値にする
+    sim.setInputLane('d', 3, 0b1111).eval();
+    eqs(sim.getBits('y', 3), '1111', `${kind} 4 値: レーン 3 だけ確実な値になる`);
+    eqs(sim.getBits('y', 0), '01x1', `${kind} 4 値: 他のレーンは x のまま`);
+  }
+
+  // ---- 2 値モードは 1 ビットも変わらない ----
+  for (const name of ['alu4.v', 'muldiv4.v', 'counter8.v', 'seqdet.v']) {
+    const two = compile(example(name), { wat: false });
+    const four = compile(example(name), { wat: false, xstate: true });
+    eqs(two.stats.gates, compile(example(name), { wat: false }).stats.gates,
+      `4 値: ${name} の 2 値モードは従来どおり`);
+    ok(four.stats.wasmBytes > two.stats.wasmBytes,
+      `4 値: ${name} は 4 値のほうが大きい`,
+      `2 値=${two.stats.wasmBytes}B 4 値=${four.stats.wasmBytes}B`);
+    eqs(four.stats.stateBytes, two.stats.stateBytes * 2,
+      `4 値: ${name} の状態はちょうど 2 倍 (面が 2 枚)`);
+  }
+
+  // 畳み込みの制限。x & ~x は 0 にならないので、2 値より回路が大きくなることがある
+  const inv2 = 'module m(input a, output y); assign y = a & ~a; endmodule';
+  const inv2Two = compile(inv2, { wat: false }).stats.gates;
+  const inv2Four = compile(inv2, { wat: false, xstate: true }).stats.gates;
+  ok(inv2Four > inv2Two, '4 値: a & ~a は畳まない (x のときは x になるため)',
+    `2 値=${inv2Two} 4 値=${inv2Four}`);
+
+  // ---- x をリテラルとして書く ----
+  const lits = `module m(output [3:0] plain, output [7:0] wide, output [7:0] sext, output [3:0] hex);
+    assign plain = 4'b1x0x;
+    assign wide  = 4'b1x0x;      // 符号なしなので上位はゼロ拡張
+    assign sext  = 4'sbx101;     // 最上位が x なので符号拡張も x
+    assign hex   = 4'hx;         // 16 進の x は 4 ビットぶん
+  endmodule`;
+  const clit = compile(lits, { wat: false, xstate: true });
+  for (const sim of [await WasmSimulator.create(clit), new RefSimulator(clit)]) {
+    const kind = sim.constructor.name;
+    sim.eval();
+    eqs(sim.getBits('plain'), '1x0x', `${kind} 4 値: x を混ぜたリテラルを書ける`);
+    eqs(sim.getBits('wide'), '00001x0x', `${kind} 4 値: 符号なしの上位はゼロ拡張`);
+    eqs(sim.getBits('sext'), 'xxxxx101', `${kind} 4 値: 最上位が x なら符号拡張も x`);
+    eqs(sim.getBits('hex'), 'xxxx', `${kind} 4 値: 16 進の x は 4 ビットぶん`);
+  }
+
+  // ---- === / !== ----
+  //
+  // `==` は x が混ざると x を返すが、`===` は**必ず 0 か 1 を返す**。
+  // これが「x かどうかを回路の中で判定できる」唯一の入口になる。
+  const ceq = `module m(input [3:0] d, output eqX, output neX, output eqLit, output plainEq,
+    output anyX, output [3:0] safe);
+    assign eqX     = d === 4'bxx01;
+    assign neX     = d !== 4'bxx01;
+    assign eqLit   = d === 4'b0101;
+    assign plainEq = d == 4'b0101;
+    assign anyX    = d !== d;        // 自分と比べても一致する (x どうしも一致)
+    assign safe    = (d === 4'bxxxx) ? 4'h0 : d;   // x なら 0 に倒す
+  endmodule`;
+  const cceq = compile(ceq, { wat: false, xstate: true });
+  for (const sim of [await WasmSimulator.create(cceq), new RefSimulator(cceq)]) {
+    const kind = sim.constructor.name;
+    const at = (d) => { sim.setInput('d', d).eval(); return sim; };
+
+    eqs(at('0101').getBits('eqLit'), '1', `${kind} ===: 確実な値どうしは == と同じ`);
+    eqs(sim.getBits('eqX'), '0', `${kind} ===: x のラベルには一致しない`);
+    eqs(sim.getBits('neX'), '1', `${kind} !==: その否定`);
+
+    eqs(at('xx01').getBits('eqX'), '1', `${kind} ===: x どうしも一致とみなす`);
+    eqs(sim.getBits('eqLit'), '0', `${kind} ===: x は確実な値と一致しない`);
+    eqs(sim.getBits('plainEq'), 'x', `${kind} ===: == なら x になる場面`);
+    eqs(sim.getBits('neX'), '0', `${kind} !==: 一致すれば 0`);
+
+    // 片方でも確実に違う桁があれば == でも決まる (x は広がらない)
+    eqs(at('1x01').getBits('plainEq'), '0', `${kind} ===: 確実に違う桁があれば == も決まる`);
+    eqs(sim.getBits('eqX'), '0', `${kind} ===: 桁の並びが違えば一致しない`);
+
+    // 自分自身との !== は必ず 0。x が混ざっていても「そっくり同じ」なので
+    for (const d of ['0101', 'xx01', 'xxxx']) {
+      eqs(at(d).getBits('anyX'), '0', `${kind} !==: 自分自身とは一致する (d=${d})`);
+    }
+    // === の結果は必ず確実な値なので、そのまま条件に使える
+    eqs(at('xxxx').getBits('safe'), '0000', `${kind} ===: x を検出して 0 に倒せる`);
+    eqs(at('1010').getBits('safe'), '1010', `${kind} ===: x でなければ素通し`);
+  }
+
+  // 2 値では === は == とまったく同じもの。回路も 1 ゲートも変わらない
+  const same = 'module m(input [3:0] a, input [3:0] b, output y); assign y = a === b; endmodule';
+  const plainSame = 'module m(input [3:0] a, input [3:0] b, output y); assign y = a == b; endmodule';
+  eqs(compile(same, { wat: false }).stats.gates, compile(plainSame, { wat: false }).stats.gates,
+    '2 値: === は == と同じ回路になる');
+  const { all: twoEq } = await bothSims(same);
+  for (const sim of twoEq) {
+    sim.setInput('a', 5).setInput('b', 5).eval();
+    eq(sim.get('y'), 1, `${sim.constructor.name} 2 値: === が使える`);
+    sim.setInput('b', 6).eval();
+    eq(sim.get('y'), 0, `${sim.constructor.name} 2 値: === が == と同じ答え`);
+  }
+
+  // ---- case は「そっくり同じか」で比べる (== ではない) ----
+  const csel = `module m(input clk, input [1:0] s, output reg [3:0] y);
+    always @(posedge clk)
+      case (s)
+        2'b00: y <= 4'h1;
+        2'b01: y <= 4'h2;
+        2'bxx: y <= 4'h9;     // s がそっくり xx のときだけ
+        default: y <= 4'h0;
+      endcase
+  endmodule`;
+  const ccsel = compile(csel, { wat: false, xstate: true });
+  for (const sim of [await WasmSimulator.create(ccsel), new RefSimulator(ccsel)]) {
+    const kind = sim.constructor.name;
+    eqs(sim.reset().setInput('s', '00').step().getBits('y'), '0001', `${kind} 4 値: case の通常の一致`);
+    eqs(sim.setInput('s', 'xx').step().getBits('y'), '1001', `${kind} 4 値: case は x をそっくり比べる`);
+    eqs(sim.setInput('s', '10').step().getBits('y'), '0000', `${kind} 4 値: 外れれば default`);
+    // 片方だけ x なら、どのラベルにも一致しないので default
+    eqs(sim.setInput('s', '0x').step().getBits('y'), '0000', `${kind} 4 値: 半端な x は default`);
+  }
+
+  // casez の don't care は 4 値でも効く (比較しない桁は x でも構わない)
+  const czx = `module m(input clk, input [3:0] a, output reg [3:0] y);
+    always @(posedge clk)
+      casez (a) 4'b1???: y <= 4'h1; default: y <= 4'h0; endcase
+  endmodule`;
+  const cczx = compile(czx, { wat: false, xstate: true });
+  for (const sim of [await WasmSimulator.create(cczx), new RefSimulator(cczx)]) {
+    const kind = sim.constructor.name;
+    eqs(sim.reset().setInput('a', '1xxx').step().getBits('y'), '0001',
+      `${kind} 4 値: casez は比較しない桁が x でも一致する`);
+    eqs(sim.setInput('a', 'x111').step().getBits('y'), '0000',
+      `${kind} 4 値: 比較する桁が x なら一致しない`);
+  }
+
+  // ---- 2. WASM と参照実装が食い違っていないか ----
+  const rng = makeRng(20260817);
+  let mismatch = null;
+  let designs = 0;
+  for (let d = 0; d < 12 && !mismatch; d++) {
+    const rsrc = randomDesign(rng, 6);
+    let c;
+    try { c = compile(rsrc, { wat: false, xstate: true }); } catch (e) {
+      failures.push(`4 値: コンパイル失敗 ${e.message}\n${rsrc}`);
+      continue;
+    }
+    designs++;
+    const wasm = await WasmSimulator.create(c);
+    const ref = new RefSimulator(c);
+    for (let t = 0; t < 10 && !mismatch; t++) {
+      const a = Math.floor(rng() * 256);
+      const b = Math.floor(rng() * 256);
+      // 入力にも x を混ぜる。x が混ざったときの伝わり方こそ突き合わせたい所
+      const cIn = rng() < 0.5 ? Math.floor(rng() * 256)
+        : [...Array(8)].map(() => (rng() < 0.3 ? 'x' : rng() < 0.5 ? '1' : '0')).join('');
+      const rst = rng() < 0.25 ? 1 : 0;
+      for (const sim of [wasm, ref]) {
+        sim.setInput('a', a).setInput('b', b).setInput('c', cIn).setInput('rst', rst);
+      }
+      if (rst) { wasm.eval(); ref.eval(); } else { wasm.step(); ref.step(); }
+      for (const port of ['y', 'rout', 'rout2', 'rout3', 'rout4', 'rout5']) {
+        if (wasm.getBits(port) !== ref.getBits(port) && !mismatch) {
+          mismatch = `${port}: wasm=${wasm.getBits(port)} ref=${ref.getBits(port)}`
+            + ` (a=${a} b=${b} c=${cIn} rst=${rst} t=${t})\n${rsrc}`;
+        }
+      }
+    }
+  }
+  eqs(designs, 12, '4 値: ランダム 12 回路すべてコンパイルできた');
+  ok(!mismatch, `4 値: WASM と参照実装が一致 (${designs} 回路 × 10 ベクタ)`, mismatch ?? '');
 }
 
 // ------------------------------------------------- インスタンスの独立性
@@ -5490,6 +5771,7 @@ const suites = [
   ['eval / commit の分離', testEvalCommit],
   ['エラー検出', testErrors],
   ['ランダム差分', testRandomDiff],
+  ['x を値として扱う', testXState],
   ['インスタンスの独立性', testInstanceIndependence],
   ['WAT 出力', testWat],
   ['GUI 回路グラフ', testSchematic],

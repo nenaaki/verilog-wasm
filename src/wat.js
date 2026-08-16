@@ -7,6 +7,17 @@ export function emitWat(netlist, order, layout) {
   const { nets, gates, regs } = netlist;
   const { slots, regNext } = layout;
 
+  // **4 値には付いていっていない。** ここで 2 値の形を出すと「バイナリと 1:1」の
+  // 前提が黙って崩れるので、出さずに理由を書く。式をもう 1 か所に写すのは
+  // (codegen と参照実装に続いて 3 つ目になるので) 割に合わない ―― 4 値の中身を
+  // 読みたいときは src/fourstate.js の式を見るのが早い。
+  if (layout.xstate) {
+    return `;; module ${netlist.name}\n`
+      + ';; 4 値 (xstate) の WAT は出していません。\n'
+      + ';; このバックエンドは 2 値の形しか書けず、出すとバイナリと食い違うためです。\n'
+      + ';; 4 値のゲートの式は src/fourstate.js にまとまっています。\n';
+  }
+
   const id = (netId) => `$n${netId}_${nets[netId].name.replace(WAT_ID, '_')}`;
   const L = [];
 

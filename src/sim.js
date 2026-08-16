@@ -4,7 +4,7 @@ import { SignalAccess, MASK64 } from './signals.js';
 
 export class WasmSimulator extends SignalAccess {
   constructor(compiled, instance) {
-    super(compiled.layout.signalTable);
+    super(compiled.layout.signalTable, !!compiled.layout.xstate);
     this.compiled = compiled;
     this.instance = instance;
     this.exports = instance.exports;

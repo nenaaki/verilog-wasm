@@ -59,18 +59,32 @@ const F_RUN = 3;
 export function emitWasm(netlist, order, layout) {
   const { nets, gates, regs } = netlist;
   const { slots, regNext } = layout;
+  // 4 値では 1 ネットが 2 面。local も 2 本ずつ使い、**不定の面は値の面から
+  // nets.length ずらした番号**に置く。メモリ側は値の面の 8 バイト後ろ
+  // (どちらも src/fourstate.js の符号化に合わせてある)。
+  const xstate = !!layout.xstate;
+  const XL = nets.length;          // 不定の面の local 番号のずらし幅
+  const localCount = xstate ? nets.length * 2 : nets.length;
 
   // ---- eval 本体 ----
   const code = [];
   const emit = (...bytes) => code.push(...bytes);
   const get = (netId) => emit(OP.local_get, ...uleb(netId));
   const set = (netId) => emit(OP.local_set, ...uleb(netId));
+  const getU = (netId) => emit(OP.local_get, ...uleb(XL + netId));
+  const setU = (netId) => emit(OP.local_set, ...uleb(XL + netId));
   const allOnes = () => emit(OP.i64_const, ...sleb64(-1n));
+  const zero = () => emit(OP.i64_const, ...sleb64(0n));
+  const inv = () => { allOnes(); emit(OP.i64_xor); };          // 直前の値を反転
 
   const loadInto = (netId, offset) => {
     emit(OP.i32_const, ...sleb(0));
     emit(OP.i64_load, ...uleb(ALIGN_8), ...uleb(offset));
     set(netId);
+    if (!xstate) return;
+    emit(OP.i32_const, ...sleb(0));
+    emit(OP.i64_load, ...uleb(ALIGN_8), ...uleb(offset + 8));
+    setU(netId);
   };
 
   // --- 1. 状態の読み込み ---
@@ -80,10 +94,11 @@ export function emitWasm(netlist, order, layout) {
   // --- 2. ゲートの評価 ---
   for (const gi of order) {
     const g = gates[gi];
+    if (xstate) { emitGate4(g); continue; }
     switch (g.op) {
       case 'const':
         if (g.value) allOnes();
-        else emit(OP.i64_const, ...sleb64(0n));
+        else zero();
         set(g.out);
         break;
       case 'buf':
@@ -92,8 +107,7 @@ export function emitWasm(netlist, order, layout) {
         break;
       case 'not':
         get(g.in[0]);
-        allOnes();
-        emit(OP.i64_xor);
+        inv();
         set(g.out);
         break;
       case 'and':
@@ -114,8 +128,7 @@ export function emitWasm(netlist, order, layout) {
         emit(OP.i64_and);
         get(b);
         get(sel);
-        allOnes();
-        emit(OP.i64_xor);
+        inv();
         emit(OP.i64_and);
         emit(OP.i64_or);
         set(g.out);
@@ -126,11 +139,93 @@ export function emitWasm(netlist, order, layout) {
     }
   }
 
+  /**
+   * 4 値のゲート 1 個。式は src/fourstate.js が唯一の仕様で、ここはそれを
+   * i64 命令に写しただけ。**必ず不定の面を先に書く** ―― n 入力を畳むときは
+   * 出力の local を累算器に使うので、値の面を先に潰すと不定の面の式が読む
+   * 「畳む前の値」が消えてしまう (不定の面の式だけが値の面を必要とする)。
+   */
+  function emitGate4(g) {
+    const out = g.out;
+    if (g.op === 'const') {
+      if (g.value === 'x') { allOnes(); setU(out); zero(); set(out); return; }
+      zero(); setU(out);
+      if (g.value) allOnes(); else zero();
+      set(out);
+      return;
+    }
+    if (g.op === 'buf' || g.op === 'not') {
+      const a = g.in[0];
+      getU(a); setU(out);
+      get(a); if (g.op === 'not') inv(); set(out);
+      return;
+    }
+    if (g.op === 'isx') {
+      // 「x か」を確実な 0 / 1 として取り出す。不定の面を値の面へ移すだけ
+      const a = g.in[0];
+      zero(); setU(out);
+      getU(a); set(out);
+      return;
+    }
+    if (g.op === 'mux') {
+      const [s, a, b] = g.in;
+      // u = (~s.u & ((s.v & a.u) | (~s.v & b.u))) | (s.u & (a.u | b.u | (a.v ^ b.v)))
+      getU(s); inv();
+      get(s); getU(a); emit(OP.i64_and);
+      get(s); inv(); getU(b); emit(OP.i64_and);
+      emit(OP.i64_or);
+      emit(OP.i64_and);
+      getU(s);
+      getU(a); getU(b); emit(OP.i64_or);
+      get(a); get(b); emit(OP.i64_xor);
+      emit(OP.i64_or);
+      emit(OP.i64_and);
+      emit(OP.i64_or);
+      setU(out);
+      // v = (s.v & a.v) | (~s.v & b.v)
+      get(s); get(a); emit(OP.i64_and);
+      get(s); inv(); get(b); emit(OP.i64_and);
+      emit(OP.i64_or);
+      set(out);
+      return;
+    }
+    // and / or / xor は 2 入力ずつ畳む。出力の local を累算器にする
+    let acc = g.in[0];
+    for (let k = 1; k < g.in.length; k++) {
+      const b = g.in[k];
+      emitBin4(g.op, acc, b, out);
+      acc = out;
+    }
+    if (g.in.length === 1) { getU(acc); setU(out); get(acc); set(out); }
+  }
+
+  function emitBin4(op, a, b, out) {
+    if (op === 'xor') {
+      getU(a); getU(b); emit(OP.i64_or); setU(out);
+      get(a); get(b); emit(OP.i64_xor); set(out);
+      return;
+    }
+    // and … u = (a.u|b.u) & (a.v|a.u) & (b.v|b.u)   … どちらも「確実な 0」でない
+    // or  … u = (a.u|b.u) & (~a.v|a.u) & (~b.v|b.u) … どちらも「確実な 1」でない
+    const flip = op === 'or';
+    getU(a); getU(b); emit(OP.i64_or);
+    get(a); if (flip) inv(); getU(a); emit(OP.i64_or);
+    emit(OP.i64_and);
+    get(b); if (flip) inv(); getU(b); emit(OP.i64_or);
+    emit(OP.i64_and);
+    setU(out);
+    get(a); get(b); emit(BINOP[op]); set(out);
+  }
+
   // --- 3. 書き出し (出力ポート + レジスタ次状態) ---
   const storeFromLocal = (offset, valueNet) => {
     emit(OP.i32_const, ...sleb(0));
     get(valueNet);
     emit(OP.i64_store, ...uleb(ALIGN_8), ...uleb(offset));
+    if (!xstate) return;
+    emit(OP.i32_const, ...sleb(0));
+    getU(valueNet);
+    emit(OP.i64_store, ...uleb(ALIGN_8), ...uleb(offset + 8));
   };
   for (const n of layout.outputNets) storeFromLocal(slots.get(n), n);
   regs.forEach((r, i) => storeFromLocal(regNext[i], r.d));
@@ -143,15 +238,19 @@ export function emitWasm(netlist, order, layout) {
 
   emit(OP.end);
 
-  const evalBody = [...vec([[...uleb(nets.length), I64]]), ...code];
+  const evalBody = [...vec([[...uleb(localCount), I64]]), ...code];
 
   // ---- commit 本体: next スロット → Q スロットの一括コピー ----
   const commitCode = [];
-  regs.forEach((r, i) => {
+  const copyWord = (from, to) => {
     commitCode.push(OP.i32_const, ...sleb(0));                                  // 宛先アドレス
     commitCode.push(OP.i32_const, ...sleb(0));                                  // 元アドレス
-    commitCode.push(OP.i64_load, ...uleb(ALIGN_8), ...uleb(regNext[i]));
-    commitCode.push(OP.i64_store, ...uleb(ALIGN_8), ...uleb(slots.get(r.q)));
+    commitCode.push(OP.i64_load, ...uleb(ALIGN_8), ...uleb(from));
+    commitCode.push(OP.i64_store, ...uleb(ALIGN_8), ...uleb(to));
+  };
+  regs.forEach((r, i) => {
+    copyWord(regNext[i], slots.get(r.q));
+    if (xstate) copyWord(regNext[i] + 8, slots.get(r.q) + 8);
   });
   commitCode.push(OP.end);
   const commitBody = [...vec([]), ...commitCode];

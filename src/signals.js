@@ -9,10 +9,17 @@ export const MASK64 = (1n << 64n) - 1n;
 const ALL_ONES = MASK64;
 
 export class SignalAccess {
-  constructor(signalTable) {
+  constructor(signalTable, xstate = false) {
     this.signalTable = signalTable;
+    this.xstate = xstate;
     this.byName = new Map(signalTable.map((s) => [s.name, s]));
   }
+
+  /**
+   * 不定の面のオフセット。4 値のときは値の面の 8 バイト後ろに置いてある
+   * (src/fourstate.js の符号化)。2 値なら不定の面そのものが無い。
+   */
+  _xOffset(off) { return this.xstate ? off + 8 : null; }
 
   /** @returns {bigint} 64 ビット符号なし */
   readWord(_offset) { throw new Error('未実装'); }
@@ -24,13 +31,42 @@ export class SignalAccess {
     return s;
   }
 
-  /** 全 64 レーンに同じ値を書く */
+  /**
+   * 全 64 レーンに同じ値を書く。
+   *
+   * **文字列は MSB 先頭のビット列**（`"0110"` / `"01x0"`）、数値と BigInt はそのままの値。
+   * 10 進で渡したいときは数値を使う ―― 文字列かどうかで進数が変わるほうが、
+   * 「x が入っているかどうか」で変わるより間違えにくい。
+   */
   setInput(name, value) {
     const s = this._sig(name);
+    if (typeof value === 'string') return this._setBitString(s, value);
     const v = BigInt(value);
     s.offsets.forEach((off, b) => {
       if (off === null) return;
       this.writeWord(off, (v >> BigInt(b)) & 1n ? ALL_ONES : 0n);
+      if (this.xstate) this.writeWord(off + 8, 0n);
+    });
+    return this;
+  }
+
+  /** `"0110"` / `"01x0"` のような MSB 先頭のビット文字列を書く */
+  _setBitString(s, text) {
+    const clean = text.trim().replace(/_/g, '');
+    if (!/^[01xX]*$/.test(clean)) {
+      throw new Error(`入力のビット列に使えるのは 0 / 1 / x だけ ('${text}')。`
+        + '10 進で渡すなら数値か BigInt を使う');
+    }
+    if (!this.xstate && /x/i.test(clean)) {
+      throw new Error(`x を入力に書けるのは 4 値 (xstate) のときだけ ('${text}')`);
+    }
+    const chars = [...clean].reverse();                // LSB 先頭に並べ替える
+    s.offsets.forEach((off, b) => {
+      if (off === null) return;
+      const c = chars[b] ?? '0';
+      const isX = c === 'x' || c === 'X';
+      this.writeWord(off, c === '1' ? ALL_ONES : 0n);
+      if (this.xstate) this.writeWord(off + 8, isX ? ALL_ONES : 0n);
     });
     return this;
   }
@@ -45,19 +81,53 @@ export class SignalAccess {
       const cur = this.readWord(off);
       const on = ((v >> BigInt(b)) & 1n) === 1n;
       this.writeWord(off, (on ? cur | bit : cur & (MASK64 ^ bit)) & MASK64);
+      // 4 値では「そのレーンだけ確実な値にする」ので、不定の面はこのレーンだけ落とす
+      if (this.xstate) this.writeWord(off + 8, this.readWord(off + 8) & (MASK64 ^ bit));
     });
     return this;
   }
 
-  /** @returns {bigint} 指定レーンの信号値 */
+  /**
+   * @returns {bigint} 指定レーンの信号値。**x のビットは 0 として読める**
+   * (どのビットが x かは getX / getBits で見る)
+   */
   get(name, lane = 0) {
     const s = this._sig(name);
+    const sh = BigInt(lane);
+    const xs = this.xstate;
+    let out = 0n;
+    s.offsets.forEach((off, b) => {
+      if (off === null) return;
+      const v = (this.readWord(off) >> sh) & 1n;
+      const u = xs ? (this.readWord(off + 8) >> sh) & 1n : 0n;
+      out |= (v & ~u & 1n) << BigInt(b);
+    });
+    return out;
+  }
+
+  /** @returns {bigint} x になっているビットに 1 が立ったマスク (2 値なら常に 0) */
+  getX(name, lane = 0) {
+    const s = this._sig(name);
+    if (!this.xstate) return 0n;
     const sh = BigInt(lane);
     let out = 0n;
     s.offsets.forEach((off, b) => {
       if (off === null) return;
-      out |= ((this.readWord(off) >> sh) & 1n) << BigInt(b);
+      out |= ((this.readWord(off + 8) >> sh) & 1n) << BigInt(b);
     });
+    return out;
+  }
+
+  /** @returns {string} `"01x0"` のような MSB 先頭のビット文字列 */
+  getBits(name, lane = 0) {
+    const s = this._sig(name);
+    const v = this.get(name, lane);
+    const u = this.getX(name, lane);
+    let out = '';
+    for (let b = s.width - 1; b >= 0; b--) {
+      const i = BigInt(b);
+      out += (u >> i) & 1n ? 'x' : String((v >> i) & 1n);
+    }
     return out;
   }
 
