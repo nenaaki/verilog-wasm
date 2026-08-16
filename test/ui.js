@@ -11,6 +11,13 @@
 //
 //   CHROME=/path/to/chrome node test/ui.js   … 場所を指定する
 //   PORT=8123 node test/ui.js                … 静的サーバのポート
+//   CDP_PORT=9444 node test/ui.js            … デバッグポート (塞がっていたら変える)
+//
+// ポートの取り合いは実際に起きる (WSL の wslrelay が 9333 を掴んでいた例がある)。
+// 塞がっていると Chrome は DevTools を開けないまま起動してしまい、しかも
+// **そのポートに居る別のプログラムが応答を返すので接続自体は成功する**。
+// そのままだと原因の分からない「接続できない」になるので、下の CDP 接続で
+// 何が起きたかを覚えておいて、落ちるときに Chrome の出力ごと見せる。
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
@@ -70,13 +77,24 @@ if (!await waitForServer()) {
 }
 
 // ------------------------------------------------------------ Chrome を起動
+//
+// **Chrome の stderr は捨てない。** 繋がらないときの原因はほとんどここに出ていて、
+// 捨ててしまうと「接続できない」しか言えなくなる (ポートが塞がっていれば
+// "Cannot start http server for devtools" が出る)。
 const profile = mkdtempSync(join(tmpdir(), 'vwasm-ui-'));
 const browser = spawn(chromePath, [
   '--headless=new', '--disable-gpu', '--hide-scrollbars', '--no-first-run',
   '--disable-extensions', '--window-size=1340,900',
   `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`,
   BASE,
-], { stdio: 'ignore' });
+], { stdio: ['ignore', 'ignore', 'pipe'] });
+
+let browserLog = '';
+let browserExit = null;
+// 読み捨てずに必ず消費する (溜まるとパイプが詰まって Chrome が止まる)。
+// 保持するのは頭だけ ― 起動時のエラーはそこに出る
+browser.stderr.on('data', (d) => { if (browserLog.length < 64_000) browserLog += d; });
+browser.on('exit', (code) => { browserExit = code; });
 
 function teardown() {
   try { browser.kill(); } catch { /* もう死んでいる */ }
@@ -86,16 +104,52 @@ function teardown() {
 process.on('exit', teardown);
 
 // ---------------------------------------------------------------- CDP 接続
+//
+// 繋がらない理由は 3 通りあって、どれなのかで直し方がまるで違う:
+//
+//   1. ポートに何も応答しない          … Chrome が起動していない / まだ起動中
+//   2. 応答するが CDP ではない          … **そのポートを別のプログラムが使っている**
+//   3. CDP だがページが無い             … ページの読み込みに失敗した
+//
+// 2 が曲者で、fetch は成功してしまうので「起動を待つ」側に倒れて 15 秒待たされた
+// 挙げ句「接続できない」で終わる。**最後に何が起きたかを覚えておいて**、
+// 落ちるときにそれを出す。
 let target = null;
+let why = `ポート ${CDP_PORT} に何も応答しない (Chrome が起動していない?)`;
 for (let i = 0; i < 60 && !target; i++) {
   try {
-    const list = await (await fetch(`http://127.0.0.1:${CDP_PORT}/json`)).json();
-    target = list.find((t) => t.type === 'page' && t.url.includes('editor.html'));
-  } catch { /* まだ起動中 */ }
+    const body = await (await fetch(`http://127.0.0.1:${CDP_PORT}/json`)).text();
+    let list = null;
+    try { list = JSON.parse(body); } catch { /* CDP の応答ではない */ }
+    if (!Array.isArray(list)) {
+      why = `ポート ${CDP_PORT} で Chrome 以外の何かが応答している`
+        + ` (返ってきたのは ${JSON.stringify(body.slice(0, 100))})`;
+    } else if (!(target = list.find((t) => t.type === 'page' && t.url.includes('editor.html')))) {
+      // 拡張機能や service worker まで並べると読めなくなるので、ページだけ数個
+      const pages = list.filter((t) => t.type === 'page').map((t) => t.url);
+      why = `Chrome には繋がったが ${BASE} のページが無い (開いているのは `
+        + `${pages.slice(0, 3).join(' / ') || 'なし'}`
+        + `${pages.length > 3 ? ` 他 ${pages.length - 3} 件` : ''})`;
+    }
+  } catch (e) {
+    why = `ポート ${CDP_PORT} に何も応答しない (${e.cause?.message ?? e.message})`;
+  }
   if (!target) await sleep(250);
 }
+
 if (!target) {
-  console.log('FAIL Chrome のページに接続できない');
+  console.log(`FAIL Chrome のページに接続できない: ${why}`);
+  if (browserExit !== null) console.log(`     Chrome が終了しています (exit ${browserExit})`);
+  // Chrome 自身が理由を書いていることが多いので、そのまま見せる
+  const errs = browserLog.split('\n').filter((l) => /ERROR|FATAL/.test(l)).slice(0, 3);
+  for (const line of errs) console.log(`     chrome: ${line.trim()}`);
+  // 起動に成功したときも "DevTools listening on …" は出るので、
+  // 「devtools」だけで見てはいけない。bind に失敗した印そのものを見る
+  console.log(/Cannot start http server for devtools|bind\(\) returned an error/i.test(browserLog)
+    ? `     → ポート ${CDP_PORT} が他のプログラムに使われています。`
+      + 'CDP_PORT=9444 node test/ui.js のように空いている番号を指定してください'
+    : '     → ポートを変えるなら CDP_PORT=9444 node test/ui.js、'
+      + 'Chrome の場所を指定するなら CHROME=/path/to/chrome');
   process.exit(1);
 }
 

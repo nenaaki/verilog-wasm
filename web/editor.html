@@ -290,8 +290,9 @@
   <button id="save">保存</button>
   <button id="delSave">保存を削除</button>
   <button id="share">リンクをコピー</button>
-  <button id="dlJson" title="回路を .json ファイルとして書き出す">.json を保存</button>
-  <button id="loadJson" title="書き出した .json ファイルを読み込む">.json を読み込む</button>
+  <button id="dlJson" title="いまの回路を .json ファイルとして書き出す">.json を保存</button>
+  <button id="dlLib" title="保存した回路をまとめて 1 個の .json に書き出す">ライブラリを保存</button>
+  <button id="loadJson" title="書き出した .json を読み込む (回路 1 個でもライブラリでも)">.json を読み込む</button>
   <input type="file" id="jsonFile" accept=".json,application/json" hidden>
   <button id="dlWasm" title="いまの回路をコンパイルした .wasm を保存">.wasm を保存</button>
 </div>
@@ -359,6 +360,7 @@ import {
 } from './geometry.js';
 import { readClip, readSaved, readWork, writeClip, writeSaved, writeWork } from './storage.js';
 import { saveFile, safeName } from './download.js';
+import { circuitJson, isLibrary, libraryJson, mergeLibrary } from './library.js';
 import { WAVE, renderWave as drawWave } from './wave.js';
 import {
   MAX_TABLE_BITS, renderRangeTable as drawRangeTable, renderTable as drawTable,
@@ -436,6 +438,8 @@ function loadGraph(compact, listValue = '', name = '') {
   return rebuild();          // 呼び出し側が読み込み完了を待てるように
 }
 
+let savedCount = 0;          // 保存した回路の数 (refreshList が数える)
+
 /** サンプルと保存した回路を 1 つのリストにまとめる */
 function refreshList(select = '') {
   const sel = $('presets');
@@ -448,6 +452,9 @@ function refreshList(select = '') {
   sel.appendChild(samples);
 
   const names = Object.keys(readSaved()).sort();
+  // 保存した回路の数はボタンの有効/無効にも要る。updateEditUI はクリックのたびに
+  // 走るので、そこで localStorage を読み直さずに済むよう、数えたここで控えておく
+  savedCount = names.length;
   if (names.length) {
     const mine = document.createElement('optgroup');
     mine.label = '保存した回路';
@@ -584,10 +591,13 @@ function updateEditUI() {
     applyPanes();
   }
   $('crumb').textContent = blockStack.map((f) => f.label).join(' › ');
-  for (const id of ['presets', 'cname', 'save', 'delSave', 'share', 'dlJson', 'loadJson']) {
+  for (const id of ['presets', 'cname', 'save', 'delSave', 'share', 'dlJson', 'dlLib', 'loadJson']) {
     $(id).disabled = inBlock;
   }
-  if (!inBlock) $('dlJson').disabled = graph.nodes.length === 0;
+  if (!inBlock) {
+    $('dlJson').disabled = graph.nodes.length === 0;
+    $('dlLib').disabled = savedCount === 0;
+  }
 }
 
 // ------------------------------------------------------------ 編集操作
@@ -1876,6 +1886,7 @@ $('save').onclick = () => {
     return;
   }
   refreshList(`u:${name}`);
+  updateEditUI();               // 1 個目の保存で「ライブラリを保存」が使えるようになる
   setMsg(`「${name}」を${overwrite ? '上書き' : '保存し'}ました `
     + `(部品 ${graph.nodes.length} 個 / 配線 ${graph.wires.length} 本)`, 'ok');
 };
@@ -1890,6 +1901,7 @@ $('delSave').onclick = () => {
   delete all[name];
   writeSaved(all);
   refreshList('');
+  updateEditUI();               // 最後の 1 個を消したら「ライブラリを保存」も止まる
   setMsg(`「${name}」を削除しました (回路自体は開いたままです)`, 'ok');
 };
 
@@ -1908,26 +1920,54 @@ $('share').onclick = async () => {
 // ---- .json の書き出し / 読み込み -------------------------------------------
 //
 // 中身は共有リンクと同じ保存形式 (packCircuit) なので、リンクと相互に行き来できる。
-// 手で開いて読める / diff が取れるように、部品と配線は 1 行ずつ並べる。
-
-function circuitToJson(name) {
-  const c = packCircuit(graph);
-  const rows = (arr) => (arr.length
-    ? `[\n${arr.map((r) => `    ${JSON.stringify(r)}`).join(',\n')}\n  ]`
-    : '[]');
-  return `{\n  "name": ${JSON.stringify(name)},\n`
-    + `  "nodes": ${rows(c.nodes)},\n`
-    + `  "wires": ${rows(c.wires)}\n}\n`;
-}
+// 書式と取り込みの判断そのものは web/library.js にある (DOM を持たないので)。
 
 $('dlJson').onclick = () => {
   if (graph.nodes.length === 0) { setMsg('書き出す回路がありません', 'warn'); return; }
   const name = $('cname').value.trim();
   const file = `${safeName(name, 'circuit')}.json`;
-  saveFile(file, circuitToJson(name), 'application/json');
+  saveFile(file, `${circuitJson(name, packCircuit(graph))}\n`, 'application/json');
   setMsg(`${file} を保存しました `
     + `(部品 ${graph.nodes.length} 個 / 配線 ${graph.wires.length} 本)`, 'ok');
 };
+
+// ---- ライブラリ (保存した回路まるごと) -------------------------------------
+//
+// 「保存した回路」がそのまま部品のライブラリなので、書き出すのはその全部。
+// 別の環境へ持っていく / 誰かに渡す / バックアップを取る、が 1 ファイルで済む。
+
+$('dlLib').onclick = () => {
+  const all = readSaved();
+  const names = Object.keys(all).sort();
+  if (names.length === 0) {
+    setMsg('保存した回路がありません (名前を付けて保存すると部品にできます)', 'warn');
+    return;
+  }
+  saveFile('circuits.json', libraryJson(all), 'application/json');
+  setMsg(`circuits.json に ${names.length} 個の回路を書き出しました (${names.join(', ')})`, 'ok');
+};
+
+/** ライブラリを「保存した回路」に取り込む。判断は library.js、伝えるのはここ */
+function importLibrary(list, fileName) {
+  const { all, added, replaced, skipped } = mergeLibrary(readSaved(), list);
+
+  if (added.length + replaced.length === 0) {
+    setMsg(`${fileName} から取り込めた回路がありません\n${skipped.join('\n')}`, 'err');
+    return;
+  }
+  if (!writeSaved(all)) {
+    setMsg('保存できませんでした (localStorage が使えないか、容量を超えました)', 'err');
+    return;
+  }
+  refreshList($('presets').value);
+  updateEditUI();                    // 1 個目が入ると「ライブラリを保存」が使えるようになる
+  const parts = [];
+  if (added.length) parts.push(`${added.length} 個追加 (${added.join(', ')})`);
+  if (replaced.length) parts.push(`${replaced.length} 個上書き (${replaced.join(', ')})`);
+  setMsg(`${fileName} を取り込みました: ${parts.join(' / ')}`
+    + (skipped.length ? `\n取り込めなかったもの: ${skipped.join(' / ')}` : ''),
+    skipped.length ? 'warn' : 'ok');
+}
 
 $('loadJson').onclick = () => $('jsonFile').click();
 
@@ -1937,6 +1977,9 @@ $('jsonFile').onchange = async () => {
   $('jsonFile').value = '';          // 同じファイルをもう一度選んでも change が出るように
   try {
     const data = JSON.parse(await file.text());
+    // ライブラリなら「保存した回路」に取り込む。回路 1 個なら canvas に開く ――
+    // 開ける物と開けない物なので、ファイルを見て振り分ける
+    if (isLibrary(data)) { importLibrary(data.circuits, file.name); return; }
     // name は expandCircuit が見ない追加フィールド。あれば名前欄に入れる
     const name = typeof data.name === 'string' ? data.name.slice(0, 32) : '';
     await loadGraph(data, '', name);

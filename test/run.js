@@ -20,6 +20,7 @@ import {
   flattenGraph, insOf, outsOf, packCircuit, toVerilog,
 } from '../src/schematic.js';
 import { SAMPLE_CIRCUITS } from '../src/samples.js';
+import { circuitJson, isLibrary, libraryJson, mergeLibrary } from '../web/library.js';
 
 const MAX_DEPTH_TEST = 10;   // src 側の上限 (8) より深くする
 
@@ -5231,6 +5232,112 @@ async function testSaveFormat() {
   ok(brokenLink !== null, '保存形式: 壊れたリンクを弾く');
 }
 
+// -------------------------------------------------- 部品ライブラリ (.json)
+//
+// 「保存した回路」がそのまま部品のライブラリなので、まとめて 1 個の .json に
+// 出し入れできる。要点は **ライブラリが「回路 1 個のファイル」を並べただけ**
+// である、という形の作り。おかげで単体のファイルと相互に行き来できる。
+async function testLibrary() {
+  const packed = (name) => packCircuit(expandCircuit(SAMPLE_CIRCUITS[name]));
+  const saved = {
+    半加算器: packed('半加算器 (sum / carry)'),
+    and2: packed('AND ゲート'),
+  };
+
+  // ---- 書き出し ----
+  const text = libraryJson(saved);
+  const back = JSON.parse(text);
+  ok(isLibrary(back), 'ライブラリ: circuits を持つ形で書き出す');
+  eqs(back.circuits.length, 2, 'ライブラリ: 保存した回路が全部入る');
+  eqs(back.circuits.map((c) => c.name).join(','), 'and2,半加算器',
+    'ライブラリ: 名前順に並ぶ (diff が安定する)');
+
+  // **1 個取り出すと単体の .json とまったく同じ形**。ここが形の作りの要点なので、
+  // 文字列そのもので突き合わせる
+  const one = back.circuits.find((c) => c.name === 'and2');
+  eqs(JSON.stringify(one), JSON.stringify(JSON.parse(circuitJson('and2', saved.and2))),
+    'ライブラリ: 1 個取り出すと単体の .json と同じ形');
+  ok(!isLibrary(one), 'ライブラリ: 回路 1 個はライブラリと見なさない');
+
+  // 部品と配線は 1 行ずつ (手で読める / diff が変わった行だけで済む)
+  const lines = circuitJson('and2', saved.and2).split('\n');
+  eqs(lines.filter((l) => /^\s*\[/.test(l)).length,
+    saved.and2.nodes.length + saved.and2.wires.length,
+    'ライブラリ: 部品と配線が 1 行ずつ並ぶ');
+
+  // ---- 取り込み ----
+  const round = mergeLibrary({}, back.circuits);
+  eqs(round.added.sort().join(','), 'and2,半加算器', 'ライブラリ: 空の表に 2 個入る');
+  eqs(round.skipped.length, 0, 'ライブラリ: 落ちるものが無い', round.skipped.join(' / '));
+  for (const name of Object.keys(saved)) {
+    eqs(JSON.stringify(expandCircuit(round.all[name])), JSON.stringify(expandCircuit(saved[name])),
+      `ライブラリ: ${name} が往復して一致する`);
+  }
+
+  // 同じ名前は上書き。2 回取り込んでも増えない
+  const again = mergeLibrary(round.all, back.circuits);
+  eqs(again.added.length, 0, 'ライブラリ: 2 回目は追加されない');
+  eqs(again.replaced.sort().join(','), 'and2,半加算器', 'ライブラリ: 同じ名前は上書きになる');
+  eqs(Object.keys(again.all).length, 2, 'ライブラリ: 取り込みを繰り返しても増えない');
+
+  // 既にあるものと新しいものが混ざったとき
+  const mixed = mergeLibrary({ and2: saved.and2, 自作: saved.and2 },
+    [{ name: 'and2', ...saved.and2 }, { name: '半加算器', ...saved.半加算器 }]);
+  eqs(mixed.added.join(','), '半加算器', 'ライブラリ: 新しいものは追加');
+  eqs(mixed.replaced.join(','), 'and2', 'ライブラリ: 既にあるものは上書き');
+  eqs(Object.keys(mixed.all).sort().join(','), 'and2,半加算器,自作',
+    'ライブラリ: ファイルに無い回路は消さない');
+
+  // ---- 壊れた 1 個でライブラリ全体を落とさない ----
+  const broken = mergeLibrary({}, [
+    { name: 'よい', ...saved.and2 },
+    { name: '部品が変', nodes: [[1, 'そんな部品はない', 0, 0, 0]], wires: [] },
+    { name: 'id が重複', nodes: [[1, 'in', 0, 0, 0], [1, 'in', 0, 50, 0]], wires: [] },
+    { nodes: [], wires: [] },                       // 名前が無い
+    { name: '形が違う', nodes: 'これは配列ではない' },
+    { name: 'よい 2', ...saved.半加算器 },
+  ]);
+  eqs(broken.added.sort().join(','), 'よい,よい 2', 'ライブラリ: 通ったものだけ入る');
+  eqs(broken.skipped.length, 4, 'ライブラリ: 落としたものを数える', broken.skipped.join(' / '));
+  ok(broken.skipped.every((s) => /:/.test(s)), 'ライブラリ: 落とした理由が付く',
+    broken.skipped.join(' / '));
+  ok(broken.skipped.some((s) => /名前がありません/.test(s)), 'ライブラリ: 名前が無いものを名指しする');
+
+  // 名前は前後の空白を落として 32 文字まで (名前欄の maxlength と揃える)
+  const trimmed = mergeLibrary({}, [{ name: `  ${'あ'.repeat(40)}  `, ...saved.and2 }]);
+  eqs(trimmed.added[0].length, 32, 'ライブラリ: 名前は 32 文字で切る');
+
+  // ファイルの中に同じ名前が 2 回あっても 1 個
+  const dup = mergeLibrary({}, [{ name: 'x', ...saved.and2 }, { name: 'x', ...saved.半加算器 }]);
+  eqs(dup.added.join(','), 'x', 'ライブラリ: ファイル内の同名は 1 個と数える');
+  eqs(Object.keys(dup.all).length, 1, 'ライブラリ: 後に書いたほうが残る');
+
+  // 呼び出し側の表は書き換えない (writeSaved が失敗したときに巻き戻せる)
+  const original = { and2: saved.and2 };
+  mergeLibrary(original, [{ name: '半加算器', ...saved.半加算器 }]);
+  eqs(Object.keys(original).join(','), 'and2', 'ライブラリ: 渡された表は書き換えない');
+
+  // circuits が無い / 壊れているものはライブラリと見なさない
+  for (const bad of [null, {}, { circuits: null }, { circuits: '2 個' }, { name: 'x' }]) {
+    ok(!isLibrary(bad), `ライブラリ: ${JSON.stringify(bad)} はライブラリではない`);
+  }
+  eqs(mergeLibrary({}, undefined).added.length, 0, 'ライブラリ: 中身が無くても落ちない');
+
+  // ---- 回路部品を含む回路も往復する (中身が入れ子で入っている) ----
+  const withBlock = {
+    nodes: [
+      [1, 'in', 0, 0, 0, 'a'],
+      [2, 'block', 100, 0, 0, 'part', { ref: 'and2', def: saved.and2 }],
+    ],
+    wires: [],
+  };
+  const lib2 = JSON.parse(libraryJson({ 親: withBlock }));
+  const got = mergeLibrary({}, lib2.circuits);
+  eqs(got.added.join(','), '親', 'ライブラリ: 回路部品を含む回路も入る');
+  eqs(expandCircuit(got.all['親']).nodes[1].type, 'block',
+    'ライブラリ: 埋め込んだ部品の中身が残る');
+}
+
 async function testConstants() {
   // ---- 定数 ----
   const konst = toVerilog({
@@ -5391,6 +5498,7 @@ const suites = [
   ['端子の名前', testPortNames],
   ['回路部品', testBlocks],
   ['保存形式', testSaveFormat],
+  ['部品ライブラリ', testLibrary],
   ['定数', testConstants],
 ];
 
