@@ -1125,8 +1125,19 @@ sim.snapshot();              // 観測可能な全信号
 ## テスト
 
 ```text
-$ node test/run.js
+$ npm test
 2491 件成功, 0 件失敗
+9 件成功, 0 件失敗      ← 本物の Verilog シミュレータとの差分 (下記)
+```
+
+`npm test` は[単体のテスト](test/run.js)と[差分テスト](test/verilog-diff.js)を続けて回す。合わせて 11 秒ほど。**外の基準と突き合わせる網を普段から通す**ためで、`iverilog` が入っていない環境では差分テストだけスキップして正常終了する。
+
+個別に回すなら:
+
+```text
+node test/run.js         # 単体のテストだけ
+npm run test:verilog     # 差分テストだけ
+npm run test:ui          # 回路エディタの操作テスト (headless Chrome)
 ```
 
 この節に書いてある件数はランナー自身が読み合わせる。ズレていたら知らせるが、既定は警告だけで落とさない（テストを足している最中に邪魔しないため）。

@@ -5596,9 +5596,13 @@ async function testConstants() {
 const README = join(HERE, '..', 'README.md');
 
 // 数は必ずマッチの先頭に置く (書き戻しがその前提で成り立っている)
+// 正規表現は「前・数・後」の 3 つに割る。**数だけを狙って書き戻す**のと、
+// 前置きで場所を特定するため ―― `N 件成功, 0 件失敗` は差分テストや UI テストの
+// 出力例にも出てくるので、`$ npm test` の直後という位置で絞り込む。
+// 改行は `\r?\n`。README は環境によって CRLF になる。
 const README_NUMBERS = [
-  { what: 'テストの件数', re: /^(\d+) 件成功, 0 件失敗$/m, actual: () => passed },
-  { what: 'コンパイルエラーの種類', re: /(\d+) 種類のコンパイルエラー/, actual: () => errorKinds },
+  { what: 'テストの件数', re: /(\$ npm test\r?\n)(\d+)( 件成功, 0 件失敗)/, actual: () => passed },
+  { what: 'コンパイルエラーの種類', re: /()(\d+)( 種類のコンパイルエラー)/, actual: () => errorKinds },
 ];
 
 /** @param mode 'check' | 'update' | 'notice' */
@@ -5609,9 +5613,9 @@ function checkReadme(mode) {
     const m = text.match(n.re);
     if (!m) { stale.push(`${n.what}: README の中に見つからない (${n.re})`); continue; }
     const want = String(n.actual());
-    if (m[1] === want) continue;
-    stale.push(`${n.what}: README は ${m[1]} だが実際は ${want}`);
-    text = text.replace(n.re, (hit, num) => want + hit.slice(num.length));
+    if (m[2] === want) continue;
+    stale.push(`${n.what}: README は ${m[2]} だが実際は ${want}`);
+    text = text.replace(n.re, (_, pre, num, post) => pre + want + post);
   }
 
   if (stale.length === 0) {

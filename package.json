@@ -4,7 +4,7 @@
   "description": "Verilog サブセット (ゲート + レジスタ) を WebAssembly にコンパイルする",
   "type": "module",
   "scripts": {
-    "test": "node test/run.js",
+    "test": "node test/run.js && node test/verilog-diff.js",
     "test:readme": "node test/run.js --check-readme",
     "test:verilog": "node test/verilog-diff.js",
     "test:ui": "node test/ui.js",
