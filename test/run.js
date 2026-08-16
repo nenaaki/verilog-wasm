@@ -1935,6 +1935,218 @@ endmodule`;
   eq(cw.get('s5'), 16, '文脈依存幅: 5 ビットなら桁上げが残って 16');
 }
 
+// ------------------------------------------------------------------ signed
+//
+// 符号は幅と同じ 2 段階 (下から決めて上から降ろす) で決まる。効くのは 4 箇所
+// ―― 幅を広げるときの符号拡張、比較、除算・剰余、`>>>` ―― なので、その 4 つと
+// 「片方でも符号なしなら式全体が符号なし」を全通りで確かめる。
+async function testSigned() {
+  const toS4 = (v) => (v >= 8 ? v - 16 : v);
+  const neg4 = (v) => (-v) & 15;
+
+  // --- 符号拡張と、符号が混ざったときの伝わり方 ---
+  const ext = `module sx(input signed [3:0] a, input [3:0] u,
+    output signed [7:0] sa, output [7:0] toU, output [7:0] mixed,
+    output [7:0] viaSigned, output [7:0] viaUnsigned,
+    output [7:0] partSel, output [7:0] cat, output [7:0] plusU);
+    assign sa          = a;            // signed なので符号拡張
+    assign toU         = a;            // 左辺が符号なしでも右辺の符号で決まる
+    assign mixed       = a + 4'b0;     // 4'b0 が符号なし → 式全体が符号なし
+    assign viaSigned   = $signed(u);   // 符号なしを signed として読み直す
+    assign viaUnsigned = $unsigned(a); // signed を符号なしとして読み直す
+    assign partSel     = a[3:0];       // 部分選択は常に符号なし
+    assign cat         = {a};          // 連接も常に符号なし
+    assign plusU       = a + u;        // 片方が符号なし → 両方ゼロ拡張して足す
+  endmodule`;
+  const { all: exts } = await bothSims(ext);
+  let bad = null;
+  for (let a = 0; a < 16 && !bad; a++) {
+    for (let u = 0; u < 16 && !bad; u++) {
+      const s = toS4(a);
+      const want = {
+        sa: s & 255,
+        toU: s & 255,
+        mixed: a,
+        viaSigned: toS4(u) & 255,
+        viaUnsigned: a,
+        partSel: a,
+        cat: a,
+        plusU: (a + u) & 255,
+      };
+      for (const sim of exts) {
+        sim.setInput('a', a).setInput('u', u).eval();
+        for (const [port, w] of Object.entries(want)) {
+          if (Number(sim.get(port)) !== w && !bad) {
+            bad = `${sim.constructor.name} ${port}: a=${s} u=${u} 期待 ${w} / 実際 ${sim.get(port)}`;
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, 'signed: 符号拡張と符号の伝わり方が全通りで一致', bad ?? '');
+
+  // --- 比較・除算・シフト。符号を見る 4 箇所を全通りで ---
+  const ops = `module so(input signed [3:0] a, input signed [3:0] b, input [3:0] u,
+    output slt, output sle, output sgt, output sge, output ult,
+    output signed [3:0] sdiv, output signed [3:0] smod, output [3:0] udiv,
+    output signed [3:0] asr1, output signed [3:0] asrv,
+    output [3:0] lsr1, output signed [3:0] asl, output signed [7:0] wide);
+    assign slt  = a < b;
+    assign sle  = a <= b;
+    assign sgt  = a > b;
+    assign sge  = a >= b;
+    assign ult  = a < u;      // 片方が符号なし → 符号なしの比較
+    assign sdiv = a / b;
+    assign smod = a % b;      // 剰余の符号は被除数に従う
+    assign udiv = a / u;      // 片方が符号なし → 符号なしの除算
+    assign asr1 = a >>> 1;    // 算術右シフト (定数)
+    assign asrv = a >>> u;    // 算術右シフト (バレルシフタ)
+    assign lsr1 = u >>> 1;    // 符号なしの >>> は >> と同じ
+    assign asl  = a <<< 1;    // <<< は << と同じ
+    assign wide = a * b;      // 8 ビット文脈なので符号拡張してから掛ける
+  endmodule`;
+  const { all: opss } = await bothSims(ops);
+
+  // 符号付きの割り算は「絶対値で割ってから符号を戻す」。0 で割ったときは
+  // 符号なしの回路がそのまま出す値 (商は全ビット 1、剰余は被除数) を符号で戻す
+  const sdivmod = (a4, b4) => {
+    const sa = a4 >> 3;
+    const sb = b4 >> 3;
+    const na = sa ? neg4(a4) : a4;
+    const nb = sb ? neg4(b4) : b4;
+    const q = nb === 0 ? 15 : Math.floor(na / nb);
+    const r = nb === 0 ? na : na % nb;
+    return { q: (sa ^ sb) ? neg4(q) : q, r: sa ? neg4(r) : r };
+  };
+
+  bad = null;
+  for (let a = 0; a < 16 && !bad; a++) {
+    for (let b = 0; b < 16 && !bad; b++) {
+      for (let u = 0; u < 16 && !bad; u++) {
+        const sa = toS4(a);
+        const sb = toS4(b);
+        const { q, r } = sdivmod(a, b);
+        const want = {
+          slt: sa < sb ? 1 : 0,
+          sle: sa <= sb ? 1 : 0,
+          sgt: sa > sb ? 1 : 0,
+          sge: sa >= sb ? 1 : 0,
+          ult: a < u ? 1 : 0,
+          sdiv: q,
+          smod: r,
+          udiv: u === 0 ? 15 : Math.floor(a / u),
+          asr1: (sa >> 1) & 15,
+          asrv: u >= 4 ? (sa < 0 ? 15 : 0) : (sa >> u) & 15,
+          lsr1: u >> 1,
+          asl: (a << 1) & 15,
+          wide: (sa * sb) & 255,
+        };
+        for (const sim of opss) {
+          sim.setInput('a', a).setInput('b', b).setInput('u', u).eval();
+          for (const [port, w] of Object.entries(want)) {
+            if (Number(sim.get(port)) !== w && !bad) {
+              bad = `${sim.constructor.name} ${port}: a=${sa} b=${sb} u=${u}`
+                + ` 期待 ${w} / 実際 ${sim.get(port)}`;
+            }
+          }
+        }
+      }
+    }
+  }
+  ok(!bad, 'signed: 比較・除算・算術シフトが全通りで一致', bad ?? '');
+
+  // --- リテラルと parameter の符号 ---
+  // 比較は「外の文脈は受け取らないが、両辺だけで文脈を作る」ので、リテラルの
+  // 符号がそのまま観測できる。文脈幅が配られる位置だと、どちらでも同じ幅まで
+  // 広げてから計算するので差が出ない (`wire [39:0] y = -3;` は両方 2^40-3)。
+  const lits = `module sl(output [7:0] p5, output [7:0] m1, output [7:0] neg3,
+    output [7:0] unsignedLit, output decSigned, output basedUnsigned,
+    output [39:0] wideParam);
+    localparam NEG = -3;
+    assign p5             = 4'sd5;    // 5
+    assign m1             = 4'shF;    // -1 → 8 ビットで 255
+    assign neg3           = -4'sd3;   // -3 → 253
+    assign unsignedLit    = 4'hF;     // 符号なしなので 15 のまま
+    assign decSigned      = -1 < 0;   // 10 進リテラルは signed → 真
+    assign basedUnsigned  = -1 < 'd0; // 'd0 が符号なし → 符号なしの比較で偽
+    assign wideParam      = NEG;      // parameter は 32 ビットの signed
+  endmodule`;
+  const { all: litss } = await bothSims(lits);
+  for (const sim of litss) {
+    const kind = sim.constructor.name;
+    sim.eval();
+    eq(sim.get('p5'), 5, `${kind} signed: 4'sd5 は 5`);
+    eq(sim.get('m1'), 255, `${kind} signed: 4'shF は符号拡張されて 255`);
+    eq(sim.get('neg3'), 253, `${kind} signed: -4'sd3 は 253`);
+    eq(sim.get('unsignedLit'), 15, `${kind} signed: 4'hF は符号なしなので 15`);
+    eq(sim.get('decSigned'), 1, `${kind} signed: 10 進リテラルは signed なので -1 < 0`);
+    eq(sim.get('basedUnsigned'), 0, `${kind} signed: 基数付きリテラルは符号なし`);
+    eq(sim.get('wideParam'), (1n << 40n) - 3n, `${kind} signed: parameter は 32 ビットの signed`);
+  }
+
+  // --- always / case / function ---
+  const seq = `module sq(input clk, input signed [3:0] a,
+    output reg signed [7:0] acc, output reg [7:0] pick);
+    always @(posedge clk) acc <= acc + a;   // 4 ビットを符号拡張して足し込む
+    always @(*) begin
+      case (a)
+        -4'sd1: pick = 8'hAA;
+        4'sd2:  pick = 8'hBB;
+        default: pick = 8'hCC;
+      endcase
+    end
+  endmodule`;
+  const { all: seqs } = await bothSims(seq);
+  for (const sim of seqs) {
+    const kind = sim.constructor.name;
+    sim.reset().setInput('a', neg4(3)).step().step();
+    eq(sim.get('acc'), 250, `${kind} signed: -3 を 2 回足すと -6`);
+    sim.setInput('a', neg4(1)).eval();
+    eq(sim.get('pick'), 0xAA, `${kind} signed: case のラベル -4'sd1 に当たる`);
+    sim.setInput('a', 2).eval();
+    eq(sim.get('pick'), 0xBB, `${kind} signed: case のラベル 4'sd2 に当たる`);
+  }
+
+  const fn = `module sf(input signed [3:0] a, output [7:0] y, output [7:0] z);
+    function signed [3:0] dbl(input signed [3:0] x);
+      dbl = x + x;
+    endfunction
+    function [3:0] udbl(input signed [3:0] x);
+      udbl = x + x;
+    endfunction
+    assign y = dbl(a);    // 戻り値が signed → 符号拡張
+    assign z = udbl(a);   // 戻り値が符号なし → ゼロ拡張
+  endmodule`;
+  const { all: fns } = await bothSims(fn);
+  for (const sim of fns) {
+    const kind = sim.constructor.name;
+    sim.setInput('a', neg4(3)).eval();
+    eq(sim.get('y'), 250, `${kind} signed: function の signed な戻り値は符号拡張される`);
+    eq(sim.get('z'), 10, `${kind} signed: 符号なしの戻り値はゼロ拡張される`);
+  }
+
+  // --- 符号なしなら回路は 1 ゲートも変わらない ---
+  const shrA = compile('module m(input [7:0] a, input [2:0] s, output [7:0] y); assign y = a >>> s; endmodule');
+  const shrL = compile('module m(input [7:0] a, input [2:0] s, output [7:0] y); assign y = a >> s; endmodule');
+  eqs(shrA.stats.gates, shrL.stats.gates,
+    'signed: 符号なしの >>> は >> と同じ回路',
+    `>>>=${shrA.stats.gates} >>=${shrL.stats.gates}`);
+  const shlA = compile('module m(input signed [7:0] a, output signed [7:0] y); assign y = a <<< 3; endmodule');
+  const shlL = compile('module m(input signed [7:0] a, output signed [7:0] y); assign y = a << 3; endmodule');
+  eqs(shlA.stats.gates, shlL.stats.gates,
+    'signed: signed でも <<< は << と同じ回路 (左シフトは常に 0 詰め)',
+    `<<<=${shlA.stats.gates} <<=${shlL.stats.gates}`);
+  const divU = compile('module m(input [7:0] a, input [7:0] b, output [7:0] y); wire [7:0] t = a; assign y = t / b; endmodule');
+  const divUs = compile('module m(input [7:0] a, input [7:0] b, output [7:0] y); wire unsigned [7:0] t = a; assign y = t / b; endmodule');
+  eqs(divU.stats.gates, divUs.stats.gates,
+    'signed: unsigned と明示しても回路は同じ (既定が unsigned)',
+    `既定=${divU.stats.gates} 明示=${divUs.stats.gates}`);
+  const divS = compile('module m(input signed [7:0] a, input signed [7:0] b, output signed [7:0] y); assign y = a / b; endmodule');
+  ok(divS.stats.gates > divU.stats.gates,
+    'signed: 符号付きの除算は符号を戻すぶんだけ大きい',
+    `符号付き=${divS.stats.gates} 符号なし=${divU.stats.gates}`);
+}
+
 // ------------------------------------------------------------------ ALU
 //
 // case の書き方 (複数ラベル・default) と、単項マイナス・中置 XNOR をまとめて通す。
@@ -3293,41 +3505,14 @@ async function testErrors() {
     ['=== は未対応',
       `module m(input [3:0] a, output y); assign y = a === 4'h3; endmodule`,
       /=== は未対応/],
-    ['<<< は未対応',
-      `module m(input [3:0] a, output [3:0] y); assign y = a <<< 1; endmodule`,
-      /<<< は未対応/],
-    ['>>> は未対応',
-      `module m(input [3:0] a, output [3:0] y); assign y = a >>> 1; endmodule`,
-      />>> は未対応/],
-    // signed は書き方が 4 通りある。どれも名指しで断る (素通りさせると
-    // 「')' が必要」「解釈できない文字 '''」のような見当違いのエラーになる)
-    ['signed 付きの ANSI ポートは未対応',
-      `module m(input signed [3:0] a, output [3:0] y); assign y = a; endmodule`,
-      /signed は未対応/],
-    ['signed 付きの wire 宣言は未対応',
-      `module m(input [3:0] a, output [3:0] y); wire signed [3:0] t; assign t = a; assign y = t; endmodule`,
-      /signed は未対応/],
-    ['signed 付きの output reg は未対応',
-      `module m(input clk, output reg signed [3:0] q); always @(posedge clk) q <= 1; endmodule`,
-      /signed は未対応/],
-    ['幅を書かない signed も未対応',
-      `module m(input signed a, output y); assign y = a; endmodule`,
-      /signed は未対応/],
-    ['unsigned は既定なので断る',
-      `module m(input unsigned [3:0] a, output [3:0] y); assign y = a; endmodule`,
-      /unsigned は既定/],
-    ["'s 付きのリテラルは未対応",
-      `module m(output [7:0] y); assign y = 4'sd5; endmodule`,
-      /4'sd5 の 's は未対応/],
-    ["サイズ無しの 's も未対応",
-      `module m(output y); assign y = 'sb1; endmodule`,
-      /'sb1 の 's は未対応/],
-    ['$signed は未対応',
-      `module m(input [3:0] a, output [3:0] y); assign y = $signed(a); endmodule`,
-      /\$signed は未対応/],
-    ['$unsigned は未対応',
-      `module m(input [3:0] a, output [3:0] y); assign y = $unsigned(a); endmodule`,
-      /\$unsigned は未対応/],
+    // signed は通るようになったが、parameter は 32 ビットの signed 固定なので
+    // 幅も符号も書かせない
+    ['parameter の signed 指定は未対応',
+      `module m(output y); parameter signed P = 1; assign y = 1'b0; endmodule`,
+      /parameter の signed 指定は未対応/],
+    ['parameter の unsigned 指定も未対応',
+      `module m(output y); localparam unsigned P = 1; assign y = 1'b0; endmodule`,
+      /parameter の unsigned 指定は未対応/],
     ['システム関数は名前を出して断る',
       `module m(output [7:0] y); assign y = $clog2(8); endmodule`,
       /\$clog2 は未対応 \(システム関数/],
@@ -4659,6 +4844,7 @@ const suites = [
   ['ゲートプリミティブ', testGates],
   ['加算・減算', testArith],
   ['文脈依存幅', testContextWidth],
+  ['signed', testSigned],
   ['畳み込み / CSE', testFoldCse],
   ['刈り取り', testPrune],
   ['乗除算', testMulDiv],

@@ -12,16 +12,16 @@
 //              rstD   … リセット時の値
 //              qAsync … mux(rst, rstD, q)。クロックを待たずに Q へ書き戻す値で、
 //                       eval が Q スロットに store する (d は commit 用)
-//   signals: Map<name, { dir, kind, msb, lsb, width, bits:[netId] }>
+//   signals: Map<name, { dir, kind, signed, msb, lsb, width, bits:[netId] }>
 //
 // 幅の解決は Verilog の文脈依存幅に従う。2 段階に分かれていて、
 // selfWidth() が 1 段目 (下から自己決定幅を求める)、evalExpr(e, ctx) が 2 段目
 // (上から文脈幅を配り、文脈依存の演算子は max(自己決定幅, 文脈幅) で計算する)。
 // 詳しくは selfWidth() の上のコメントと README「幅の規則」を参照。
 //
-// Verilog と違うのはサイズ無し整数リテラルの幅だけ。LRM は 32 ビットだが、
-// ここでは値が収まる最小幅にしている (32 ビットにすると q + 1 が 32 ビット
-// 加算器になり、定数畳み込みも刈り取りも無いので死んだ論理がそのまま残る)。
+// 符号も同じ 2 段階で決まる。signOf() が下から「この式は signed か」を求め、
+// evalExpr(e, ctx, sctx) の sctx が上から降りてくる符号。詳しくは signOf() の
+// 上のコメントを参照。
 
 import { CompileError } from './errors.js';
 import { GATE_PRIMITIVES } from './parser.js';
@@ -212,15 +212,20 @@ export function elaborate(mod, all = [mod]) {
 
   /**
    * 定数式を評価する。パラメータとリテラルだけで組まれた式が対象で、
-   * 幅を持たない整数 (BigInt) として計算する。
+   * 幅を持たない整数 (BigInt) として計算する。負の数もそのまま持てるので、
+   * signed のリテラルは自分の幅で符号拡張してから返す (4'shF は -1)。
    * ビット幅が要る演算 (~ や連接) は意味が決まらないので断る。
    */
   function constExpr(e) {
     const bool = (b) => (b ? 1n : 0n);
     switch (e.type) {
-      case 'num':
+      case 'num': {
         if (e.mask) throw new CompileError(DONT_CARE_ONLY_IN_CASEZ, e.line);
-        return e.bits & ((1n << BigInt(e.width)) - 1n);      // 自分の幅で切る
+        const v = e.bits & ((1n << BigInt(e.width)) - 1n);   // 自分の幅で切る
+        // signed なら最上位ビットが符号。以降は幅を持たない整数として扱う
+        if (e.signed && ((v >> BigInt(e.width - 1)) & 1n) === 1n) return v - (1n << BigInt(e.width));
+        return v;
+      }
       case 'call':
         // 定数式は幅を持たない整数で計算するので、ビットに展開する function は使えない
         throw new CompileError(`定数式では function (${e.name}) を呼べない`, e.line);
@@ -254,8 +259,9 @@ export function elaborate(mod, all = [mod]) {
           case '%':
             if (b === 0n) throw new CompileError('定数式で 0 除算', e.line);
             return a % b;
-          case '<<': return a << b;
-          case '>>': return a >> b;
+          // 幅を持たない整数なので、算術シフトと普通のシフトは同じもの
+          case '<<': case '<<<': return a << b;
+          case '>>': case '>>>': return a >> b;
           case '&': return a & b;
           case '|': return a | b;
           case '^': return a ^ b;
@@ -272,6 +278,10 @@ export function elaborate(mod, all = [mod]) {
       }
       case 'tern':
         return constExpr(e.sel) !== 0n ? constExpr(e.a) : constExpr(e.b);
+      case 'sys':
+        // 定数式は幅を持たない整数なので $signed は何もしない。
+        // $unsigned だけは 32 ビットとして読み直す (parameter の幅と揃える)
+        return e.op === 'signed' ? constExpr(e.a) : (((constExpr(e.a) % WRAP32) + WRAP32) % WRAP32);
       default:
         throw new CompileError(`定数式には使えない式 ('${e.type}')`, e.line);
     }
@@ -287,13 +297,18 @@ export function elaborate(mod, all = [mod]) {
     return { msb, lsb };
   }
 
-  /** 定数の値を LSB 先頭のネット配列にする (パラメータを式の中で使ったとき) */
-  function constBits(value, width) {
+  /**
+   * 定数の値を LSB 先頭のネット配列にする (パラメータを式の中で使ったとき)。
+   * parameter は 32 ビットの signed なので、32 ビットより上は signed な文脈なら
+   * 符号ビットで埋める (`localparam K = -1;` を 40 ビットに代入すると全部 1)。
+   */
+  function constBits(value, width, signed = false) {
     const masked = ((value % WRAP32) + WRAP32) % WRAP32;
+    const fill = signed && ((masked >> BigInt(PARAM_WIDTH - 1)) & 1n) === 1n ? CONST1 : CONST0;
     const out = [];
     for (let b = 0; b < width; b++) {
-      const bit = b < PARAM_WIDTH ? (masked >> BigInt(b)) & 1n : 0n;
-      out.push(bit === 1n ? CONST1 : CONST0);
+      if (b >= PARAM_WIDTH) { out.push(fill); continue; }
+      out.push(((masked >> BigInt(b)) & 1n) === 1n ? CONST1 : CONST0);
     }
     return out;
   }
@@ -332,7 +347,7 @@ export function elaborate(mod, all = [mod]) {
     scopeBase = savedBase;
   }
 
-  function declare(prefix, name, { dir, kind, range }, line) {
+  function declare(prefix, name, { dir, kind, signed, range }, line) {
     const full = prefix + name;
     let s = signals.get(full);
     const r = range ? evalRange(range, line) : null;
@@ -347,7 +362,7 @@ export function elaborate(mod, all = [mod]) {
       }
       s = {
         name: full, local: name, isTop: prefix === '',
-        dir: dir ?? null, kind: kind ?? 'wire', msb, lsb, width, bits,
+        dir: dir ?? null, kind: kind ?? 'wire', signed: !!signed, msb, lsb, width, bits,
       };
       signals.set(full, s);
     } else {
@@ -356,6 +371,9 @@ export function elaborate(mod, all = [mod]) {
       }
       if (dir) s.dir = dir;
       if (kind) s.kind = kind;
+      // 非 ANSI では `output signed [3:0] y;` と `reg [3:0] y;` に分かれて書ける。
+      // どちらか一方に signed が付いていれば signed (Verilog と同じ)
+      if (signed) s.signed = true;
     }
     return s;
   }
@@ -462,6 +480,19 @@ export function elaborate(mod, all = [mod]) {
     if (bits.length === width) return bits;
     if (bits.length > width) return bits.slice(0, width);
     return [...bits, ...Array(width - bits.length).fill(CONST0)];
+  }
+
+  /**
+   * 幅を width に合わせる。resize と違って、signed なら空いた上位を符号ビット
+   * (= 元の最上位ビット) で埋める。ネットを並べるだけなのでゲートは増えない。
+   *
+   * 符号なしとの分かれ目はここ 1 箇所だけ。Verilog の「拡張するときだけ符号を見る」
+   * がそのまま形になっている ― 切り詰めは符号に関係なく上位を捨てる。
+   */
+  function extend(bits, width, signed) {
+    if (bits.length >= width) return resize(bits, width);
+    const fill = signed && bits.length > 0 ? bits[bits.length - 1] : CONST0;
+    return [...bits, ...Array(width - bits.length).fill(fill)];
   }
 
   /**
@@ -637,9 +668,53 @@ export function elaborate(mod, all = [mod]) {
   }
 
   /**
-   * a == b / a != b。差分ビットを OR リダクションして 1 ビットにする。
-   * XNOR の AND リダクションでも同じだが、こちらは基本ゲートだけで済む。
+   * cond が 1 なら 2 の補数で符号反転、0 ならそのまま。
+   * ~x + 1 の「~」を xor(x, cond)、「+1」を桁上げ入力 cond にしたもの。
+   * cond が定数 0 なら畳み込みが全部消すので、符号なしの経路に負担はかからない。
    */
+  function condNeg(bits, cond) {
+    const inv = bits.map((n) => newGate('xor', [n, cond]));
+    return addBits(inv, Array(bits.length).fill(CONST0), cond);
+  }
+
+  /**
+   * 符号付きの a / b と a % b。**Verilog の除算は 0 方向への切り捨て**なので、
+   * floor 除算ではなく「絶対値で割ってから符号を戻す」でよい:
+   *
+   *   商 の符号 = 被除数の符号 ^ 除数の符号
+   *   剰余の符号 = 被除数の符号   (a % b の符号は a に従う)
+   *
+   * 中身は符号なしの divRem をそのまま使う。b が 0 のときも同じで、符号なしの
+   * 回路が出す値 (商は全 1、剰余は |a|) に符号の付け替えがかかる。
+   * 前後の condNeg は cond が信号なので消えないが、加算器 2 個ぶんで、
+   * 割り算本体に比べればごく小さい。
+   */
+  function divRemSigned(a, b) {
+    const sa = a[a.length - 1];
+    const sb = b[b.length - 1];
+    const { quot, rem } = divRem(condNeg(a, sa), condNeg(b, sb));
+    return {
+      quot: condNeg(quot, newGate('xor', [sa, sb])),
+      rem: condNeg(rem, sa),
+    };
+  }
+
+  /**
+   * case 式とラベルが揃えられる幅と符号。比較と同じ規則で、**全部の max(幅)** に
+   * 揃い、**全部が signed のときだけ符号付き**として拡張される (Verilog の規則)。
+   */
+  function caseContext(st) {
+    let cw = selfWidth(st.sel);
+    let cs = signOf(st.sel);
+    for (const it of st.items) {
+      for (const label of it.labels) {
+        cw = Math.max(cw, selfWidth(label));
+        cs = cs && signOf(label);
+      }
+    }
+    return { cw, cs };
+  }
+
   /**
    * case のラベル 1 個と式の一致。casez のときはラベルに書いた z / ? の桁を
    * 比較から外す。ラベルを幅 cw に伸ばしたときの上位は 0 で埋まる (don't care は
@@ -648,11 +723,11 @@ export function elaborate(mod, all = [mod]) {
    * don't care は**リテラルに書いたものだけ**を見る。式で作った z は無いので、
    * ラベルがリテラル以外なら普通の一致になる。
    */
-  function matchLabel(sel, label, cw, casez) {
+  function matchLabel(sel, label, cw, casez, signed) {
     const mask = casez && label.type === 'num' ? label.mask : 0n;
-    if (!mask) return equalBits(sel, evalExpr(label, cw), '==')[0];
+    if (!mask) return equalBits(sel, evalExpr(label, cw, signed), '==')[0];
     // mask を落としたリテラルとして評価する (don't care の桁は 0 が入っている)
-    const bits = evalExpr({ ...label, mask: 0n }, cw);
+    const bits = evalExpr({ ...label, mask: 0n }, cw, signed);
     const diffs = [];
     for (let i = 0; i < cw; i++) {
       if ((mask >> BigInt(i)) & 1n) continue;
@@ -664,6 +739,12 @@ export function elaborate(mod, all = [mod]) {
     return newGate('not', [diff]);
   }
 
+  /**
+   * a == b / a != b。差分ビットを OR リダクションして 1 ビットにする。
+   * XNOR の AND リダクションでも同じだが、こちらは基本ゲートだけで済む。
+   * 符号で分岐しないのはここが「ビット列が同じか」を見ているだけだから ―
+   * 両辺は呼び出し側で同じ幅・同じ符号で揃えてある。
+   */
   function equalBits(a, b, op) {
     const w = Math.max(a.length, b.length);
     const aa = resize(a, w);
@@ -677,11 +758,20 @@ export function elaborate(mod, all = [mod]) {
    * a - b の桁上げ出力だけを作る。1 なら a >= b、0 なら a < b (符号なし)。
    * 和は使わないので作らない。減算なので b を反転し、桁上げ入力は 1。
    * 最下段は桁上げ入力が定数 1 に決まっているので (a&b)|(1&(a^b)) = a|b に縮む。
+   *
+   * **符号付きの大小は「最上位ビットを反転してから符号なしで比べる」と同じ**
+   * (両辺に 2^(w-1) の下駄を履かせると、-8…7 が 0…15 に順序を保ったまま移る)。
+   * not ゲートが 2 個増えるだけで、比較器そのものは 1 つで済む。
    */
-  function geCarry(a, b) {
+  function geCarry(a, b, signed = false) {
     const w = Math.max(a.length, b.length);
-    const aa = resize(a, w);
-    const nb = resize(b, w).map((n) => newGate('not', [n]));
+    let aa = resize(a, w);
+    let bb = resize(b, w);
+    if (signed) {
+      aa = [...aa.slice(0, w - 1), newGate('not', [aa[w - 1]])];
+      bb = [...bb.slice(0, w - 1), newGate('not', [bb[w - 1]])];
+    }
+    const nb = bb.map((n) => newGate('not', [n]));
     let carry = newGate('or', [aa[0], nb[0]]);
     for (let i = 1; i < w; i++) {
       const axb = newGate('xor', [aa[i], nb[i]]);
@@ -698,10 +788,10 @@ export function elaborate(mod, all = [mod]) {
     '>': { swap: true, invert: true },     // ~(b >= a)
   };
 
-  /** 関係演算子。結果は Verilog と同じく 1 ビット */
-  function compareBits(a, b, op) {
+  /** 関係演算子。結果は Verilog と同じく 1 ビット (符号なし) */
+  function compareBits(a, b, op, signed) {
     const { swap, invert } = CMP[op];
-    const ge = swap ? geCarry(b, a) : geCarry(a, b);
+    const ge = swap ? geCarry(b, a, signed) : geCarry(a, b, signed);
     return invert ? [newGate('not', [ge])] : [ge];
   }
 
@@ -715,11 +805,15 @@ export function elaborate(mod, all = [mod]) {
    * 代入先の幅は見ないので、左辺が広いと押し出されたビットは戻ってこない。
    * これは + / - と同じ割り切り (README の「幅の規則」にまとめてある)。
    * 幅を増やしたいときは連接を使う: {hi, 4'h0} は hi << 4 と違って幅が曖昧にならない。
+   *
+   * fill は右シフトで空いた上位に詰めるネット。`>>` なら 0、`>>>` (signed の
+   * 算術右シフト) なら符号ビットを渡す。左シフトは signed でも常に 0 詰め。
    */
-  function shiftFixed(bits, sh, op) {
+  function shiftFixed(bits, sh, op, fill = CONST0) {
     const w = bits.length;
-    if (sh >= w) return Array(w).fill(CONST0);   // 全部押し出される (巨大なリテラル対策も兼ねる)
-    if (op === '>>') return resize(bits.slice(sh), w);
+    // 全部押し出される (巨大なリテラル対策も兼ねる)。算術右シフトなら符号が残る
+    if (sh >= w) return Array(w).fill(op === '>>' ? fill : CONST0);
+    if (op === '>>') return [...bits.slice(sh), ...Array(sh).fill(fill)];
     return [...Array(sh).fill(CONST0), ...bits.slice(0, w - sh)];
   }
 
@@ -727,10 +821,13 @@ export function elaborate(mod, all = [mod]) {
    * シフト量が信号のときのシフト (バレルシフタ)。シフト量の各ビットについて
    * 「2^j ずらすかどうか」を mux で選ぶ log 段構成。
    *
-   * 2^j が幅以上になるビットは、立っていたら結果が全 0 になるだけなので、段を
-   * 積まずにまとめて 1 段のマスクにする。
+   * 2^j が幅以上になるビットは、立っていたら結果が全 0 (算術右シフトなら全部が
+   * 符号ビット) になるだけなので、段を積まずにまとめて 1 段のマスクにする。
+   *
+   * fill は shiftFixed と同じ。**段ごとに詰め直しても値は変わらない** ―
+   * 算術右シフトは符号ビットを保つので、どの段でも詰めるのは同じネットになる。
    */
-  function barrelShift(a, amt, op) {
+  function barrelShift(a, amt, op, fill = CONST0) {
     const w = a.length;
     let cur = a;
     const overflow = [];
@@ -738,14 +835,15 @@ export function elaborate(mod, all = [mod]) {
     for (let j = 0; j < amt.length; j++) {
       const sh = 2 ** j;
       if (sh >= w) { overflow.push(amt[j]); continue; }
-      const shifted = shiftFixed(cur, sh, op);
+      const shifted = shiftFixed(cur, sh, op, fill);
       cur = cur.map((n, i) => newGate('mux', [amt[j], shifted[i], n]));
     }
 
     if (overflow.length > 0) {
       let big = overflow[0];
       for (let k = 1; k < overflow.length; k++) big = newGate('or', [big, overflow[k]]);
-      cur = cur.map((n) => newGate('mux', [big, CONST0, n]));
+      const out = op === '>>' ? fill : CONST0;
+      cur = cur.map((n) => newGate('mux', [big, out, n]));
     }
     return cur;
   }
@@ -767,6 +865,10 @@ export function elaborate(mod, all = [mod]) {
   // 「1 ビットの結果を反転」になるので、ここでは扱わなくてよい。
   const REDUCE = { '&': 'and', '|': 'or', '^': 'xor' };
 
+  // シフト 4 種。`<<<` は signed でも `<<` と同じ結果になる (左シフトは常に 0 詰め)
+  // ので同じ扱い。`>>>` だけが「signed なら符号ビットで埋める」算術右シフトになる。
+  const SHIFT = { '<<': 'left', '<<<': 'left', '>>': 'right', '>>>': 'arith' };
+
   // ---- 自己決定幅 (文脈依存幅の 1 段目) --------------------------------------
   //
   // Verilog は式の幅を 2 段階で決める:
@@ -781,6 +883,10 @@ export function elaborate(mod, all = [mod]) {
   // ゲートは作らないので、同じノードを何度尋ねても副作用は無い。ノードごとに
   // 結果をキャッシュして、深い式で何度も辿らないようにしてある。
   const selfWidthCache = new Map();
+  const signCache = new Map();
+
+  /** 添字が変わると幅も符号 (部分選択かどうか) も変わり得るので、まとめて捨てる */
+  const clearExprCache = () => { selfWidthCache.clear(); signCache.clear(); };
 
   function selfWidth(e) {
     const hit = selfWidthCache.get(e);
@@ -794,6 +900,9 @@ export function elaborate(mod, all = [mod]) {
     switch (e.type) {
       case 'num':
         return e.width;
+      // $signed / $unsigned は符号だけを付け替える。幅は中身のまま
+      case 'sys':
+        return selfWidth(e.a);
       case 'call':
         // 関数呼び出しの自己決定幅は宣言した戻り値の幅。中身は見なくて済む
         return funcWidth(lookupFunc(e));
@@ -809,7 +918,7 @@ export function elaborate(mod, all = [mod]) {
       case 'bin':
         if (e.op === '&&' || e.op === '||') return 1;
         if (e.op === '==' || e.op === '!=' || CMP[e.op]) return 1;
-        if (e.op === '<<' || e.op === '>>') return selfWidth(e.a);
+        if (SHIFT[e.op]) return selfWidth(e.a);
         return Math.max(selfWidth(e.a), selfWidth(e.b));
       case 'tern':
         return Math.max(selfWidth(e.a), selfWidth(e.b));
@@ -825,39 +934,124 @@ export function elaborate(mod, all = [mod]) {
     }
   }
 
+  // ---- 符号 (signed か) ------------------------------------------------------
+  //
+  // 幅とまったく同じ 2 段階で決まる:
+  //   1. 下から「この式は signed か」を求める        … signOf()
+  //   2. 上から降ろして、文脈依存の位置ではそれに従う … evalExpr の sctx
+  //
+  // 下からの規則 (Verilog LRM 5.5.1):
+  //   signed になるもの … signed 宣言した信号まるごと、's 付きリテラル、
+  //                       基数を書かない 10 進リテラル、parameter、$signed(x)
+  //   常に符号なし     … ビット選択・部分選択・連接・繰り返し連接・
+  //                       比較 / 論理演算 / リダクションの結果、$unsigned(x)
+  //   両辺が signed なら signed … + - * / % & | ^ ~^ と ?: の値側
+  //   左オペランドに従う        … シフト
+  //
+  // 上から降ろすのが要点で、**片方でも符号なしなら式全体が符号なしになり、
+  // それが文脈依存のオペランドにも伝わる**。だから signed な a も
+  // 「unsigned + a」の中ではゼロ拡張されるし、signed どうしの割り算でも
+  // 外側に符号なしが混じれば符号なし除算になる (Verilog の有名な落とし穴)。
+
+  /** 参照が signed か。ビット選択 / 部分選択は Verilog では常に符号なし */
+  function refSigned(node) {
+    if (node.range) return false;
+    if (node.path) {
+      const name = pathName(node);
+      return !!signals.get(resolveScope(name) + name)?.signed;
+    }
+    const local = funcEnv?.get(node.name);
+    if (local) return !!local.signed;
+    const base = resolveScope(node.name);
+    // parameter は 32 ビットの signed (サイズ無しの 10 進リテラルと同じ扱い)
+    if (params.has(base + node.name)) return true;
+    return !!signals.get(base + node.name)?.signed;
+  }
+
+  function signOf(e) {
+    const hit = signCache.get(e);
+    if (hit !== undefined) return hit;
+    const s = computeSign(e);
+    signCache.set(e, s);
+    return s;
+  }
+
+  function computeSign(e) {
+    switch (e.type) {
+      case 'num':
+        return !!e.signed;
+      case 'sys':
+        return e.op === 'signed';
+      case 'call':
+        return !!lookupFunc(e).signed;
+      case 'ref':
+        return refSigned(e);
+      case 'un':
+        // 結果が 1 ビットに決まるもの (論理否定・リダクション) は符号なし。
+        // ~ と単項 - はオペランドの符号をそのまま引き継ぐ
+        if (e.op === '!' || REDUCE[e.op] || e.op === '~^' || e.op === '^~') return false;
+        return signOf(e.a);
+      case 'bin':
+        if (e.op === '&&' || e.op === '||') return false;
+        if (e.op === '==' || e.op === '!=' || CMP[e.op]) return false;
+        if (SHIFT[e.op]) return signOf(e.a);          // シフト量の符号は関係ない
+        return signOf(e.a) && signOf(e.b);
+      case 'tern':
+        return signOf(e.a) && signOf(e.b);
+      case 'concat':
+      case 'repeat':
+        return false;                                 // 連接は常に符号なし
+      default:
+        throw new CompileError(`未知の式ノード '${e.type}'`, e.line);
+    }
+  }
+
   /**
    * 式を LSB 先頭のネット配列に展開する (文脈依存幅の 2 段目)。
    *
    * ctx は上から配られてくる文脈幅。0 は「文脈なし」= 自己決定幅で計算する、の意味。
    * 実効幅は max(自己決定幅, ctx) で、文脈依存の演算子はこれを子に配る。
    * 返す配列の長さは必ず実効幅になるので、呼び出し側は代入先の幅に resize するだけ。
+   *
+   * sctx は上から降ろされてくる符号。null は「自己決定」= signOf(e) を使う、の意味で、
+   * 自己決定の位置 (代入の右辺・連接のパート・シフト量など) からはこれで呼ぶ。
+   * 幅を広げるときにゼロ拡張するか符号拡張するか、`/` `%` `>>>` `<` などを
+   * 符号付きで作るかどうかが、この 1 個の値で決まる。
    */
-  function evalExpr(e, ctx = 0) {
+  function evalExpr(e, ctx = 0, sctx = null) {
     const w = Math.max(selfWidth(e), ctx);
+    const sg = sctx === null ? signOf(e) : sctx;
 
     switch (e.type) {
       // 関数呼び出しは自己決定幅 (= 宣言した戻り値の幅) で展開して、
-      // 外の文脈幅にはゼロ拡張で合わせる。文脈は中に配らない
+      // 外の文脈幅には拡張で合わせる。文脈は中に配らない
       case 'call':
-        return resize(inlineFunc(e), w);
+        return extend(inlineFunc(e), w, sg);
+      // $signed / $unsigned は符号を付け替えるだけ。中身は自己決定で、
+      // 外の文脈幅への拡張がゼロ拡張か符号拡張かだけが変わる
+      case 'sys':
+        return extend(evalExpr(e.a), w, sg);
       case 'num': {
         if (e.mask) throw new CompileError(DONT_CARE_ONLY_IN_CASEZ, e.line);
+        // 自分の幅より上は符号ビット (符号なしなら 0)。ここでマスクしないと
+        // 4'hFF が 255 のまま広がる
+        const top = (e.bits >> BigInt(e.width - 1)) & 1n;
+        const fill = sg && top === 1n ? 1n : 0n;
         const out = [];
         for (let b = 0; b < w; b++) {
-          // 自分の幅より上は 0。ここでマスクしないと 4'hFF が 255 のまま広がる
-          const bit = b < e.width ? (e.bits >> BigInt(b)) & 1n : 0n;
+          const bit = b < e.width ? (e.bits >> BigInt(b)) & 1n : fill;
           out.push(bit === 1n ? CONST1 : CONST0);
         }
         return out;
       }
       case 'ref': {
-        if (e.path) return resize(refBits(e), w);
+        if (e.path) return extend(refBits(e), w, sg);
         const pv = params.get(resolveScope(e.name) + e.name);
         if (pv !== undefined) {
           if (e.range) throw new CompileError('parameter のビット選択は未対応', e.line);
-          return constBits(pv, w);
+          return constBits(pv, w, sg);
         }
-        return resize(refBits(e), w);
+        return extend(refBits(e), w, sg);
       }
       case 'un': {
         if (e.op === '!') {
@@ -873,7 +1067,7 @@ export function elaborate(mod, all = [mod]) {
         if (e.op === '~^' || e.op === '^~') {
           return resize([newGate('not', [reduce(evalExpr(e.a), 'xor')])], w);
         }
-        const a = evalExpr(e.a, w);        // ~ と単項 - は文脈依存
+        const a = evalExpr(e.a, w, sg);    // ~ と単項 - は文脈依存 (符号も降ろす)
         if (e.op === '~') return a.map((n) => newGate('not', [n]));
         if (e.op === '-') {
           // 2 の補数で符号反転
@@ -896,29 +1090,41 @@ export function elaborate(mod, all = [mod]) {
           // 比較は外の文脈を受け取らないが、2 つのオペランドが互いの max(幅) に
           // 揃えられる。つまりオペランド 2 つだけで文脈を作る。
           // (8 ビットのリテラルと比べると、左辺の a - b も 8 ビットで計算される)
+          // 符号も同じで、**両辺とも signed のときだけ符号付きの比較**になる。
           const cw = Math.max(selfWidth(e.a), selfWidth(e.b));
-          const l = evalExpr(e.a, cw);
-          const r = evalExpr(e.b, cw);
-          const bits = CMP[e.op] ? compareBits(l, r, e.op) : equalBits(l, r, e.op);
+          const cs = signOf(e.a) && signOf(e.b);
+          const l = evalExpr(e.a, cw, cs);
+          const r = evalExpr(e.b, cw, cs);
+          // == / != はビット列が同じかどうかなので、符号の分岐は要らない
+          const bits = CMP[e.op] ? compareBits(l, r, e.op, cs) : equalBits(l, r, e.op);
           return resize(bits, w);
         }
 
-        // --- シフト: 左は文脈依存、シフト量は自己決定 ---
-        if (e.op === '<<' || e.op === '>>') {
-          const a = evalExpr(e.a, w);
+        // --- シフト: 左は文脈依存、シフト量は自己決定 (符号なしとして読む) ---
+        if (SHIFT[e.op]) {
+          const kind = SHIFT[e.op];
+          const a = evalExpr(e.a, w, sg);
+          const dir = kind === 'left' ? '<<' : '>>';
+          // 算術右シフトで空いた上位に詰めるのは符号ビット。signed でなければ
+          // >>> は >> と同じ (Verilog の規則そのもの)
+          const fill = kind === 'arith' && sg ? a[a.length - 1] : CONST0;
           // リテラルなら並べ替えだけ、信号ならバレルシフタ
           return e.b.type === 'num'
-            ? shiftFixed(a, Number(e.b.bits), e.op)
-            : barrelShift(a, evalExpr(e.b), e.op);
+            ? shiftFixed(a, Number(e.b.bits), dir, fill)
+            : barrelShift(a, evalExpr(e.b), dir, fill);
         }
 
         // --- 残り (ビット演算・算術) は両辺とも文脈依存 ---
-        const a = evalExpr(e.a, w);
-        const b = evalExpr(e.b, w);
+        const a = evalExpr(e.a, w, sg);
+        const b = evalExpr(e.b, w, sg);
+        // + - * と & | ^ は 2 の補数なら符号で結果が変わらない (下位 w ビットが同じ)。
+        // 符号を見るのは割り算だけ
         if (e.op === '+' || e.op === '-') return addSub(a, b, e.op);
         if (e.op === '*') return mulBits(a, b);
-        if (e.op === '/') return divRem(a, b).quot;
-        if (e.op === '%') return divRem(a, b).rem;
+        if (e.op === '/' || e.op === '%') {
+          const r = sg ? divRemSigned(a, b) : divRem(a, b);
+          return e.op === '/' ? r.quot : r.rem;
+        }
         // 中置の ~^ / ^~ はビットごとの XNOR
         if (e.op === '~^' || e.op === '^~') {
           return a.map((n, i) => newGate('not', [newGate('xor', [n, b[i]])]));
@@ -929,8 +1135,8 @@ export function elaborate(mod, all = [mod]) {
       }
       case 'tern': {
         const sel = reduceOr(evalExpr(e.sel));   // 条件は自己決定
-        const a = evalExpr(e.a, w);
-        const b = evalExpr(e.b, w);
+        const a = evalExpr(e.a, w, sg);
+        const b = evalExpr(e.b, w, sg);
         return a.map((n, i) => newGate('mux', [sel, n, b[i]]));
       }
       case 'concat': {
@@ -1032,22 +1238,26 @@ export function elaborate(mod, all = [mod]) {
       throw new CompileError(`function '${f.name}' の呼び出しが深すぎる (再帰は未対応)`, node.line);
     }
 
-    // 引数は**呼び出し側の環境**で評価する。渡した後に新しい環境へ切り替える
+    // 引数は**呼び出し側の環境**で評価する。渡した後に新しい環境へ切り替える。
+    // 引数への受け渡しは代入と同じなので、幅を合わせるときの拡張は
+    // 渡す式そのものの符号で決まる (evalExpr が実効幅まで済ませてくれる)
     const bound = f.args.map((a, i) => {
       const r = declRange(a.range, a.line);
-      return [a.name, { ...r, bits: resize(evalExpr(node.args[i], r.width), r.width) }];
+      return [a.name, {
+        ...r, signed: !!a.signed, bits: resize(evalExpr(node.args[i], r.width), r.width),
+      }];
     });
 
     const env = new Map(bound);
     // 戻り値とローカルは 0 から始める (Verilog では未定義だが 2 値しか無いので 0)
     const retR = declRange(f.range, f.line);
-    env.set(f.name, { ...retR, bits: Array(retR.width).fill(CONST0) });
+    env.set(f.name, { ...retR, signed: !!f.signed, bits: Array(retR.width).fill(CONST0) });
     for (const l of f.locals) {
       if (env.has(l.name)) {
         throw new CompileError(`${f.name}: '${l.name}' が引数と重複している`, l.line);
       }
       const r = declRange(l.range, l.line);
-      env.set(l.name, { ...r, bits: Array(r.width).fill(CONST0) });
+      env.set(l.name, { ...r, signed: !!l.signed, bits: Array(r.width).fill(CONST0) });
     }
 
     // ローカルの integer も for のループ変数。scope はいまの module のままにする
@@ -1105,7 +1315,7 @@ export function elaborate(mod, all = [mod]) {
     let cur = state;
     try {
       for (let n = 0; ; n++) {
-        selfWidthCache.clear();      // 添字が変わると部分選択の幅も変わり得る
+        clearExprCache();      // 添字が変わると部分選択の幅も変わり得る
         if (constExpr(st.cond) === 0n) break;
         if (n >= MAX_UNROLL) {
           throw new CompileError(
@@ -1115,7 +1325,7 @@ export function elaborate(mod, all = [mod]) {
         cur = run(st.body, cur);
       }
     } finally {
-      selfWidthCache.clear();
+      clearExprCache();
     }
     return cur;
   }
@@ -1130,11 +1340,11 @@ export function elaborate(mod, all = [mod]) {
     let cur = state;
     try {
       for (let k = 0; k < Number(n); k++) {
-        selfWidthCache.clear();
+        clearExprCache();
         cur = run(st.body, cur);
       }
     } finally {
-      selfWidthCache.clear();
+      clearExprCache();
     }
     return cur;
   }
@@ -1167,7 +1377,7 @@ export function elaborate(mod, all = [mod]) {
       params.set(key, constExpr(st.init));
       for (let n = 0; ; n++) {
         // 添字が変わると部分選択の幅も変わり得るので、幅のキャッシュを捨てる
-        selfWidthCache.clear();
+        clearExprCache();
         if (constExpr(st.cond) === 0n) break;
         if (n >= MAX_UNROLL) {
           throw new CompileError(
@@ -1177,7 +1387,7 @@ export function elaborate(mod, all = [mod]) {
         params.set(key, constExpr(st.step));
       }
     } finally {
-      selfWidthCache.clear();
+      clearExprCache();
       if (had) params.set(key, saved); else params.delete(key);
     }
     return cur;
@@ -1250,11 +1460,8 @@ export function elaborate(mod, all = [mod]) {
       }
 
       if (st.type === 'case') {
-        let cw = selfWidth(st.sel);
-        for (const it of st.items) {
-          for (const label of it.labels) cw = Math.max(cw, selfWidth(label));
-        }
-        const sel = evalExpr(st.sel, cw);
+        const { cw, cs } = caseContext(st);
+        const sel = evalExpr(st.sel, cw, cs);
         const before = new Map(cur);
         let acc = st.default ? runFuncStmts(st.default, new Map(before)) : new Map(before);
         for (let k = st.items.length - 1; k >= 0; k--) {
@@ -1262,7 +1469,7 @@ export function elaborate(mod, all = [mod]) {
           syncEnv(before);
           let cond = null;
           for (const label of it.labels) {
-            const hit = matchLabel(sel, label, cw, st.casez);
+            const hit = matchLabel(sel, label, cw, st.casez, cs);
             cond = cond === null ? hit : newGate('or', [cond, hit]);
           }
           acc = mergeBits(cond, runFuncStmts(it.stmts, new Map(before)), acc);
@@ -1328,13 +1535,8 @@ export function elaborate(mod, all = [mod]) {
       }
 
       if (st.type === 'case') {
-        // case 式と全ラベルは、そのすべての max(幅) に揃えられる (Verilog の規則)。
-        // 符号なししか無いので結果は max(2 つ) と同じになるが、規則どおりにしておく。
-        let cw = selfWidth(st.sel);
-        for (const it of st.items) {
-          for (const label of it.labels) cw = Math.max(cw, selfWidth(label));
-        }
-        const sel = evalExpr(st.sel, cw);
+        const { cw, cs } = caseContext(st);
+        const sel = evalExpr(st.sel, cw, cs);
         // default (無ければ「保持」) を土台にして後ろの項目から積む。こうすると
         // 先に書いた項目の mux が外側に来て、Verilog の「上から順に最初に一致
         // したものが勝つ」がそのまま出る。
@@ -1343,7 +1545,7 @@ export function elaborate(mod, all = [mod]) {
           const it = st.items[k];
           let cond = null;
           for (const label of it.labels) {
-            const hit = matchLabel(sel, label, cw, st.casez);
+            const hit = matchLabel(sel, label, cw, st.casez, cs);
             cond = cond === null ? hit : newGate('or', [cond, hit]);
           }
           acc = mergeStates(cond, runStmts(it.stmts, new Map(cur)), acc, cur);
@@ -1425,9 +1627,13 @@ export function elaborate(mod, all = [mod]) {
     };
   }
 
-  /** ネット列どうしを接続する (buf ゲートで橋渡し) */
-  function connectNets(lhs, rhsBits, what, line) {
-    const src = resize(rhsBits, lhs.length);
+  /**
+   * ネット列どうしを接続する (buf ゲートで橋渡し)。
+   * signed は「右辺が狭いときに符号拡張するか」。式から来る場合は evalExpr が
+   * 文脈幅まで広げ終えているので、効くのはネット列を直に渡す出力ポートだけ。
+   */
+  function connectNets(lhs, rhsBits, what, line, signed = false) {
+    const src = extend(rhsBits, lhs.length, signed);
     lhs.forEach((q, i) => {
       setDriver(q, what, line);
       const gate = { op: 'buf', out: q, in: [src[i]] };
@@ -1588,7 +1794,7 @@ export function elaborate(mod, all = [mod]) {
     const savedEnv = funcEnv;
     funcEnv = new Map();
     for (const [name, s] of targets) {
-      funcEnv.set(name, { bits: [...s.bits], msb: s.msb, lsb: s.lsb });
+      funcEnv.set(name, { bits: [...s.bits], msb: s.msb, lsb: s.lsb, signed: s.signed });
     }
     let out;
     try {
@@ -1705,7 +1911,7 @@ export function elaborate(mod, all = [mod]) {
       try {
         params.set(key, constExpr(item.init));
         for (let n = 0; ; n++) {
-          selfWidthCache.clear();      // 添字が変わると部分選択の幅も変わり得る
+          clearExprCache();      // 添字が変わると部分選択の幅も変わり得る
           if (constExpr(item.cond) === 0n) break;
           if (n >= MAX_UNROLL) {
             throw new CompileError(
@@ -1717,7 +1923,7 @@ export function elaborate(mod, all = [mod]) {
           params.set(key, constExpr(item.step));
         }
       } finally {
-        selfWidthCache.clear();
+        clearExprCache();
         if (had) params.set(key, savedVal); else params.delete(key);
       }
       return;
@@ -1920,7 +2126,7 @@ export function elaborate(mod, all = [mod]) {
             `出力ポート '${pname}' には信号名をつなぐ (式は駆動できない)`, item.line);
         }
         connectNets(refBits(conn.expr), port.bits,
-          `${item.name} の出力ポート ${pname}`, item.line);
+          `${item.name} の出力ポート ${pname}`, item.line, port.signed);
       } else {
         throw new CompileError(`ポート '${pname}' の方向が宣言されていない`, item.line);
       }

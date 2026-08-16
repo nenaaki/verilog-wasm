@@ -4,8 +4,7 @@
 
 import { CompileError } from './errors.js';
 
-// 's は符号付きリテラル (4'sd5)。扱わないが、基数の前に来るので読めないと
-// 「解釈できない文字 '''」になってしまう。読んでから名指しで断る。
+// 's は符号付きリテラル (4'sd5)。ビット列は 4'd5 と同じで、signed の印だけが付く。
 // z / Z / ? は casez のラベルで「その桁を比較しない」印として使う。x / X は
 // 値としての x なので断るが、これも読めないと理由が伝わらないので桁に含める。
 const RE_SIZED = /(\d+)?'([sS]?)([bodhBODH])([0-9a-fA-F_xXzZ?]+)/y;
@@ -22,14 +21,15 @@ const PUNCT2 = ['<=', '>=', '==', '!=', '<<', '>>', '&&', '||', '~^', '^~'];
 // '.' は名前指定のポート接続 (.a(x))、'#' はパラメータ指定 (#(.W(4))) で使う
 // '/' はコメントの判定を先に済ませてからここに来る
 const PUNCT1 = ['?', ':', '(', ')', '[', ']', '{', '}', ',', ';', '=', '&', '|', '^', '~', '@', '+', '-', '<', '>', '!', '.', '#', '*', '/', '%'];
+// 算術シフト。'<<' や '>>' より先に見ないと 2 文字で切れてしまうので、
+// 3 文字の候補をここでまとめて先に試す。
+const PUNCT3 = ['<<<', '>>>'];
 // 対応している演算子と見た目が近いので、素通りさせずに名指しで断る。
-// どれも「扱っていないものが絡まなければ同じ意味になる」ので、黙って別扱いに
+// どちらも「扱っていないものが絡まなければ同じ意味になる」ので、黙って別扱いに
 // するより理由を出したほうがよい。
 const PUNCT3_REJECT = {
   '===': '=== は未対応 (x / z を扱わないので == と同じ意味になる)',
   '!==': '!== は未対応 (x / z を扱わないので != と同じ意味になる)',
-  '<<<': '<<< は未対応 (算術左シフトは signed でも << と同じ結果になる)',
-  '>>>': '>>> は未対応 (signed を扱わないので >> と同じ意味になる)',
 };
 
 const RADIX = { b: 2, o: 8, d: 10, h: 16 };
@@ -71,11 +71,6 @@ export function lex(src) {
     const sized = RE_SIZED.exec(src);
     if (sized) {
       const [raw, widthStr, signChar, baseChar, digitsRaw] = sized;
-      if (signChar) {
-        throw new CompileError(
-          `${raw} の 's は未対応 (signed を扱わないので `
-          + `${widthStr ?? ''}'${baseChar}${digitsRaw} と同じビット列になる)`, line);
-      }
       const radix = RADIX[baseChar.toLowerCase()];
       const digits = digitsRaw.replace(/_/g, '');
       // mask は「比較しない桁」。1 桁が基数ぶんのビットになるので、value と同じ
@@ -99,12 +94,16 @@ export function lex(src) {
       const width = widthStr ? parseInt(widthStr, 10) : UNSIZED_WIDTH;
       if (width < 1 || width > 4096) throw new CompileError(`ビット幅 ${width} が不正`, line);
       const wm = (1n << BigInt(width)) - 1n;
-      tokens.push({ type: 'num', value: raw, line, width, bits: value & wm, mask: mask & wm });
+      tokens.push({
+        type: 'num', value: raw, line, width, bits: value & wm, mask: mask & wm,
+        signed: !!signChar,
+      });
       i += raw.length;
       continue;
     }
 
-    // 素の 10 進数。ビット選択の添字にも使うので数値そのものを保持する
+    // 素の 10 進数。ビット選択の添字にも使うので数値そのものを保持する。
+    // 基数を書かない 10 進リテラルは Verilog では signed (integer と同じ)
     RE_DEC.lastIndex = i;
     const dec = RE_DEC.exec(src);
     if (dec) {
@@ -118,6 +117,7 @@ export function lex(src) {
         bits: value,
         plain: Number(value),
         unsized: true,
+        signed: true,
       });
       i += raw.length;
       continue;
@@ -131,19 +131,28 @@ export function lex(src) {
       continue;
     }
 
-    // $signed / $display のようなシステム関数・タスク。'$' を素の記号として
-    // 弾くと理由が伝わらないので、名前まで読んでから断る
+    // $signed / $unsigned は符号の付け替えとして通す。$display のような
+    // 他のシステム関数・タスクは、'$' を素の記号として弾くと理由が伝わらないので、
+    // 名前まで読んでから断る
     if (c === '$') {
       RE_IDENT.lastIndex = i + 1;
       const sys = RE_IDENT.exec(src);
       const name = sys ? `$${sys[0]}` : '$';
-      throw new CompileError(name === '$signed' || name === '$unsigned'
-        ? `${name} は未対応 (signed を扱わないので符号の付け替えができない)`
-        : `${name} は未対応 (システム関数・タスクは扱わない)`, line);
+      if (name !== '$signed' && name !== '$unsigned') {
+        throw new CompileError(`${name} は未対応 (システム関数・タスクは扱わない)`, line);
+      }
+      tokens.push({ type: 'ident', value: name, line });
+      i += name.length;
+      continue;
     }
 
     const three = src.slice(i, i + 3);
     if (PUNCT3_REJECT[three]) throw new CompileError(PUNCT3_REJECT[three], line);
+    if (PUNCT3.includes(three)) {
+      tokens.push({ type: 'punct', value: three, line });
+      i += 3;
+      continue;
+    }
 
     const two = src.slice(i, i + 2);
     if (PUNCT2.includes(two)) {

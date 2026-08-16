@@ -1,7 +1,7 @@
 // Verilog サブセット → AST
 //
 // 式の優先順位 (低い順):
-//   ?:  ||  &&  |  ^ ~^ ^~  &  == !=  < <= > >=  << >>  + -
+//   ?:  ||  &&  |  ^ ~^ ^~  &  == !=  < <= > >=  << >> <<< >>>  + -
 //   単項 (~ - + ! & | ^ ~^ ^~)  primary
 // これは Verilog 本来の優先順位と一致する。論理演算子 (|| &&) はビット演算より
 // 弱く、等価 (== !=) は関係 (< など) より弱く、関係はシフトより弱く、シフトは
@@ -23,16 +23,10 @@ const UNSUPPORTED_ITEMS = new Set([
 ]);
 const DIRECTIONS = new Set(['input', 'output']);
 const NET_KINDS = new Set(['wire', 'reg']);
-// signed / unsigned は宣言の中で幅の前に来る (`wire signed [3:0] x;`)。予約語として
-// 知らないと識別子に見えてしまい、次の '[' で見当違いのエラーになる
 // module 本体にしか出てこない語。function の中で出会ったら endfunction の書き忘れ
 const FUNC_BODY_STOP = new Set([
   'endmodule', 'module', 'assign', 'always', 'function', 'task', 'input', 'output', 'inout',
 ]);
-const SIGNEDNESS = {
-  signed: 'signed は未対応 (すべて符号なしとして扱う)',
-  unsigned: 'unsigned は既定なので、書かずに省いてください',
-};
 
 export function parse(src) {
   const toks = lex(src);
@@ -52,10 +46,14 @@ export function parse(src) {
     if (peek().type !== 'ident') throw err(`識別子が必要ですが '${peek().value}' がありました`);
     return next().value;
   };
-  /** 宣言に付いた signed / unsigned を名指しで断る。幅の前に呼ぶ */
-  function rejectSignedness() {
-    const t = peek();
-    if (t.type === 'ident' && SIGNEDNESS[t.value]) throw err(SIGNEDNESS[t.value]);
+  /**
+   * 宣言に付いた signed / unsigned。幅の前に来る (`wire signed [3:0] x;`)。
+   * 既定は unsigned なので、書かなければ false。
+   */
+  function parseSignedness() {
+    if (at('signed')) { next(); return true; }
+    if (at('unsigned')) { next(); return false; }
+    return false;
   }
   // ---- [msb:lsb] / [n] ----------------------------------------------------
   // 添字は式で受ける。`[WIDTH-1:0]` のようにパラメータが入るので、数に落とすのは
@@ -103,7 +101,8 @@ export function parse(src) {
   // * / % は + - より強く結合する (Verilog と同じ)
   const parseMul = binaryLevel(['*', '/', '%'], () => parseUnary());
   const parseAdd = binaryLevel(['+', '-'], parseMul);
-  const parseShift = binaryLevel(['<<', '>>'], parseAdd);
+  // 算術シフト <<< >>> は普通のシフトと同じ優先順位
+  const parseShift = binaryLevel(['<<<', '>>>', '<<', '>>'], parseAdd);
   const parseRel = binaryLevel(['<=', '>=', '<', '>'], parseShift);
   const parseEq = binaryLevel(['==', '!='], parseRel);
   const parseAnd = binaryLevel('&', parseEq);
@@ -154,7 +153,7 @@ export function parse(src) {
       // mask は casez のラベルで「比較しない桁」。それ以外の場所では elaborate が断る
       return {
         type: 'num', width: t.width, bits: t.bits, mask: t.mask ?? 0n,
-        unsized: !!t.unsized, line: t.line,
+        unsized: !!t.unsized, signed: !!t.signed, line: t.line,
       };
     }
 
@@ -181,6 +180,16 @@ export function parse(src) {
       while (eat(',')) parts.push(parseExpr());
       expect('}');
       return { type: 'concat', parts, line };
+    }
+
+    // $signed(x) / $unsigned(x) は符号の付け替え。中身は自己決定 (幅は変わらない) で、
+    // 変わるのは「この式が signed か」だけ ― だから専用のノードにする
+    if (t.value === '$signed' || t.value === '$unsigned') {
+      next();
+      expect('(');
+      const a = parseExpr();
+      expect(')');
+      return { type: 'sys', op: t.value.slice(1), a, line: t.line };
     }
 
     if (t.type === 'ident') {
@@ -235,7 +244,7 @@ export function parse(src) {
     if (DIRECTIONS.has(peek().value)) dir = next().value;
     if (NET_KINDS.has(peek().value)) kind = next().value;
     if (!dir && !kind) throw err('宣言が必要');
-    rejectSignedness();
+    const isSigned = parseSignedness();
     const range = parseRange();
     // `wire t = a & b;` は宣言と assign を 1 行で書いたもの (net declaration assignment)。
     // 名前ごとに書けるので `wire x = a, y = b;` も通す。
@@ -253,7 +262,7 @@ export function parse(src) {
       inits.push({ name: nm, expr: parseExpr(), line: iline });
     } while (eat(','));
     expect(';');
-    return { type: 'decl', dir, kind, range, names, inits, line };
+    return { type: 'decl', dir, kind, signed: isSigned, range, names, inits, line };
   }
 
   /**
@@ -265,6 +274,9 @@ export function parse(src) {
   function parseParamDecl() {
     const line = peek().line;
     const local = next().value === 'localparam';
+    if (at('signed') || at('unsigned')) {
+      throw err(`parameter の ${peek().value} 指定は未対応 (parameter は 32 ビットの signed として扱う)`);
+    }
     if (at('[')) throw err('parameter の幅指定は未対応 (値の大きさで決まる)');
     const items = [];
     do {
@@ -334,7 +346,7 @@ export function parse(src) {
   function parseFunction() {
     const line = expect('function').line;
     if (at('automatic') || at('static')) throw err(`function の ${peek().value} は未対応`);
-    rejectSignedness();
+    const isSigned = parseSignedness();
     const range = parseRange();          // 省略時は 1 ビット
     const name = expectIdent();
 
@@ -344,13 +356,13 @@ export function parse(src) {
       do {
         if (!at('input')) throw err('function の引数は input だけ');
         next();
-        rejectSignedness();
+        const asigned = parseSignedness();
         const arange = parseRange();
-        args.push({ name: expectIdent(), range: arange, line: peek().line });
+        args.push({ name: expectIdent(), range: arange, signed: asigned, line: peek().line });
         // input a, b; のようにまとめて書く形も許す
         while (at(',') && peek(1).type === 'ident' && !at2Input()) {
           next();
-          args.push({ name: expectIdent(), range: arange, line: peek().line });
+          args.push({ name: expectIdent(), range: arange, signed: asigned, line: peek().line });
         }
       } while (eat(','));
       expect(')');
@@ -366,12 +378,12 @@ export function parse(src) {
     while (at('reg') || at('wire') || at('integer')) {
       if (at('integer')) { ints.push(...parseIntDecl().names); continue; }
       const kind = next().value;
-      rejectSignedness();
+      const lsigned = parseSignedness();
       const lrange = parseRange();
       const names = [expectIdent()];
       while (eat(',')) names.push(expectIdent());
       expect(';');
-      for (const n of names) locals.push({ name: n, range: lrange, kind, line });
+      for (const n of names) locals.push({ name: n, range: lrange, signed: lsigned, kind, line });
     }
 
     // begin...end で囲んでも囲まなくてもよいので parseStmtBlock で読む。
@@ -391,7 +403,7 @@ export function parse(src) {
     if (!assignsTo(body, name)) {
       throw err(`function ${name} は戻り値 (${name} への代入) がどこにも無い`);
     }
-    return { type: 'func', name, range, args, locals, ints, body, line };
+    return { type: 'func', name, signed: isSigned, range, args, locals, ints, body, line };
   }
 
   /** 文の列のどこかで name に代入しているか */
@@ -712,16 +724,17 @@ export function parse(src) {
             if (!DIRECTIONS.has(peek().value)) throw err('ANSI ポートリストでは input/output が必要');
             const dir = next().value;
             const kind = NET_KINDS.has(peek().value) ? next().value : null;
-            rejectSignedness();
+            const isSigned = parseSignedness();
             const range = parseRange();
             const pname = expectIdent();
-            portDecls.push({ type: 'decl', dir, kind, range, names: [pname], line: pline });
+            const pdecl = { type: 'decl', dir, kind, signed: isSigned, range, line: pline };
+            portDecls.push({ ...pdecl, names: [pname] });
             portOrder.push(pname);
             // input a, b; のように同一宣言で複数ポートを並べる形も許す
             while (at(',') && peek(1).type === 'ident' && !DIRECTIONS.has(peek(1).value)) {
               next();
               const extra = expectIdent();
-              portDecls.push({ type: 'decl', dir, kind, range, names: [extra], line: pline });
+              portDecls.push({ ...pdecl, names: [extra] });
               portOrder.push(extra);
             }
           } else {
